@@ -19,7 +19,7 @@ impl Plugin for SkyboxPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(AtmosphereModel::default()) // Default Atmosphere material, we can edit it to simulate another planet
             .insert_resource(CycleTimer(Timer::new(
-                std::time::Duration::from_millis(1000), // Update our atmosphere every 50ms (in a real game, this would be much slower, but for the sake of an example we use a faster update)
+                std::time::Duration::from_millis(10), // Update our atmosphere every 50ms (in a real game, this would be much slower, but for the sake of an example we use a faster update)
                 TimerMode::Repeating,
             )))
             .add_plugins(AtmospherePlugin)

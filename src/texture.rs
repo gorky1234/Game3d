@@ -1,5 +1,8 @@
 use bevy::prelude::*;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use serde::Deserialize;
 use bevy::asset::{Assets, AssetServer, Handle};
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::{default, Res, ResMut, Resource};
@@ -10,13 +13,54 @@ use bevy_pbr::MaterialPipeline;
 use crate::world::block::BlockType;
 
 
+//lire le json
+#[derive(Deserialize, Debug)]
+struct FrameRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+#[derive(Deserialize, Debug)]
+struct Frame {
+    frame: FrameRect,
+}
+
+#[derive(Deserialize, Debug)]
+struct AtlasData {
+    frames: HashMap<String, Frame>,
+    meta: MetaData,
+}
+
+#[derive(Deserialize, Debug)]
+struct MetaData {
+    size: AtlasSize,
+}
+
+#[derive(Deserialize, Debug)]
+struct AtlasSize {
+    w: f32,
+    h: f32,
+}
+
+fn filename_to_block_type(name: &str) -> Option<BlockType> {
+    match name {
+        "dirt.jpg" => Some(BlockType::Dirt),
+        "grass.jpg" => Some(BlockType::Grass),
+        "rock.jpg" => Some(BlockType::Rock),
+        "water.jpg" => Some(BlockType::Water),
+        _ => None,
+    }
+}
+
+
 //Load Texture
 #[derive(Resource,Clone)]
 pub struct TextureAtlasMaterial {
-    pub handle: Handle<StandardMaterial>,
+    pub opaque_handle: Handle<StandardMaterial>,
     pub water_handle: Handle<StandardMaterial>, // <- pour l’eau
-    pub uv_map: HashMap<BlockType, [f32; 2]>, // coin bas-gauche de chaque bloc dans l’atlas
-    pub tile_size: f32, // exemple : 1.0 / 4.0 pour un atlas 4x4
+    pub uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>, // (base_uv, size_uv)
 }
 
 pub fn setup_texture_atlas(
@@ -25,7 +69,7 @@ pub fn setup_texture_atlas(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     // Charge la texture principale (couleur) et la normal map
-    let texture_handle = asset_server.load("atlas_texture_color_v2.png");
+    /*let texture_handle = asset_server.load("atlas_texture_color_v2.png");
     let normal_map_handle = asset_server.load("atlas_texture_normal_v2.png"); // Assurez-vous que cette texture existe
 
     let standard_material = materials.add(StandardMaterial {
@@ -60,6 +104,57 @@ pub fn setup_texture_atlas(
             water_handle: water_material,
             uv_map,
             tile_size,
+    });*/
+
+    let texture_handle = asset_server.load("atlas_texture.png");
+    let normal_map_handle = asset_server.load("atlas_texture_normal.png");
+
+    let water_material = materials.add(StandardMaterial {
+        base_color_texture: Some(texture_handle.clone()), // Optionnel : tu peux le supprimer si tu veux un flat color
+        normal_map_texture: Some(normal_map_handle.clone()), // Optionnel
+        base_color: Color::srgba(0.11, 0.16, 0.26, 0.99), // Bleu transparent
+        alpha_mode: AlphaMode::Blend,
+        unlit: false,
+        ..default()
+    });
+
+
+    let standard_material = materials.add(StandardMaterial {
+        base_color_texture: Some(texture_handle.clone()),
+        normal_map_texture: Some(normal_map_handle.clone()),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+
+    let json_path = Path::new("assets/atlas_texture.json");
+    let json_str = fs::read_to_string(json_path).expect("Impossible de lire spritesheet.json");
+    let atlas_data: AtlasData = serde_json::from_str(&json_str).expect("JSON mal formé");
+
+    let atlas_width = atlas_data.meta.size.w;
+    let atlas_height = atlas_data.meta.size.h;
+
+    let mut uv_map = HashMap::new();
+
+    for (filename, frame_data) in atlas_data.frames.iter() {
+        if let Some(block_type) = filename_to_block_type(filename.as_str()) {
+            let frame = &frame_data.frame;
+
+            // On convertit les coordonnées pixels -> UV
+            let u = frame.x / atlas_width;
+            let v = frame.y / atlas_height;
+            let w = frame.w / atlas_width;
+            let h = frame.h / atlas_height;
+
+            uv_map.insert(block_type, ([u, v], [w, h]));
+        }
+    }
+
+    println!("{:#?}", uv_map);
+
+    commands.insert_resource(TextureAtlasMaterial {
+        opaque_handle: standard_material,
+        water_handle: water_material,
+        uv_map,
     });
 }
 

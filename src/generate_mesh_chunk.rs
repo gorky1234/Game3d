@@ -220,18 +220,17 @@ pub async fn generate_chunk_mesh_async(
                         let base = Vec3::new(x as f32, y as f32, z as f32);
                         let verts = corners.map(|offset| (base + Vec3::from(offset)).to_array());
 
+                        let (base_uv, size_uv) = atlas.uv_map.get(&block_type).copied().unwrap_or(([0.0, 0.0], [1.0, 1.0]));
+
+                        let uv_in_tile = |u: f32, v: f32| -> [f32; 2] {
+                            [base_uv[0] + u * size_uv[0], base_uv[1] + v * size_uv[1]]
+                        };
+
                         let tile_scale = 10.0;
 
                         let fx = (global_x.rem_euclid(tile_scale as i32)) as f32 / tile_scale;
                         let fy = (global_y.rem_euclid(tile_scale as i32)) as f32 / tile_scale;
                         let fz = (global_z.rem_euclid(tile_scale as i32)) as f32 / tile_scale;
-
-                        let base_uv = atlas.uv_map.get(&block_type).copied().unwrap_or([0.0, 0.0]);
-                        let s = atlas.tile_size;
-
-                        let uv_in_tile = |u: f32, v: f32| -> [f32; 2] {
-                            [base_uv[0] + u * s, base_uv[1] + v * s]
-                        };
 
                         let uvs = match normal {
                             [0.0, 1.0, 0.0] | [0.0, -1.0, 0.0] => [
@@ -262,17 +261,7 @@ pub async fn generate_chunk_mesh_async(
     }
 
     let mut opaque_mesh = opaque_mesh_builder.build();
-    /*if !opaque_mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().is_empty() {
-        if let Err(e) = opaque_mesh.generate_tangents() {
-            warn!("Tangents failed: {:?}", e);
-        }
-    }*/
-
     let mut water_mesh = water_mesh_builder.build();
-    /*if !water_mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().is_empty() {
-        // Pas besoin de tangentes si pas de normal map ou matériau unlit
-    }*/
-
 
     let transform = Transform::from_xyz(
         (chunk.x * CHUNK_SIZE as i32) as f32,
@@ -280,5 +269,5 @@ pub async fn generate_chunk_mesh_async(
         (chunk.z * CHUNK_SIZE as i32) as f32,
     );
 
-    (opaque_mesh,water_mesh, transform)
+    (opaque_mesh, water_mesh, transform)
 }

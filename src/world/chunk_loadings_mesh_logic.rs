@@ -90,7 +90,7 @@ fn poll_chunk_tasks(
             ) {
                 commands.spawn((
                     Mesh3d(opaque_mesh_handle.clone()),
-                    MeshMaterial3d(materials.handle.clone()),
+                    MeshMaterial3d(materials.opaque_handle.clone()),
                     transform,
                     GlobalTransform::default(),
                     collider,

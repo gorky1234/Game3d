@@ -53,32 +53,11 @@ fn spawn_player(mut commands: Commands,
         far: 10000.0,
     };
 
-    let metering_mask = asset_server.load("basic_metering_mask.png");
-    let auto_exposure = AutoExposure {
-        range: -8.0..=8.0,
-        speed_brighten: 6.0,
-        speed_darken: 2.0,
-        metering_mask: metering_mask.clone(),
-        compensation_curve: compensation_curves.add(
-            AutoExposureCompensationCurve::from_curve(LinearSpline::new([
-                vec2(-8.0, 0.5),
-                vec2(4.0, -2.0),
-            ])).unwrap(),
-        ),
-        ..Default::default()
-    };
 
     let atmosphere_settings = AtmosphereSettings {
         aerial_view_lut_max_distance: 3.2e5,
         scene_units_to_m: 1e+4,
         ..Default::default()
-    };
-
-    let fog = DistanceFog {
-        color: Color::srgba(0.2, 0.3, 0.15, 1.0), // vert sombre, légèrement jaunâtre (brume marécageuse)
-        directional_light_color: Color::srgba(0.5, 0.6, 0.4, 1.0), // lumière douce, verdâtre
-        directional_light_exponent: 8.0,  // lumière diffuse, assez douce
-        falloff: FogFalloff::Exponential { density: 0.12 }, // densité moyenne à élevée pour une brume épaisse
     };
 
     let cam = commands.spawn((
@@ -88,7 +67,6 @@ fn spawn_player(mut commands: Commands,
             clear_color: ClearColorConfig::None,
             ..default()
         },
-        Projection::Perspective(perspective_projection),
         /*auto_exposure,*/
         Tonemapping::AcesFitted,
         Transform::from_xyz(0.0, 0.15, -1.0).looking_at(Vec3::Y * 0.3, Vec3::Y),
