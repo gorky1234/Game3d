@@ -68,44 +68,6 @@ pub fn setup_texture_atlas(
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Charge la texture principale (couleur) et la normal map
-    /*let texture_handle = asset_server.load("atlas_texture_color_v2.png");
-    let normal_map_handle = asset_server.load("atlas_texture_normal_v2.png"); // Assurez-vous que cette texture existe
-
-    let standard_material = materials.add(StandardMaterial {
-        base_color_texture: Some(texture_handle.clone()),
-        normal_map_texture: Some(normal_map_handle.clone()), // <- Normal map ici
-        perceptual_roughness: 1.0,
-        ..default()
-    });
-
-    // Matériau transparent pour l'eau
-    let water_material = materials.add(StandardMaterial {
-        base_color_texture: Some(texture_handle.clone()), // Optionnel : tu peux le supprimer si tu veux un flat color
-        normal_map_texture: Some(normal_map_handle.clone()), // Optionnel
-        base_color: Color::srgba(0.11, 0.16, 0.26, 0.99), // Bleu transparent
-        alpha_mode: AlphaMode::Blend,
-        unlit: false,
-        ..default()
-    });
-
-    let mut uv_map = HashMap::new();
-    let tile_size = 0.5; // 2x2 atlas => chaque tuile fait 0.5x0.5
-
-    uv_map.insert(BlockType::Dirt,  [0.0 * tile_size, 0.0 * tile_size]);
-    uv_map.insert(BlockType::Grass, [1.0 * tile_size, 0.0 * tile_size]);
-    uv_map.insert(BlockType::Rock,  [0.0 * tile_size, 1.0 * tile_size]);
-    uv_map.insert(BlockType::Water, [1.0 * tile_size, 1.0 * tile_size]);
-    // Ajoute d'autres blocs ici...
-
-
-    commands.insert_resource(TextureAtlasMaterial {
-            handle: standard_material,
-            water_handle: water_material,
-            uv_map,
-            tile_size,
-    });*/
-
     let texture_handle = asset_server.load("atlas_texture.png");
     let normal_map_handle = asset_server.load("atlas_texture_normal.png");
 
@@ -148,8 +110,6 @@ pub fn setup_texture_atlas(
             uv_map.insert(block_type, ([u, v], [w, h]));
         }
     }
-
-    println!("{:#?}", uv_map);
 
     commands.insert_resource(TextureAtlasMaterial {
         opaque_handle: standard_material,
