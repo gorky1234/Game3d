@@ -26,8 +26,8 @@ pub fn get_biome_data(biome_type: BiomeType) -> Biome {
             underground_block: BlockType::Rock,
         },
         BiomeType::Mountain => Biome {
-            base_height: 90.0,
-            amplitude: 30.0,
+            base_height: 64.0,
+            amplitude: 120.0,
             frequency: 0.01,
             surface_block: BlockType::Rock,
             underground_block: BlockType::Rock,

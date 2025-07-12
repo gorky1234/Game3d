@@ -11,7 +11,7 @@ use bevy_atmosphere::prelude::*;
 #[derive(Component)]
 struct Sun;
 
-const DAY_LENGTH: f32 = 500.0;
+const DAY_LENGTH: f32 = 100.0;
 
 pub struct SkyboxPlugin;
 

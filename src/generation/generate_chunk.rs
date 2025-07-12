@@ -1,8 +1,8 @@
 use noise::Perlin;
 use crate::constants::{CHUNK_SIZE, SEA_LEVEL, SECTION_HEIGHT, WORLD_HEIGHT};
 use crate::generation::biome::{Biome, BiomeType, get_biome_data};
-use crate::generation::generate_biome_map::{BiomeCenter, generate_biomes_map, get_biome_voronoi};
-use crate::generation::generate_height_map::generate_height_map;
+use crate::generation::generate_biome_map::BiomeMap;
+use crate::generation::generate_height_map::{generate_chunk_heightmap};
 use crate::world::block::BlockType;
 use crate::world::chunk::{Chunk, ChunkSection};
 
@@ -27,10 +27,13 @@ pub fn generate_chunk(x: i32, z: i32) -> Chunk {
 
     //biome map
     let area_size = 512.0; // taille du "monde" Voronoï
-    let biomes_map = generate_biomes_map(&perlin, seed, 30, area_size);
+
+    let mut biomes_map: BiomeMap = BiomeMap::new();
+    biomes_map.generate_biomes_map(seed, 30, area_size);
 
     // heightmap
-    let heightmap =  generate_height_map(&perlin, x, z, &biomes_map);
+    //let heightmap =  generate_height_map(&perlin, x, z, &biomes_map);
+    let heightmap =  generate_chunk_heightmap(&perlin, x, z, 30.0);
 
 
 
@@ -51,9 +54,9 @@ pub fn generate_chunk(x: i32, z: i32) -> Chunk {
             let world_x = x * CHUNK_SIZE as i32 + local_x as i32;
             let world_z = z * CHUNK_SIZE as i32 + local_z as i32;
 
-            let biome = get_biome_voronoi(world_x as f64, world_z as f64, &biomes_map);
+            let biome = biomes_map.get_biome_voronoi(world_x as f64, world_z as f64);
             let biome_data = get_biome_data(biome);
-            let height = heightmap[local_x][local_z];
+            let height = heightmap[local_x][local_z] as usize;
 
             for y in 0..WORLD_HEIGHT {
                 let section_index = y / SECTION_HEIGHT;
