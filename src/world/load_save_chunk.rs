@@ -9,9 +9,9 @@ use fastnbt::Value;
 use flate2::Status;
 use noise::{NoiseFn, Perlin};
 use crate::constants::{CHUNK_SIZE, SECTION_HEIGHT, WORLD_HEIGHT};
+use crate::generation::generate_chunk::generate_chunk;
 use crate::world::block::BlockType;
 use crate::world::chunk::Chunk;
-use crate::world::generate_chunk::generate_chunk;
 
 #[derive(Resource, Default, Clone)]
 pub struct WorldData {
