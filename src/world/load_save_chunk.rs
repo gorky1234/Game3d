@@ -2,22 +2,153 @@ use std::collections::HashMap;
 use std::fs::{File, create_dir_all};
 use std::io::{Read, Write};
 use std::path::Path;
-use bevy::prelude::{Entity, Resource};
+use bevy::app::{App, Plugin, Update};
+use bevy::log::{error, info};
+use bevy::prelude::{Entity, Event, EventReader, EventWriter, ResMut, Resource};
+use bevy::tasks::{AsyncComputeTaskPool, Task};
 use mca::{RegionReader, RegionWriter, RawChunk};
 use fastnbt::{to_writer, from_bytes, SerOpts};
 use fastnbt::Value;
 use flate2::Status;
+use futures::FutureExt;
 use noise::{NoiseFn, Perlin};
 use crate::constants::{CHUNK_SIZE, SECTION_HEIGHT, WORLD_HEIGHT};
-use crate::generation::generate_chunk::generate_chunk;
+use crate::generation::generate_chunk::ToGenerateChunkEvent;
 use crate::world::block::BlockType;
 use crate::world::chunk::Chunk;
+use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
 
 #[derive(Resource, Default, Clone)]
 pub struct WorldData {
     pub chunks_loaded: HashMap<(i32,i32), Chunk>,
     pub chunks_entities: HashMap<(i32,i32), Entity>,
 }
+
+
+pub struct WorldDataPlugin;
+
+#[derive(Default, Event)]
+pub struct ToLoadChunkEvent {
+    pub x: i32,
+    pub z: i32,
+}
+
+#[derive(Default, Event)]
+pub struct ToUnloadChunkEvent {
+    pub x: i32,
+    pub z: i32,
+}
+
+impl Plugin for WorldDataPlugin {
+    fn build(&self, app: &mut App) {
+        app
+            .insert_resource(WorldData::default())
+            .add_event::<ToGenerateChunkEvent>()
+            .add_event::<ToLoadChunkEvent>()
+            .add_event::<ToUnloadChunkEvent>()
+            .add_event::<ChunkLoadedEvent>()
+            .add_systems(Update, load_chunk_system)
+            .add_systems(Update, apply_loaded_chunks)
+            .init_resource::<ChunkLoadTasks>()
+            .add_systems(Update, collect_loaded_chunks_system);
+    }
+}
+
+pub fn load_chunk_system(
+    mut event_reader: EventReader<ToLoadChunkEvent>,
+    mut tasks: ResMut<ChunkLoadTasks>,
+) {
+    let task_pool = AsyncComputeTaskPool::get();
+
+    for event in event_reader.read() {
+
+        let x = event.x;
+        let z = event.z;
+
+        let task = task_pool.spawn(async move {
+            let chunk = load_chunk(x, z).await.expect("Erreur chargement chunk");
+            (x, z, chunk)
+        });
+
+        tasks.tasks.push(task);
+    }
+}
+
+#[derive(Default, Resource)]
+pub struct ChunkLoadTasks {
+    pub tasks: Vec<Task<(i32, i32, Chunk)>>, // x, z, chunk
+}
+
+#[derive(Event)]
+struct ChunkLoadedEvent {
+    x: i32,
+    z: i32,
+    chunk: Chunk
+}
+
+fn collect_loaded_chunks_system(
+    mut tasks: ResMut<ChunkLoadTasks>,
+    mut chunk_loaded_events: EventWriter<ChunkLoadedEvent>,
+) {
+    // On garde uniquement les tâches non terminées
+    tasks.tasks.retain_mut(|task| {
+        if let Some((x, z, chunk)) = task.now_or_never() {
+            chunk_loaded_events.write(ChunkLoadedEvent { x, z, chunk });
+            false // tâche terminée, on la supprime
+        } else {
+            true // encore en cours
+        }
+    });
+}
+
+fn apply_loaded_chunks(
+    mut load_events: EventReader<ChunkLoadedEvent>,
+    mut to_generate: EventWriter<ToGenerateChunkEvent>,
+    mut chunk_to_update_event: EventWriter<ChunkToUpdateEvent>,
+    mut world_data: ResMut<WorldData>,
+) {
+    for event in load_events.read() {
+        let x = event.x;
+        let z = event.z;
+
+        if !event.chunk.sections.is_empty() {
+            world_data.chunks_loaded.insert((x,z), event.chunk.clone());
+            chunk_to_update_event.write(ChunkToUpdateEvent { x, z });
+        }
+
+        to_generate.write(ToGenerateChunkEvent { x, z });
+    }
+}
+
+
+pub async fn load_chunk(x: i32, z: i32) -> anyhow::Result<Chunk> {
+    let (rx, rz) = (x.div_euclid(32), z.div_euclid(32));
+    let region_path = format!("r.{}.{}.mca", rx, rz);
+
+    // Lire le fichier de région s'il existe
+    if Path::new(&region_path).exists() {
+        let mut buf = Vec::new();
+        File::open(&region_path)?.read_to_end(&mut buf)?;
+        let region = RegionReader::new(&buf)?;
+
+        // Lire les données du chunk s'il est présent
+        if let Some(raw) = region.get_chunk((x & 31) as i32 as usize, (z & 31) as i32 as usize)? {
+            let data = raw.decompress()?;
+            let nbt: Value = from_bytes(&data)?;
+            let chunk = parse_nbt_to_chunk(x, z, nbt);
+            //self.chunks_loaded.insert((x, z), chunk);
+            return Ok(chunk);
+        }
+    }
+    
+    Ok(Chunk {
+        x,
+        z,
+        sections: vec![],
+    })
+}
+
+
 
 impl WorldData {
     /*pub fn load_chunk(&mut self, x: i32, z: i32) -> anyhow::Result<()> {
@@ -96,37 +227,6 @@ impl WorldData {
     pub fn set_block(&mut self, wx: i32, wy: i32, wz: i32, palette_index: u8) {
 
     }
-}
-
-
-pub async fn load_chunk(x: i32, z: i32) -> anyhow::Result<Chunk> {
-    let (rx, rz) = (x.div_euclid(32), z.div_euclid(32));
-    let region_path = format!("r.{}.{}.mca", rx, rz);
-
-    // Lire le fichier de région s'il existe
-    if Path::new(&region_path).exists() {
-        let mut buf = Vec::new();
-        File::open(&region_path)?.read_to_end(&mut buf)?;
-        let region = RegionReader::new(&buf)?;
-
-        // Lire les données du chunk s'il est présent
-        if let Some(raw) = region.get_chunk((x & 31) as i32 as usize, (z & 31) as i32 as usize)? {
-            let data = raw.decompress()?;
-            let nbt: Value = from_bytes(&data)?;
-            let chunk = parse_nbt_to_chunk(x, z, nbt);
-            //self.chunks_loaded.insert((x, z), chunk);
-            return Ok(chunk);
-        }
-    }
-
-    // Le chunk n'existe pas sur disque → générer
-    //println!("Chunk ({}, {}) non trouvé, génération...", x, z);
-    let generated = generate_chunk(x, z);
-    //println!("{:?}", generated);
-    //self.chunks_loaded.insert((x, z), generated);
-    //self.chunks_status.insert((x, z), ChunkStatus::ToUpdate);
-
-    Ok(generated)
 }
 
 // Convertit NBT (Value) ⇄ chunk simplifié

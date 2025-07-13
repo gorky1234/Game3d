@@ -1,3 +1,6 @@
+use bevy::app::{App, Plugin, Startup, Update};
+use bevy::log::info;
+use bevy::prelude::{Commands, Event, EventReader, EventWriter, Res, ResMut, Resource};
 use noise::Perlin;
 use crate::constants::{CHUNK_SIZE, SEA_LEVEL, SECTION_HEIGHT, WORLD_HEIGHT, WORLD_SIZE};
 use crate::generation::biome::{Biome, BiomeType, get_biome_data};
@@ -5,35 +8,56 @@ use crate::generation::generate_biome_map::BiomeMap;
 use crate::generation::generate_height_map::generate_height_map;
 use crate::world::block::BlockType;
 use crate::world::chunk::{Chunk, ChunkSection};
+use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
+use crate::world::load_save_chunk::WorldData;
 
+pub struct ChunkGenerationPlugin;
 
-fn get_block_id(block_name: &str, palette: &[String]) -> u8 {
-    palette.iter().position(|s| s == block_name).unwrap_or(0) as u8
-}
-
-fn get_or_insert_block_id(palette: &mut Vec<String>, block_type: &BlockType) -> usize {
-    let block_name = block_type.to_string();
-    if let Some(index) = palette.iter().position(|b| *b == block_name) {
-        index
-    } else {
-        palette.push(block_name.to_string());
-        palette.len() - 1
+impl Plugin for ChunkGenerationPlugin {
+    fn build(&self, app: &mut App) {
+        app
+            .insert_resource(BiomeMap::new())
+            .add_event::<ToGenerateChunkEvent>()
+            .add_systems(Startup, setup_biome_map)
+            .add_systems(Update, generate_chunks_system);
     }
 }
 
-pub fn generate_chunk(x: i32, z: i32) -> Chunk {
+/// Evénement pour demander la génération d’un chunk en position (x,z)
+#[derive(Default, Event)]
+pub struct ToGenerateChunkEvent {
+    pub x: i32,
+    pub z: i32,
+}
+
+/// Initialisation de la map de biomes (à faire une fois au démarrage)
+fn setup_biome_map(mut biome_map: ResMut<BiomeMap>) {
     let seed = 0;
-    let perlin = Perlin::new(seed as u32);
-
-    //biome map
-    let mut biomes_map: BiomeMap = BiomeMap::new();
-    biomes_map.generate(seed, 300, WORLD_SIZE as f64);
-
-    // heightmap
-    let heightmap =  generate_height_map(&perlin, x, z, &biomes_map);
+    biome_map.generate(seed, 300, WORLD_SIZE as f64);
+}
 
 
+/// Système de génération des chunks (à appeler avec une entité ou un événement)
+fn generate_chunks_system(
+    biome_map: Res<BiomeMap>,
+    mut world_data: ResMut<WorldData>,
+    mut event_reader: EventReader<ToGenerateChunkEvent>,
+    mut to_update_mesh: EventWriter<ChunkToUpdateEvent>,
+) {
+    let perlin = Perlin::new(0);
+    for event in event_reader.read() {
+        let x = event.x;
+        let z = event.z;
+        let chunk = generate_chunk(x, z, &perlin, &biome_map);
+        world_data.chunks_loaded.insert((x, z), chunk);
+        to_update_mesh.write(ChunkToUpdateEvent { x, z });
+    }
 
+}
+
+/// Version modifiée de generate_chunk pour prendre Perlin & BiomeMap en référence
+fn generate_chunk(x: i32, z: i32, perlin: &Perlin, biomes_map: &BiomeMap) -> Chunk {
+    // Palette vide au départ, qui sera clonée pour chaque section
     let palette = vec![];
     let mut sections: Vec<ChunkSection> = vec![];
 
@@ -45,6 +69,7 @@ pub fn generate_chunk(x: i32, z: i32) -> Chunk {
         });
     }
 
+    let heightmap = generate_height_map(perlin, x, z, biomes_map);
 
     for local_x in 0..CHUNK_SIZE {
         for local_z in 0..CHUNK_SIZE {
@@ -88,4 +113,14 @@ pub fn generate_chunk(x: i32, z: i32) -> Chunk {
     }
 
     Chunk { x, z, sections }
+}
+
+fn get_or_insert_block_id(palette: &mut Vec<String>, block_type: &BlockType) -> usize {
+    let block_name = block_type.to_string();
+    if let Some(index) = palette.iter().position(|b| *b == block_name) {
+        index
+    } else {
+        palette.push(block_name.to_string());
+        palette.len() - 1
+    }
 }

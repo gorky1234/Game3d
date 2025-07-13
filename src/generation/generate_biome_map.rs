@@ -1,3 +1,4 @@
+use bevy::prelude::Resource;
 use noise::{NoiseFn, Perlin};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -12,6 +13,7 @@ pub struct ClimatePoint {
     pub altitude: f64,
 }
 
+#[derive(Resource, Default, Clone)]
 pub struct BiomeMap {
     pub points: Vec<ClimatePoint>,
 }

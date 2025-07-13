@@ -21,7 +21,7 @@ use futures::FutureExt;
 use crate::player::Player;
 use crate::constants::{CHUNK_SIZE, VIEW_DISTANCE};
 use crate::generate_mesh_chunk::generate_chunk_mesh_async;
-use crate::world::load_save_chunk::{load_chunk, WorldData};
+use crate::world::load_save_chunk::WorldData;
 
 #[derive(Event,Clone)]
 pub struct ChunkToUpdateEvent {
