@@ -7,6 +7,13 @@ pub enum BiomeType {
     Ocean,
 }
 
+pub const ALL_BIOMES: [BiomeType; 3] = [
+    BiomeType::Plains,
+    BiomeType::Mountain,
+    BiomeType::Ocean,
+];
+
+
 #[derive(Debug, Clone)]
 pub struct Biome {
     pub base_height: f64,   // Hauteur moyenne
@@ -20,14 +27,14 @@ pub fn get_biome_data(biome_type: BiomeType) -> Biome {
     match biome_type {
         BiomeType::Plains => Biome {
             base_height: 64.0,
-            amplitude: 5.0,
+            amplitude: 15.0,
             frequency: 0.01,
             surface_block: BlockType::Grass,
             underground_block: BlockType::Rock,
         },
         BiomeType::Mountain => Biome {
             base_height: 64.0,
-            amplitude: 120.0,
+            amplitude: 200.0,
             frequency: 0.01,
             surface_block: BlockType::Rock,
             underground_block: BlockType::Rock,

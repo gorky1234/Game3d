@@ -11,7 +11,7 @@ use bevy_atmosphere::prelude::*;
 #[derive(Component)]
 struct Sun;
 
-const DAY_LENGTH: f32 = 100.0;
+const DAY_LENGTH: f32 = 500.0;
 
 pub struct SkyboxPlugin;
 
@@ -19,7 +19,7 @@ impl Plugin for SkyboxPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(AtmosphereModel::default()) // Default Atmosphere material, we can edit it to simulate another planet
             .insert_resource(CycleTimer(Timer::new(
-                std::time::Duration::from_millis(10), // Update our atmosphere every 50ms (in a real game, this would be much slower, but for the sake of an example we use a faster update)
+                std::time::Duration::from_millis(0), // Update our atmosphere every 50ms (in a real game, this would be much slower, but for the sake of an example we use a faster update)
                 TimerMode::Repeating,
             )))
             .add_plugins(AtmospherePlugin)
@@ -38,7 +38,7 @@ fn setup_skybox(
         Sun,
     ));
 
-    let clamped_hour = 15.0;
+    let clamped_hour = 0.0;
     let t = (clamped_hour / 24.0) * TAU;
 
     // Position du soleil dans le ciel
