@@ -2,7 +2,7 @@ use bevy::prelude::Resource;
 use noise::{NoiseFn, Perlin};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use crate::constants::WORLD_HEIGHT;
+use crate::constants::{SEA_LEVEL, WORLD_HEIGHT};
 use crate::generation::biome::{BiomeType, get_biome_data};
 
 #[derive(Clone,Debug)]
@@ -35,25 +35,31 @@ impl BiomeMap {
         }
     }
 
-    pub fn generate(&mut self, seed: u64, count: usize, area_size: f64) {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    pub fn generate(&mut self, seed: u64, spacing: f64, area_size: f64) {
         let perlin = Perlin::new(seed as u32);
 
-        for _ in 0..count {
-            let x = rng.gen_range(-(area_size/2.0)..area_size/2.0);
-            let z = rng.gen_range(-(area_size/2.0)..area_size/2.0);
-            let (temperature, humidity, altitude) = sample_environment(&perlin, x, z);
-            let biome_type = choose_biome(temperature, humidity, altitude);
-            println!("{:?}", biome_type);
+        let half = area_size / 2.0;
+        let mut x = -half;
 
-            self.points.push(ClimatePoint {
-                x,
-                z,
-                temperature,
-                humidity,
-                altitude,
-                biome_type
-            });
+        while x <= half {
+            let mut z = -half;
+            while z <= half {
+                let (temperature, humidity, altitude) = sample_environment(&perlin, x, z);
+                let biome_type = choose_biome(temperature, humidity, altitude);
+                println!("{x} {z} => {:#?}", biome_type);
+
+                self.points.push(ClimatePoint {
+                    x,
+                    z,
+                    temperature,
+                    humidity,
+                    altitude,
+                    biome_type,
+                });
+
+                z += spacing;
+            }
+            x += spacing;
         }
     }
 
@@ -126,43 +132,22 @@ fn fractal_noise(perlin: &Perlin, x: f64, z: f64, octaves: usize, base_freq: f64
 }
 
 fn sample_environment(perlin: &Perlin, x: f64, z: f64) -> (f64, f64, f64) {
-    // Masque de montagne : où doit-on amplifier la hauteur ?
-    let mountain_mask = (perlin.get([x * 0.0012 + 999.0, z * 0.0012 + 999.0]) + 1.0) / 2.0;
-    let mountain_intensity = mountain_mask.powf(2.0); // plus doux au centre, plus fort vers les extrêmes
+    let temp: f64 = 0.0;
+    let humidity: f64 = 0.0;
 
-    // Génération du terrain de base (relief)
-    let raw_altitude = fractal_noise(perlin, x, z, 6, 0.02, 0.45);
-    let amplified_altitude = raw_altitude * (300.0 + 1200.0 * mountain_intensity); // monte jusqu’à 1500m
+    let frequency = 0.0005; // plus petit = plus large, plus grand = plus rugueux
+    let amplitude = 2.0;
+    let altitude = perlin.get([x * frequency, z * frequency]) * amplitude;
 
-    // Latitude - température de base
-    let normalized_latitude = ((z % 1000.0) / 1000.0) * 2.0 - 1.0;
-    let latitude_temp = (normalized_latitude * std::f64::consts::PI).cos();
-    let base_temp = 15.0 + 15.0 * latitude_temp;
-
-    // Refroidissement par altitude
-    let corrected_temp = base_temp - (amplified_altitude * 0.0065);
-    let norm_temp = corrected_temp.clamp(0.0, 40.0) / 40.0;
-
-    // Humidité
-    let humidity = (perlin.get([x * 0.003 + 1337.0, z * 0.003 + 1337.0]) + 1.0) / 2.0;
-
-    (norm_temp, humidity, amplified_altitude / 1500.0) // normalisé 0.0–1.0 si besoin
+    (temp, humidity, altitude)
 }
 
 pub fn choose_biome(mut temp: f64, humidity: f64, altitude: f64) -> BiomeType {
-    let humid = humidity.clamp(0.0, 1.0);
-    let alt = altitude.clamp(0.0, 1.0);
-
-    // Refroidissement en fonction de l'altitude (effet montagne)
-    let lapse_rate = 0.7;
-    temp -= alt * lapse_rate;
-    temp = temp.clamp(0.0, 1.0);
-
-    if altitude < get_biome_data(BiomeType::Ocean).max_height {
+    if altitude < (SEA_LEVEL / WORLD_HEIGHT) as f64 {
         return BiomeType::Ocean;
     }
 
-    if alt > 0.8 {
+    if altitude > 0.6 {
         return BiomeType::Mountain;
     }
 

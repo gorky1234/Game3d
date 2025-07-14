@@ -60,7 +60,7 @@ impl Plugin for ChunkGenerationPlugin {
 fn setup_biome_map(mut commands: Commands) {
     let mut map = BiomeMap::new();
     let seed = 0;
-    map.generate(seed, 1000, (WORLD_SIZE * 2) as f64);
+    map.generate(seed, 100.0, (WORLD_SIZE * 2) as f64);
     commands.insert_resource(BiomeMapArc(Arc::new(map)));
 }
 

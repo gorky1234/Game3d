@@ -40,7 +40,7 @@ fn spawn_player(mut commands: Commands) {
 
     let player = commands
         .spawn((
-            Transform::from_xyz(0.0, 258.0, 0.0),
+            Transform::from_xyz(-1000.0, 258.0, 300.0),
             RigidBody::Dynamic,
             Collider::capsule_y(1.8, 0.5),
             Velocity::zero(),

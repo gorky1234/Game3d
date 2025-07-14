@@ -29,17 +29,17 @@ pub fn get_biome_data(biome_type: BiomeType) -> Biome {
     match biome_type {
         BiomeType::Plains => Biome {
             base_height: SEA_LEVEL as f64,
-            max_height: WORLD_HEIGHT as f64,
-            amplitude: 15.0,
-            frequency: 0.008,
+            max_height: (SEA_LEVEL + 100) as f64,
+            amplitude: 5.0,
+            frequency: 0.02,
             surface_block: BlockType::Grass,
             underground_block: BlockType::Rock,
         },
         BiomeType::Mountain => Biome {
             base_height: SEA_LEVEL as f64,
             max_height: WORLD_HEIGHT as f64,
-            amplitude: 200.0,
-            frequency: 0.015,
+            amplitude: 300.0,
+            frequency: 0.01,
             surface_block: BlockType::Rock,
             underground_block: BlockType::Rock,
         },
