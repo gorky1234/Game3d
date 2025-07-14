@@ -11,6 +11,7 @@ pub struct ClimatePoint {
     pub temperature: f64,
     pub humidity: f64,
     pub altitude: f64,
+    pub biome_type: BiomeType
 }
 
 #[derive(Resource, Default, Clone)]
@@ -41,6 +42,7 @@ impl BiomeMap {
             let x = rng.gen_range(-(area_size/2.0)..area_size/2.0);
             let z = rng.gen_range(-(area_size/2.0)..area_size/2.0);
             let (temperature, humidity, altitude) = sample_environment(&perlin, x, z);
+            let biome_type = choose_biome(temperature, humidity, altitude);
 
             self.points.push(ClimatePoint {
                 x,
@@ -48,6 +50,7 @@ impl BiomeMap {
                 temperature,
                 humidity,
                 altitude,
+                biome_type
             });
         }
     }

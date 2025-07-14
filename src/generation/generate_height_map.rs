@@ -10,7 +10,7 @@ pub fn get_blended_biome_height(
     z: f64,
     perlin: &Perlin,
     climate_points: &[ClimatePoint],
-) -> (Biome, f64) {
+) -> f64 {
     let radius = 150.0;
 
     // Collecte des influences des points proches
@@ -28,7 +28,7 @@ pub fn get_blended_biome_height(
     }
 
     if influences.is_empty() {
-        return (get_biome_data(BiomeType::Plains), 64.0);
+        return get_biome_data(BiomeType::Plains).base_height;
     }
 
     let mut total_weight = 0.0;
@@ -37,7 +37,7 @@ pub fn get_blended_biome_height(
     let mut max_weight = 0.0;
 
     for (point, weight) in &influences {
-        let biome_type = choose_biome(point.temperature, point.humidity, point.altitude);
+        let biome_type = point.biome_type;
         let biome = get_biome_data(biome_type);
 
         let noise = perlin.get([x * biome.frequency + 1000.0, z * biome.frequency + 1000.0]);
@@ -48,14 +48,17 @@ pub fn get_blended_biome_height(
         total_weight += weight;
 
         if *weight > max_weight {
-            dominant_biome = biome_type;
             max_weight = *weight;
         }
     }
 
     final_height /= total_weight;
 
-    (get_biome_data(dominant_biome), final_height)
+    if (dominant_biome == BiomeType::Plains || dominant_biome == BiomeType::Mountain) && final_height > 90.0{
+        println!("{:#?} {:#?}", dominant_biome, final_height);
+    }
+
+    final_height
 }
 
 /// Génère une carte de hauteur à partir d’un chunk et des points climatiques
@@ -72,7 +75,7 @@ pub fn generate_height_map(
             let world_x = x * CHUNK_SIZE as i32 + local_x as i32;
             let world_z = z * CHUNK_SIZE as i32 + local_z as i32;
 
-            let (_, height) = get_blended_biome_height(
+            let height = get_blended_biome_height(
                 world_x as f64,
                 world_z as f64,
                 perlin,
@@ -84,7 +87,7 @@ pub fn generate_height_map(
     }
 
     // Lissage des pentes abruptes
-    let max_slope = 4;
+    /*let max_slope = 4;
     for _ in 0..2 {
         for x in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
@@ -103,7 +106,7 @@ pub fn generate_height_map(
                 }
             }
         }
-    }
+    }*/
 
     heightmap
 }
