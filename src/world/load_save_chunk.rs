@@ -86,6 +86,7 @@ struct ChunkLoadedEvent {
     chunk: Chunk
 }
 
+
 fn collect_loaded_chunks_system(
     mut tasks: ResMut<ChunkLoadTasks>,
     mut chunk_loaded_events: EventWriter<ChunkLoadedEvent>,
@@ -107,6 +108,8 @@ fn apply_loaded_chunks(
     mut chunk_to_update_event: EventWriter<ChunkToUpdateEvent>,
     mut world_data: ResMut<WorldData>,
 ) {
+    let task_pool = AsyncComputeTaskPool::get();
+
     for event in load_events.read() {
         let x = event.x;
         let z = event.z;
@@ -119,7 +122,6 @@ fn apply_loaded_chunks(
         to_generate.write(ToGenerateChunkEvent { x, z });
     }
 }
-
 
 pub async fn load_chunk(x: i32, z: i32) -> anyhow::Result<Chunk> {
     let (rx, rz) = (x.div_euclid(32), z.div_euclid(32));
