@@ -6,7 +6,8 @@ pub enum BlockType {
     Dirt,
     Rock,
     Brick,
-    Water
+    Water,
+    Sand
 }
 
 impl BlockType {
@@ -15,7 +16,8 @@ impl BlockType {
         BlockType::Grass,
         BlockType::Dirt,
         BlockType::Rock,
-        BlockType::Water
+        BlockType::Water,
+        BlockType::Sand
     ];
 
     pub fn from_string(name: &str) -> Self {
@@ -24,6 +26,7 @@ impl BlockType {
             "minecraft:dirt" => BlockType::Dirt,
             "minecraft:rock" => BlockType::Rock,
             "minecraft:water" => BlockType::Water,
+            "minecraft:sand" => BlockType::Sand,
             _ => BlockType::Air,
         }
     }

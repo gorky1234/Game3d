@@ -50,6 +50,7 @@ fn filename_to_block_type(name: &str) -> Option<BlockType> {
         "grass.jpg" => Some(BlockType::Grass),
         "rock.jpg" => Some(BlockType::Rock),
         "water.jpg" => Some(BlockType::Water),
+        "sand.jpg" => Some(BlockType::Sand),
         _ => None,
     }
 }

@@ -2,7 +2,8 @@ use bevy::prelude::Resource;
 use noise::{NoiseFn, Perlin};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use crate::generation::biome::BiomeType;
+use crate::constants::WORLD_HEIGHT;
+use crate::generation::biome::{BiomeType, get_biome_data};
 
 #[derive(Clone,Debug)]
 pub struct ClimatePoint {
@@ -43,6 +44,7 @@ impl BiomeMap {
             let z = rng.gen_range(-(area_size/2.0)..area_size/2.0);
             let (temperature, humidity, altitude) = sample_environment(&perlin, x, z);
             let biome_type = choose_biome(temperature, humidity, altitude);
+            println!("{:?}", biome_type);
 
             self.points.push(ClimatePoint {
                 x,
@@ -57,9 +59,9 @@ impl BiomeMap {
 
 
     /// Calcule les valeurs climatiques blendées autour d’un point
-    fn get_climate_blended(&self,
-        x: f64,
-        z: f64,
+    pub(crate) fn get_climate_blended(&self,
+                                      x: f64,
+                                      z: f64,
     ) -> (f64, f64, f64) {
         let perlin = Perlin::new(0);
         let radius = 120.0;
@@ -156,10 +158,11 @@ pub fn choose_biome(mut temp: f64, humidity: f64, altitude: f64) -> BiomeType {
     temp -= alt * lapse_rate;
     temp = temp.clamp(0.0, 1.0);
 
-    if alt < 0.3 {
+    if altitude < get_biome_data(BiomeType::Ocean).max_height {
         return BiomeType::Ocean;
     }
-    if alt > 0.55 {
+
+    if alt > 0.8 {
         return BiomeType::Mountain;
     }
 

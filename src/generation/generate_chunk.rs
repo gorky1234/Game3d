@@ -39,7 +39,7 @@ pub async fn generate_chunk(x: i32, z: i32, perlin: &Perlin, biomes_map: &BiomeM
 
                 let block_type= if biome == BiomeType::Ocean {
                     if y <= height {
-                        BlockType::Rock
+                        biome_data.underground_block
                     }
                     else if y <= SEA_LEVEL {
                         BlockType::Water

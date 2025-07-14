@@ -36,9 +36,7 @@ impl Plugin for PlayerPlugin {
     }
 }
 
-fn spawn_player(mut commands: Commands,
-                asset_server: Res<AssetServer>,
-                mut compensation_curves: ResMut<Assets<AutoExposureCompensationCurve>>,) {
+fn spawn_player(mut commands: Commands) {
 
     let player = commands
         .spawn((
