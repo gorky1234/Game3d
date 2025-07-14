@@ -5,7 +5,6 @@ use bevy::prelude::{Commands, Component, Entity, Event, EventReader, EventWriter
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use futures::FutureExt;
 use crate::constants::{CHUNK_SIZE, VIEW_DISTANCE, WORLD_SIZE};
-use crate::generation::generate_chunk::ToGenerateChunkEvent;
 use crate::player::Player;
 use crate::world::chunk::Chunk;
 use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;

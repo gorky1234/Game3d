@@ -13,7 +13,7 @@ use flate2::Status;
 use futures::FutureExt;
 use noise::{NoiseFn, Perlin};
 use crate::constants::{CHUNK_SIZE, SECTION_HEIGHT, WORLD_HEIGHT};
-use crate::generation::generate_chunk::ToGenerateChunkEvent;
+use crate::generation::chunk_generation_logic::ToGenerateChunkEvent;
 use crate::world::block::BlockType;
 use crate::world::chunk::Chunk;
 use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
