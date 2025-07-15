@@ -77,6 +77,7 @@ fn poll_chunk_tasks(
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<TextureAtlasMaterial>,
     mut chunk_tasks: ResMut<ChunkMeshTasks>,
+    mut world_data: ResMut<WorldData>
 ) {
     let mut completed = Vec::new();
 
@@ -88,13 +89,18 @@ fn poll_chunk_tasks(
                 &opaque_mesh,
                 &ComputedColliderShape::TriMesh(bevy_rapier3d::geometry::TriMeshFlags::default()),
             ) {
-                commands.spawn((
+                let entity = commands.spawn((
                     Mesh3d(opaque_mesh_handle.clone()),
                     MeshMaterial3d(materials.opaque_handle.clone()),
                     transform,
                     GlobalTransform::default(),
                     collider,
-                ));
+                )).id();
+
+                world_data.chunks_entities
+                    .entry(coords) // chunk_pos: (i32, i32)
+                    .or_insert_with(Vec::new)
+                    .push(entity);
 
             } else {
                 warn!("Pas de collider généré pour le mesh du chunk {:?}", coords);
@@ -104,12 +110,17 @@ fn poll_chunk_tasks(
                 if !indices.is_empty() {
                     let water_mesh_handle = meshes.add(water_mesh);
 
-                    commands.spawn((
+                    let entity =  commands.spawn((
                         Mesh3d(water_mesh_handle.clone()),
                         MeshMaterial3d(materials.water_handle.clone()), // transparent
                         transform,
                         GlobalTransform::default(),
-                    ));
+                    )).id();
+
+                    world_data.chunks_entities
+                        .entry(coords) // chunk_pos: (i32, i32)
+                        .or_insert_with(Vec::new)
+                        .push(entity);
 
                 }
             }

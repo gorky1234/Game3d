@@ -74,26 +74,22 @@ fn loading_and_unloading_chunks(
     }
 
     // Unload distant chunks
-    let chunks_to_unload: Vec<(i32, i32)> = world_data.chunks_loaded.iter()
-        .filter_map(|(&pos, _)| {
+    let chunks_to_unload: Vec<(i32, i32)> = world_data.chunks_loaded.iter().filter_map(|(&pos, _)| {
             if (IVec2::new(pos.0, pos.1) - new_chunk).abs().max_element() > VIEW_DISTANCE {
                 Some(pos)
             } else {
                 None
             }
-        })
-        .collect();
+    }).collect();
 
     // Étape 2 : Décharger ces chunks et les retirer de chunks_loaded
     for pos in chunks_to_unload {
         if let Some(entity) = world_data.chunks_entities.get(&pos) {
-            unload_chunk(&mut commands, *entity);
+            for et in entity {
+                commands.entity(*et).despawn();
+            }
             world_data.chunks_entities.remove(&pos);
+            world_data.chunks_loaded.remove(&pos);
         }
-        world_data.chunks_loaded.remove(&pos);
     }
-}
-
-fn unload_chunk(commands: &mut Commands, entity: Entity) {
-    commands.entity(entity).despawn_recursive();
 }

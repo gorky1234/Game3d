@@ -21,7 +21,7 @@ use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
 #[derive(Resource, Default, Clone)]
 pub struct WorldData {
     pub chunks_loaded: HashMap<(i32,i32), Chunk>,
-    pub chunks_entities: HashMap<(i32,i32), Entity>,
+    pub chunks_entities: HashMap<(i32,i32), Vec<Entity>>,
 }
 
 
