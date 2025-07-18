@@ -1,80 +1,54 @@
+use std::collections::HashMap;
+use bevy::math::IVec2;
+use bevy::prelude::Resource;
 use crate::generation::biome::{Biome, BiomeType, get_biome_data};
-use crate::generation::generate_biome_map::choose_biome;
-use noise::{NoiseFn, Perlin};
+use noise::{Fbm, NoiseFn, Perlin};
 use crate::constants::{CHUNK_SIZE, WORLD_HEIGHT};
-use crate::generation::generate_biome_map::{BiomeMap, ClimatePoint};
+use crate::generation::generate_biome_map::{BiomeMap, choose_biome};
+use crate::world::chunk::Chunk;
 
-/// Calcule la hauteur et le biome dominant à partir du climat blendé
-pub fn get_blended_biome_height(
-    x: f64,
-    z: f64,
-    perlin: &Perlin,
-    biome_map: &BiomeMap,
-) -> f64 {
-    let radius = 150.0;
-    let mut influences = Vec::new();
-
-    for point in &biome_map.points {
-        let dx = point.x - x;
-        let dz = point.z - z;
-        let dist2 = dx * dx + dz * dz;
-        if dist2 < radius * radius {
-            let dist = dist2.sqrt();
-            let weight = (1.0 - dist / radius).powi(3); // courbe douce
-            influences.push((point, weight));
-        }
-    }
-
-    if influences.is_empty() {
-        return get_biome_data(BiomeType::Plains).base_height;
-    }
-
-    let mut total_weight = 0.0;
-    let mut final_height = 0.0;
-
-    for (point, weight) in influences {
-        let biome = get_biome_data(point.biome_type);
-
-        let noise = perlin.get([
-            x * biome.frequency + 1000.0,
-            z * biome.frequency + 1000.0,
-        ]);
-        let normalized = (noise + 1.0) / 2.0;
-
-        let height = biome.base_height + normalized * biome.amplitude;
-        final_height += height * weight;
-        total_weight += weight;
-    }
-
-    final_height / total_weight
+#[derive(Resource, Default, Clone)]
+pub struct HeightMap {
 }
 
-/// Génère une carte de hauteur à partir d’un chunk et des points climatiques
-pub fn generate_height_map(
-    perlin: &Perlin,
-    chunk_x: i32,
-    chunk_z: i32,
-    biome_map: &BiomeMap,
-) -> Vec<Vec<usize>> {
-    let mut heightmap = vec![vec![0usize; CHUNK_SIZE]; CHUNK_SIZE];
 
-    for local_x in 0..CHUNK_SIZE {
-        for local_z in 0..CHUNK_SIZE {
-            let world_x = chunk_x * CHUNK_SIZE as i32 + local_x as i32;
-            let world_z = chunk_z * CHUNK_SIZE as i32 + local_z as i32;
+impl HeightMap{
 
-            let height = get_blended_biome_height(
-                world_x as f64,
-                world_z as f64,
-                perlin,
-                biome_map,
-            );
-
-            heightmap[local_x][local_z] = height
-                .floor()
-                .clamp(0.0, WORLD_HEIGHT as f64 - 1.0) as usize;
-        }
+    pub fn new() -> Self {
+        Self {  }
     }
 
-    heightmap
+    pub fn get_chunk(&self, chunk_x: i64, chunk_z: i64, biomes_map: &BiomeMap) -> Vec<Vec<usize>> {
+        let mut chunk_heightmap = vec![vec![0usize; CHUNK_SIZE]; CHUNK_SIZE];
+        for local_x in 0..CHUNK_SIZE {
+            for local_z in 0..CHUNK_SIZE {
+                let world_x = chunk_x  * CHUNK_SIZE as i64 + local_x as i64;
+                let world_z = chunk_z  * CHUNK_SIZE as i64 + local_z as i64;
+
+                let mut current_base_height = 0.0;
+                let mut current_amplitude = 0.0;
+                let mut current_frequency = 0.0;
+                let mut total_dist = 0.0;
+
+                for (dist, biome) in biomes_map.get_biome(world_x,world_z){
+                    let current_biome_data = get_biome_data(biome);
+                    current_base_height += current_biome_data.base_height * dist;
+                    current_amplitude += current_biome_data.amplitude * dist;
+                    current_frequency += current_biome_data.frequency * dist;
+                    total_dist += dist;
+                }
+                current_base_height /= total_dist;
+                current_amplitude /= total_dist;
+                current_frequency /= total_dist;
+
+
+                let mut fbm: Fbm<Perlin> = Fbm::new(0);
+                fbm.octaves = 5;
+                fbm.frequency = current_frequency;
+
+                chunk_heightmap[local_x][local_z] = (current_base_height + (fbm.get([world_x as f64 * current_frequency, world_z as f64 * current_frequency]) + 1.0) * current_amplitude) as usize;
+            }
+        }
+        chunk_heightmap
+    }
 }

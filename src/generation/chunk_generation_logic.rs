@@ -10,8 +10,9 @@ use crate::constants::WORLD_SIZE;
 use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
 use crate::world::load_save_chunk::{ChunkLoadTasks, load_chunk, WorldData};
 use crate::generation::biome::{Biome, BiomeType, get_biome_data};
-use crate::generation::generate_biome_map::BiomeMap;
+use crate::generation::generate_biome_map::{BiomeMap, generate_biome_image};
 use crate::generation::generate_chunk::generate_chunk;
+use crate::generation::generate_height_map::HeightMap;
 use crate::world::chunk::Chunk;
 
 pub struct ChunkGenerationPlugin;
@@ -48,7 +49,7 @@ impl Plugin for ChunkGenerationPlugin {
             .add_event::<ChunkGenerateEvent>()
             .init_resource::<ChunkGenerateQueue>()
 
-            .add_systems(Startup, setup_biome_map)
+            .add_systems(Startup, setup_maps)
             .add_systems(Update, enqueue_generate_requests)
             .add_systems(Update, generate_chunks_system)
             .add_systems(Update, collect_generate_chunks_system)
@@ -57,11 +58,16 @@ impl Plugin for ChunkGenerationPlugin {
 }
 
 /// Initialisation de la map de biomes (à faire une fois au démarrage)
-fn setup_biome_map(mut commands: Commands) {
+fn setup_maps(mut commands: Commands) {
     let mut map = BiomeMap::new();
-    let seed = 0;
-    map.generate(seed, 100.0, (WORLD_SIZE * 2) as f64);
-    commands.insert_resource(BiomeMapArc(Arc::new(map)));
+    commands.insert_resource(BiomeMapArc(Arc::new(map.clone())));
+
+    generate_biome_image(&map, -69, 47, 1000);
+
+    //let mut height_map = HeightMap::new();
+    //height_map.generate(-69, 47, &map);
+    commands.insert_resource(HeightMap::new());
+
 }
 
 fn enqueue_generate_requests(
@@ -83,6 +89,7 @@ const MAX_CONCURRENT_TASKS: usize = 5;
 /// Système de génération des chunks (à appeler avec une entité ou un événement)
 fn generate_chunks_system(
     biome_map: Res<BiomeMapArc>,
+    height_map: Res<HeightMap>,
     mut queue: ResMut<ChunkGenerateQueue>,
 ) {
     let task_pool = AsyncComputeTaskPool::get();
@@ -92,10 +99,11 @@ fn generate_chunks_system(
             let x = event.x;
             let z = event.z;
             let biome_map = biome_map.0.clone();
+            let height_map = height_map.clone();
 
             let task = task_pool.spawn(async move {
                 let perlin = Perlin::new(0);
-                let chunk = generate_chunk(x, z, &perlin, &biome_map).await;
+                let chunk = generate_chunk(x, z, &perlin, &biome_map, &height_map).await;
                 (x, z, chunk)
             });
 

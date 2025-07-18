@@ -5,4 +5,4 @@ pub const WORLD_SIZE: usize = 2000;
 
 pub const SEA_LEVEL: usize = 126;
 
-pub  const VIEW_DISTANCE: i32 = 12;
+pub  const VIEW_DISTANCE: i32 = 10 ;
