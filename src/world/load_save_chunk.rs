@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, create_dir_all};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -16,8 +16,10 @@ use crate::constants::{CHUNK_SIZE, SECTION_HEIGHT, WORLD_HEIGHT};
 use crate::generation::chunk_generation_logic::ToGenerateChunkEvent;
 use crate::world::block::BlockType;
 use crate::world::chunk::Chunk;
-use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
+use crate::render::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
 use bevy::render::primitives::Aabb;
+
+const MAX_LOAD_TASKS: usize = 5;
 
 #[derive(Resource, Default, Clone)]
 pub struct WorldData {
@@ -25,10 +27,16 @@ pub struct WorldData {
     pub chunks_sections_meshes: HashMap<(i32,i32, i32), Vec<(Entity, Aabb)>>,
 }
 
+#[derive(Default, Resource)]
+pub struct ChunkLoadQueue {
+    pub queue: VecDeque<ToLoadChunkEvent>,
+    pub current_tasks: Vec<Task<(i32, i32, Chunk)>>,
+}
 
 pub struct WorldDataPlugin;
 
 #[derive(Default, Event)]
+#[derive(Clone)]
 pub struct ToLoadChunkEvent {
     pub x: i32,
     pub z: i32,
@@ -40,46 +48,6 @@ pub struct ToUnloadChunkEvent {
     pub z: i32,
 }
 
-impl Plugin for WorldDataPlugin {
-    fn build(&self, app: &mut App) {
-        app
-            .insert_resource(WorldData::default())
-            .add_event::<ToGenerateChunkEvent>()
-            .add_event::<ToLoadChunkEvent>()
-            .add_event::<ToUnloadChunkEvent>()
-            .add_event::<ChunkLoadedEvent>()
-            .add_systems(Update, load_chunk_system)
-            .add_systems(Update, apply_loaded_chunks)
-            .init_resource::<ChunkLoadTasks>()
-            .add_systems(Update, collect_loaded_chunks_system);
-    }
-}
-
-pub fn load_chunk_system(
-    mut event_reader: EventReader<ToLoadChunkEvent>,
-    mut tasks: ResMut<ChunkLoadTasks>,
-) {
-    let task_pool = AsyncComputeTaskPool::get();
-
-    for event in event_reader.read() {
-
-        let x = event.x;
-        let z = event.z;
-
-        let task = task_pool.spawn(async move {
-            let chunk = load_chunk(x, z).await.expect("Erreur chargement chunk");
-            (x, z, chunk)
-        });
-
-        tasks.tasks.push(task);
-    }
-}
-
-#[derive(Default, Resource)]
-pub struct ChunkLoadTasks {
-    pub tasks: Vec<Task<(i32, i32, Chunk)>>, // x, z, chunk
-}
-
 #[derive(Event)]
 struct ChunkLoadedEvent {
     x: i32,
@@ -87,18 +55,67 @@ struct ChunkLoadedEvent {
     chunk: Chunk
 }
 
+impl Plugin for WorldDataPlugin {
+    fn build(&self, app: &mut App) {
+        app
+            .insert_resource(WorldData::default())
+            .add_event::<ToGenerateChunkEvent>()
+            .add_event::<ToUnloadChunkEvent>()
 
-fn collect_loaded_chunks_system(
-    mut tasks: ResMut<ChunkLoadTasks>,
-    mut chunk_loaded_events: EventWriter<ChunkLoadedEvent>,
+            .add_event::<ToLoadChunkEvent>()
+            .add_event::<ChunkLoadedEvent>()
+            .init_resource::<ChunkLoadQueue>()
+            .add_systems(Update, enqueue_load_requests)
+            .add_systems(Update, load_chunks_system)
+            .add_systems(Update, collect_load_chunks_system)
+            .add_systems(Update, apply_loaded_chunks);
+    }
+}
+
+fn enqueue_load_requests(
+    mut queue: ResMut<ChunkLoadQueue>,
+    mut event_reader: EventReader<ToLoadChunkEvent>,
 ) {
-    // On garde uniquement les tâches non terminées
-    tasks.tasks.retain_mut(|task| {
-        if let Some((x, z, chunk)) = task.now_or_never() {
-            chunk_loaded_events.write(ChunkLoadedEvent { x, z, chunk });
-            false // tâche terminée, on la supprime
+    for event in event_reader.read() {
+        if !queue.queue.iter().any(|e| e.x == event.x && e.z == event.z) {
+            queue.queue.push_back(event.clone());
+        }
+    }
+}
+
+use std::time::{Duration, SystemTime};
+fn load_chunks_system(
+    mut queue: ResMut<ChunkLoadQueue>,
+) {
+    let task_pool = AsyncComputeTaskPool::get();
+
+    while queue.current_tasks.len() < MAX_LOAD_TASKS {
+        if let Some(event) = queue.queue.pop_front() {
+            let x = event.x;
+            let z = event.z;
+
+            let task = task_pool.spawn(async move {
+                let chunk = load_chunk(x, z).await.expect("Erreur chargement chunk");
+                (x, z, chunk)
+            });
+
+            queue.current_tasks.push(task);
         } else {
-            true // encore en cours
+            break;
+        }
+    }
+}
+
+fn collect_load_chunks_system(
+    mut queue: ResMut<ChunkLoadQueue>,
+    mut writer: EventWriter<ChunkLoadedEvent>,
+) {
+    queue.current_tasks.retain_mut(|task| {
+        if let Some((x, z, chunk)) = task.now_or_never() {
+            writer.write(ChunkLoadedEvent { x, z, chunk });
+            false
+        } else {
+            true
         }
     });
 }

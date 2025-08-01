@@ -7,10 +7,10 @@ use bevy::tasks::{AsyncComputeTaskPool, Task};
 use futures::FutureExt;
 use noise::Perlin;
 use crate::constants::WORLD_SIZE;
-use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
-use crate::world::load_save_chunk::{ChunkLoadTasks, load_chunk, WorldData};
+use crate::render::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
+use crate::world::load_save_chunk::{load_chunk, WorldData};
 use crate::generation::biome::{Biome, BiomeType, get_biome_data};
-use crate::generation::generate_biome_map::{BiomeMap, generate_biome_image};
+use crate::generation::generate_biome_map::{BiomeMap};
 use crate::generation::generate_chunk::generate_chunk;
 use crate::generation::generate_height_map::HeightMap;
 use crate::world::chunk::Chunk;
@@ -62,7 +62,8 @@ fn setup_maps(mut commands: Commands) {
     let mut map = BiomeMap::new();
     commands.insert_resource(BiomeMapArc(Arc::new(map.clone())));
 
-    generate_biome_image(&map, -69, 47, 1000);
+    map.generate();
+    //generate_biome_image(&map, -69, 47, 500);
 
     //let mut height_map = HeightMap::new();
     //height_map.generate(-69, 47, &map);

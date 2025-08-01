@@ -1,154 +1,303 @@
+use std::process::exit;
 use std::collections::HashSet;
 use bevy::prelude::Resource;
 use image::{ImageBuffer, Luma, Rgb, RgbImage};
-use noise::{NoiseFn, Perlin, Fbm};
+use noise::{NoiseFn, Perlin, Fbm, OpenSimplex};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use crate::constants::{CHUNK_SIZE, SEA_LEVEL, WORLD_HEIGHT};
 use crate::generation::biome::{ALL_BIOMES, BiomeType, get_biome_data};
 
-#[derive(Debug, Clone)]
-pub struct ClimateParams {
-    pub temperature: f64,
-    pub humidity: f64,
-    pub continentalness: f64,
-    pub erosion: f64,
-    pub weirdness: f64,
-    pub ridges: f64,
+
+fn zoom_2x(input: &Vec<Vec<bool>>) -> Vec<Vec<bool>> {
+    let old_height = input.len();
+    let old_width = if old_height > 0 { input[0].len() } else { 0 };
+
+    let new_height = old_height * 2;
+    let new_width = old_width * 2;
+
+    let mut output = vec![vec![false; new_width]; new_height];
+
+    for y in 0..old_height {
+        for x in 0..old_width {
+            let val = input[y][x];
+            // Remplir un carré 2x2 dans la matrice agrandie
+            output[y * 2][x * 2] = val;
+            output[y * 2][x * 2 + 1] = val;
+            output[y * 2 + 1][x * 2] = val;
+            output[y * 2 + 1][x * 2 + 1] = val;
+        }
+    }
+
+    output
 }
+
+
+fn apply_rule(input: &Vec<Vec<bool>>) -> Vec<Vec<bool>> {
+    let height = input.len();
+    let width = if height > 0 { input[0].len() } else { 0 };
+
+    // Matrice résultat
+    let mut output = input.clone();
+
+    // Déplacements relatifs des 8 voisins
+    let neighbors = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),          (0, 1),
+        (1, -1),  (1, 0), (1, 1),
+    ];
+
+    for y in 0..height {
+        for x in 0..width {
+            let current = input[y][x];
+            let mut true_count = 0;
+            let mut false_count = 0;
+
+            // Compter les voisins
+            for (dy, dx) in &neighbors {
+                let ny = y as isize + dy;
+                let nx = x as isize + dx;
+
+                if ny >= 0 && ny < height as isize && nx >= 0 && nx < width as isize {
+                    if input[ny as usize][nx as usize] {
+                        true_count += 1;
+                    } else {
+                        false_count += 1;
+                    }
+                }
+            }
+
+            // Appliquer la règle selon la majorité des voisins
+            if !current && true_count > false_count {
+                output[y][x] = true;
+            } else if current && false_count > true_count {
+                output[y][x] = false;
+            }
+            // Sinon la cellule reste identique
+        }
+    }
+
+    output
+}
+
+fn convert_to_biomes(input: &Vec<Vec<bool>>) -> Vec<Vec<BiomeType>> {
+    let height = input.len();
+    let width = if height > 0 { input[0].len() } else { 0 };
+
+    let mut result = vec![vec![BiomeType::Plain; width]; height];
+    let mut rng = rand::thread_rng();
+
+    let neighbors = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),          (0, 1),
+        (1, -1),  (1, 0), (1, 1),
+    ];
+
+    for y in 0..height {
+        for x in 0..width {
+            let current = input[y][x];
+
+            let mut true_count = 0;
+            let mut false_count = 0;
+
+            for (dy, dx) in &neighbors {
+                let ny = y as isize + dy;
+                let nx = x as isize + dx;
+
+                if ny >= 0 && ny < height as isize && nx >= 0 && nx < width as isize {
+                    if input[ny as usize][nx as usize] {
+                        true_count += 1;
+                    } else {
+                        false_count += 1;
+                    }
+                } else {
+                    // Bord hors grille = on peut choisir de l'ignorer ou le traiter comme false/true
+                    // Ici on ignore
+                }
+            }
+
+            let biome = match current {
+                false => {
+                    if true_count == 0 {
+                        if rng.r#gen::<f64>() < 0.3 {
+                            BiomeType::Abyss
+                        }
+                        else {
+                            BiomeType::Ocean
+                        }
+                    } else {
+                        BiomeType::Ocean
+                    }
+                }
+                true => {
+                    if false_count == 0 {
+                        if rng.r#gen::<f64>() < 0.3 {
+                            BiomeType::Mountain
+                        }
+                        else {
+                            BiomeType::Plain
+                        }
+                    } else {
+                        BiomeType::Plain
+                    }
+                }
+            };
+
+            result[y][x] = biome;
+        }
+    }
+
+    result
+}
+
+fn smooth_biomes(input: &Vec<Vec<BiomeType>>) -> Vec<Vec<BiomeType>> {
+    let height = input.len();
+    let width = if height > 0 { input[0].len() } else { 0 };
+
+    let mut output = input.clone();
+
+    // Voisins orthogonaux (haut, bas, gauche, droite)
+    let neighbors = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+    ];
+
+    for y in 0..height {
+        for x in 0..width {
+            match input[y][x] {
+                BiomeType::Abyss => {
+                    // Vérifie si tous voisins orthogonaux sont Ocean (ou hors limites)
+                    let all_ocean = neighbors.iter().all(|(dy, dx)| {
+                        let ny = y as isize + dy;
+                        let nx = x as isize + dx;
+                        if ny >= 0 && ny < height as isize && nx >= 0 && nx < width as isize {
+                            matches!(input[ny as usize][nx as usize], BiomeType::Ocean)
+                        } else {
+                            true // bord traité comme ok
+                        }
+                    });
+
+                    if all_ocean {
+                        output[y][x] = BiomeType::Ocean;
+                    }
+                }
+
+                BiomeType::Mountain => {
+                    // Vérifie si tous voisins orthogonaux sont Plain (ou hors limites)
+                    let all_plain = neighbors.iter().all(|(dy, dx)| {
+                        let ny = y as isize + dy;
+                        let nx = x as isize + dx;
+                        if ny >= 0 && ny < height as isize && nx >= 0 && nx < width as isize {
+                            matches!(input[ny as usize][nx as usize], BiomeType::Plain)
+                        } else {
+                            true // bord traité comme ok
+                        }
+                    });
+
+                    if all_plain {
+                        output[y][x] = BiomeType::Plain;
+                    }
+                }
+
+                _ => {} // autres biomes inchangés
+            }
+        }
+    }
+
+    output
+}
+
 
 #[derive(Resource, Default, Clone)]
 pub struct BiomeMap {
+    biomes_map: Vec<Vec<BiomeType>>
 }
-
 
 impl BiomeMap {
 
     pub fn new() -> Self {
-        Self {}
-    }
-
-
-    pub fn compute_climate_params(&self, x: i64, z: i64) -> ClimateParams {
-        let perlin = Perlin::new(0u32);
-        let fbm: Fbm<Perlin> = Fbm::new(0);
-
-        let scale = 0.005;
-
-        let temperature =    fbm.get([x as f64 * scale, z as f64 * scale]);
-        let humidity =       fbm.get([x as f64 * scale + 100.0, z as f64 * scale + 100.0]);
-
-
-        let continent_scale = 0.001;
-        let mut continentalness = perlin.get([
-            x as f64 * continent_scale + 200.0,
-            z as f64 * continent_scale + 200.0
-        ]) * 6.0;
-        continentalness = normalize(continentalness);
-
-        let erosion =        perlin.get([x as f64 * scale + 300.0, z as f64 * scale + 300.0]);
-
-        let weirdness = fbm.get([x as f64 * scale + 400.0, z as f64 * scale + 400.0]);
-        let ridges = fbm.get([x as f64 * scale + 500.0, z as f64 * scale + 500.0]);
-
-        ClimateParams {
-            temperature,
-            humidity,
-            continentalness,
-            erosion,
-            weirdness,
-            ridges,
+        Self {
+            biomes_map: vec![vec![BiomeType::Plain; 1600]; 1600],
         }
     }
 
-    pub fn get_biome(&self, x: i64, z: i64) -> Vec<(f64, BiomeType)> {
-        let climate = self.compute_climate_params(x, z);
-        choose_biome(&climate)
-    }
-}
-
-fn normalize(value: f64) -> f64 {
-    (value - -5.0 )/(5.0 - -5.0)
-}
-
-pub fn choose_biome(params: &ClimateParams) -> Vec<(f64, BiomeType)> {
-    let mut scored_biomes: Vec<(f64, BiomeType)> = Vec::new();
-
-    for biome_type in ALL_BIOMES {
-        let biome_data =  get_biome_data(biome_type);
-
-        /*let distance = (biome_data.temperature - params.temperature).powi(2) +
-            (biome_data.humidity - params.humidity).powi(2) +
-            (biome_data.continentalness - params.continentalness).powi(2);*/
-
-        let distance = (biome_data.temperature - params.temperature).abs() +
-            (biome_data.humidity - params.humidity).abs() +
-            (biome_data.continentalness - params.continentalness).abs();
-
-        // Inversion en score : plus la distance est faible, plus le score est grand
-        let epsilon = 1e-6; // pour éviter division par zéro
-        let final_score = 1.0 / (distance + epsilon);
-
-        scored_biomes.push((final_score, biome_type));
-    }
-
-    let total_score: f64 = scored_biomes.iter().map(|(s, _)| s).sum();
-
-    // Normalisation : poids entre 0.0 et 1.0
-    let mut normalized: Vec<(f64, BiomeType)> = scored_biomes
-        .into_iter()
-        .map(|(score, biome)| (score / total_score, biome))
-        .collect();
-
-    // Tri décroissant : du biome le plus probable au moins probable
-    normalized.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-
-    normalized
-}
-
-
-pub fn generate_biome_image(biome_map: &BiomeMap, x: i32, y: i32, size: i32) {
-    let mut matrix: Vec<Vec<[u8; 3]>> = vec![
-        vec![[0, 0, 0]; size as usize];
-        size as usize
-    ];
-
-    for local_x in 0..size {
-        for local_z in 0..size {
-            let world_x = local_x * CHUNK_SIZE as i32 + local_x;
-            let world_z = local_z * CHUNK_SIZE as i32 + local_z;
-
-            let biome_type = biome_map.get_biome(world_x as i64, world_z as i64)[0].1;
-            let color: [u8; 3] =  if biome_type == BiomeType::Ocean {
-                [173, 216, 230]
-            } else if biome_type == BiomeType::Abyss {
-                [25, 25, 112]
-            } /*else if biome_type == BiomeType::Beach {
-                [255, 255, 0]
-            } */else if biome_type == BiomeType::Plains {
-                [0, 255, 0]
-            } else if biome_type == BiomeType::Mountain {
-                [125, 125, 125]
-            }else {
-                [255, 0, 0]
-            };
-
-            matrix[local_x as usize][local_z as usize] = color;
+    pub fn generate(&mut self) {
+        //une case = 4096 * 4096 block
+        let mut biome_map_size_0 = vec![vec![true; 100]; 100];
+        let noise = OpenSimplex::new(0);
+        let mut rng = rand::thread_rng();
+        for x in 0..100 {
+            for z in 0..100 {
+                // Génère un float entre 0 et 1
+                let r: f64 = rng.r#gen();
+                if r < 0.5 {
+                    biome_map_size_0[x][z] = false;
+                }
+            }
         }
-    }
 
-    let width = matrix[0].len() as u32;
-    let height = matrix.len() as u32;
+        let biome_map_size_1 = zoom_2x(&biome_map_size_0);
+        let biome_map_size_1 = apply_rule(&biome_map_size_1);
+        let biome_map_size_2 = zoom_2x(&biome_map_size_1);
+        let biome_map_size_3 = zoom_2x(&biome_map_size_2);
+        let biome_map_size_4 = zoom_2x(&biome_map_size_3);
+        let biome_map_size_4 = apply_rule(&biome_map_size_4);
 
-    // Créer une image en niveaux de gris
-    let mut img: RgbImage = ImageBuffer::new(width as u32, height as u32);
 
-    for (y, row) in matrix.iter().enumerate() {
-        for (x, &[r, g, b]) in row.iter().enumerate() {
-            img.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
+        //generate img
+        let mut img: RgbImage = ImageBuffer::new(1600 as u32, 1600 as u32);
+
+        for (y, row) in biome_map_size_4.iter().enumerate() {
+            for (x, &value) in row.iter().enumerate() {
+                let color = if value {
+                    Rgb([0, 255, 0])
+                } else {
+                    Rgb([0, 0, 255])
+                };
+                img.put_pixel(x as u32, y as u32, color);
+            }
         }
+
+        img.save("biome_map_size_4.png").expect("Erreur lors de la sauvegarde de l'image");
+
+        let biomes = convert_to_biomes(&biome_map_size_4);
+        self.biomes_map = smooth_biomes(&biomes);
+
+
+        let mut img_biomes: RgbImage = ImageBuffer::new(1600 as u32, 1600 as u32);
+
+        for (y, row) in self.biomes_map.iter().enumerate() {
+            for (x, &value) in row.iter().enumerate() {
+                let color =  if value == BiomeType::Ocean {
+                    Rgb([173, 216, 230])
+                } else if value == BiomeType::Abyss {
+                    Rgb([25, 25, 112])
+                } else if value == BiomeType::Plain {
+                    Rgb([0, 255, 0])
+                } else if value == BiomeType::Mountain {
+                    Rgb([125, 125, 125])
+                }else {
+                    Rgb([255, 0, 0])
+                };
+
+                img_biomes.put_pixel(x as u32, y as u32, color);
+            }
+        }
+        img_biomes.save("biome_map.png").expect("Erreur lors de la sauvegarde de l'image");
     }
 
-    // Sauvegarder l'image
-    img.save("output.png").expect("Erreur lors de la sauvegarde");
+
+    pub fn get_biome(&self, x_block: i64, z_block: i64) -> BiomeType {
+        let biome_size = 256;
+        let map_size = self.biomes_map.len() as i32; // ici 1600
+
+        // calcul position case relative à 0,0
+        let x_index = (x_block.div_euclid(biome_size)) + (map_size / 2) as i64;
+        let z_index = (z_block.div_euclid(biome_size)) + (map_size / 2) as i64;
+
+
+        self.biomes_map[z_index as usize][x_index as usize]
+    }
 }

@@ -8,6 +8,15 @@ pub struct ChunkSection {
     pub palette: Vec<String>,
 }
 
+impl ChunkSection {
+    pub fn get_block(&self, x: usize, y: usize, z: usize) -> BlockType {
+        let index = (y * 16 + z) * 16 + x;
+        let palette_index = self.blocks[index];
+        let block_name = &self.palette[palette_index as usize];
+        BlockType::from_string(block_name)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub x: i32,

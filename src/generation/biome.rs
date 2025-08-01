@@ -4,16 +4,16 @@ use crate::world::block::BlockType;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BiomeType {
     Mountain,
-    Plains,
-    //Beach,
+    Plain,
+    Beach,
     Ocean,
     Abyss
 }
 
-pub const ALL_BIOMES: [BiomeType; 4] = [
+pub const ALL_BIOMES: [BiomeType; 5] = [
     BiomeType::Mountain,
-    BiomeType::Plains,
-    //BiomeType::Beach,
+    BiomeType::Plain,
+    BiomeType::Beach,
     BiomeType::Ocean,
     BiomeType::Abyss,
 ];
@@ -40,14 +40,14 @@ pub fn get_biome_data(biome_type: BiomeType) -> Biome {
             humidity: 0.0,
             continentalness: 1.0,
 
-            base_height: (SEA_LEVEL + 28) as f64,
+            base_height: (SEA_LEVEL + 10) as f64,
             amplitude: 200.0,
             frequency: 0.1,
             size_factor: 1.5,
             surface_block: BlockType::Rock,
             underground_block: BlockType::Rock,
         },
-        BiomeType::Plains => Biome {
+        BiomeType::Plain => Biome {
             temperature: 0.0,
             humidity: 0.0,
             continentalness: 0.5,
@@ -60,26 +60,25 @@ pub fn get_biome_data(biome_type: BiomeType) -> Biome {
             surface_block: BlockType::Grass,
             underground_block: BlockType::Rock,
         },
-        /*BiomeType::Beach => Biome {
-            temperature: 0.6,
-            humidity: 0.7,
+        BiomeType::Beach => Biome {
+            temperature: 0.0,
+            humidity: 0.0,
             continentalness: 0.0,
 
-            base_height: SEA_LEVEL as f64,  // Niveau bas, sous la mer
+            base_height: (SEA_LEVEL + 4) as f64,
             amplitude: 5.0,
             frequency: 0.02,
-            size_factor: 0.5,
-
+            size_factor: 1.0,
 
             surface_block: BlockType::Sand,
-            underground_block: BlockType::Sand, // Ou terre meuble sous l'eau
-        },*/
+            underground_block: BlockType::Rock,
+        },
         BiomeType::Ocean => Biome {
             temperature: 0.0,
             humidity: 1.0,
-            continentalness: -0.5,
+            continentalness: -0.1,
 
-            base_height: (SEA_LEVEL - 40) as f64,  // Niveau bas, sous la mer
+            base_height: (SEA_LEVEL - 80) as f64,  // Niveau bas, sous la mer
             amplitude: 25.0,
             frequency: 0.005,
             size_factor: 2.0,
@@ -90,9 +89,9 @@ pub fn get_biome_data(biome_type: BiomeType) -> Biome {
         BiomeType::Abyss => Biome {
             temperature: 0.0,
             humidity: 1.0,
-            continentalness: -1.0,
+            continentalness: -0.5,
 
-            base_height: (SEA_LEVEL - 60) as f64,  // Niveau bas, sous la mer
+            base_height: (SEA_LEVEL - 110) as f64,  // Niveau bas, sous la mer
             amplitude: 100.0,
             frequency: 0.005,
             size_factor: 1.0,

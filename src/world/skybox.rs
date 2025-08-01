@@ -7,6 +7,7 @@ use bevy::pbr::{DirectionalLight, StandardMaterial};
 use bevy::pbr::light_consts::lux::AMBIENT_DAYLIGHT;
 use bevy::prelude::{AlphaMode, Commands, Component, default, Entity, Mesh, Query, Res, ResMut, Resource, Time, Timer, TimerMode, Transform, With};
 use bevy_atmosphere::prelude::*;
+use bevy_pbr::VolumetricLight;
 
 #[derive(Component)]
 struct Sun;

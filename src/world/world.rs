@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use bevy::app::{App, Plugin};
 use crate::generation::chunk_generation_logic::ChunkGenerationPlugin;
 use crate::world::chunk_loadings_logic::ChunkLoadingsPlugin;
-use crate::world::chunk_loadings_mesh_logic::GenerateMeshChunksPlugin;
+use crate::render::chunk_loadings_mesh_logic::GenerateMeshChunksPlugin;
 use crate::world::load_save_chunk::{WorldData, WorldDataPlugin};
 use crate::world::skybox::SkyboxPlugin;
 

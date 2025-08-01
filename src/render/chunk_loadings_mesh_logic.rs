@@ -4,7 +4,7 @@ use bevy_rapier3d::prelude::TriMeshFlags;
 use bevy_rapier3d::prelude::ComputedColliderShape;
 use bevy_rapier3d::prelude::Collider;
 use bevy::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::task;
@@ -21,8 +21,8 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::FutureExt;
 use crate::player::Player;
 use crate::constants::{CHUNK_SIZE, SECTION_HEIGHT, VIEW_DISTANCE, WORLD_HEIGHT};
-use crate::generate_mesh_chunk::generate_chunk_sections_mesh_async;
-use crate::world::load_save_chunk::WorldData;
+use crate::render::generate_mesh_chunk::generate_mesh_from_chunk;
+use crate::world::load_save_chunk::{ToLoadChunkEvent, WorldData};
 
 #[derive(Event,Clone)]
 pub struct ChunkToUpdateEvent {
@@ -65,7 +65,8 @@ fn queue_chunk_mesh_tasks(
                 let atlas_material = atlas_material.clone();
 
                 let task = thread_pool.spawn(async move {
-                    generate_chunk_sections_mesh_async(chunk_data, world_data, atlas_material).await
+                    //generate_chunk_sections_mesh_async(chunk_data, world_data, atlas_material).await
+                    generate_mesh_from_chunk(&chunk_data, &atlas_material).await
                 });
 
                 chunk_tasks.tasks.insert((x, z), task);

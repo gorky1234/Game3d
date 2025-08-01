@@ -8,7 +8,7 @@ use bevy::prelude::*;
 use bevy_atmosphere::model::AtmosphereModel;
 use bevy_atmosphere::plugin::{AtmosphereCamera, AtmospherePlugin};
 use bevy_atmosphere::prelude::{AtmosphereMut, Nishita};
-use bevy_pbr::{Atmosphere, AtmosphereSettings};
+use bevy_pbr::{Atmosphere, AtmosphereSettings, VolumetricFog};
 use bevy_rapier3d::prelude::*;
 use crate::camera::MovementSettings;
 use crate::world::block::BlockType;
@@ -40,7 +40,7 @@ fn spawn_player(mut commands: Commands) {
 
     let player = commands
         .spawn((
-            Transform::from_xyz(-1109.0, 258.0, 760.0),
+            Transform::from_xyz(1500.0, 258.0, 1000.0),
             RigidBody::Dynamic,
             Collider::capsule_y(1.8, 0.5),
             Velocity::zero(),
@@ -73,11 +73,13 @@ fn spawn_player(mut commands: Commands) {
             ..default()
         },
         /*auto_exposure,*/
-        Tonemapping::AcesFitted,
+        Tonemapping::TonyMcMapface,
+        Bloom::default(),
         Transform::from_xyz(0.0, 0.15, -1.0).looking_at(Vec3::Y * 0.3, Vec3::Y),
         AtmosphereCamera::default(),
         atmosphere_settings
     )).id();
+
 
     commands.entity(player).add_child(cam);
     commands.entity(player).insert(PlayerCamera(cam));

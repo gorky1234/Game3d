@@ -8,7 +8,7 @@ use futures::FutureExt;
 use crate::constants::{CHUNK_SIZE, SECTION_HEIGHT, VIEW_DISTANCE, WORLD_HEIGHT, WORLD_SIZE};
 use crate::player::Player;
 use crate::world::chunk::Chunk;
-use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
+use crate::render::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
 use crate::world::load_save_chunk::{ToLoadChunkEvent, WorldData};
 
 // --- RESOURCES ---
@@ -27,6 +27,8 @@ impl Default for PlayerChunk {
 
 #[derive(Component)]
 struct LoadingChunkTask(Task<anyhow::Result<()>>);
+
+
 
 // --- PLUGIN ---
 pub struct ChunkLoadingsPlugin;
@@ -123,7 +125,7 @@ pub fn update_visible_sessions(
                         false,
                         false,
                     );
-
+                    
                     if visible && *visibility != Visibility::Visible {
                         *visibility = Visibility::Visible;
                     } else if !visible && *visibility != Visibility::Hidden {
