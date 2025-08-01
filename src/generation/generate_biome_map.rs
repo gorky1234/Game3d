@@ -135,7 +135,6 @@ pub fn generate_biome_image(biome_map: &BiomeMap, x: i32, y: i32, size: i32) {
 
             matrix[local_x as usize][local_z as usize] = color;
         }
-        println!("x => {local_x}");
     }
 
     let width = matrix[0].len() as u32;

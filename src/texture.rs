@@ -9,7 +9,9 @@ use bevy::prelude::{default, Res, ResMut, Resource};
 use bevy::render::render_resource::{AsBindGroup, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BufferBindingType, BufferSize, Sampler, ShaderRef, ShaderStages, ShaderType};
 use bevy::sprite::Material2d;
 use bevy::window::PrimaryWindow;
+use bevy_mod_mipmap_generator::{generate_mipmaps, MipmapGeneratorPlugin};
 use bevy_pbr::MaterialPipeline;
+use crate::generation::chunk_generation_logic::ChunkGenerationPlugin;
 use crate::world::block::BlockType;
 
 
@@ -62,6 +64,16 @@ pub struct TextureAtlasMaterial {
     pub opaque_handle: Handle<StandardMaterial>,
     pub water_handle: Handle<StandardMaterial>, // <- pour l’eau
     pub uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>, // (base_uv, size_uv)
+}
+
+
+pub struct TexturePlugin;
+impl Plugin for TexturePlugin {
+    fn build(&self, app: &mut App) {
+        app.add_plugins(MipmapGeneratorPlugin);
+        app.add_systems(Update, generate_mipmaps::<StandardMaterial>);  // Ajout du système générateur de mipmaps
+        app.add_systems(Startup, setup_texture_atlas);
+    }
 }
 
 pub fn setup_texture_atlas(
@@ -118,22 +130,5 @@ pub fn setup_texture_atlas(
         uv_map,
     });
 }
-
-
-pub fn atlas_uvs(col: usize, row: usize, atlas_width: usize, atlas_height: usize) -> [[f32; 2]; 4] {
-    let cell_w = 1.0 / atlas_width as f32;
-    let cell_h = 1.0 / atlas_height as f32;
-
-    let u = col as f32 * cell_w;
-    let v = row as f32 * cell_h;
-
-    [
-        [u, v],                         // Bottom Left
-        [u + cell_w, v],               // Bottom Right
-        [u + cell_w, v + cell_h],      // Top Right
-        [u, v + cell_h],               // Top Left
-    ]
-}
-
 
 
