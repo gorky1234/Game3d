@@ -17,11 +17,12 @@ use crate::generation::chunk_generation_logic::ToGenerateChunkEvent;
 use crate::world::block::BlockType;
 use crate::world::chunk::Chunk;
 use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
+use bevy::render::primitives::Aabb;
 
 #[derive(Resource, Default, Clone)]
 pub struct WorldData {
     pub chunks_loaded: HashMap<(i32,i32), Chunk>,
-    pub chunks_entities: HashMap<(i32,i32), Vec<Entity>>,
+    pub chunks_sections_meshes: HashMap<(i32,i32, i32), Vec<(Entity, Aabb)>>,
 }
 
 

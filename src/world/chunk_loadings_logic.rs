@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
 use bevy::app::{App, Plugin, Update};
-use bevy::math::IVec2;
-use bevy::prelude::{Commands, Component, Entity, Event, EventReader, EventWriter, Query, ResMut, Resource, Transform, With};
+use bevy::math::{Affine3A, IVec2};
+use bevy::prelude::{Camera, Camera3d, Commands, Component, Entity, Event, EventReader, EventWriter, GlobalTransform, Query, Res, ResMut, Resource, Transform, Visibility, With};
+use bevy::render::primitives::Frustum;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use futures::FutureExt;
-use crate::constants::{CHUNK_SIZE, VIEW_DISTANCE, WORLD_SIZE};
+use crate::constants::{CHUNK_SIZE, SECTION_HEIGHT, VIEW_DISTANCE, WORLD_HEIGHT, WORLD_SIZE};
 use crate::player::Player;
 use crate::world::chunk::Chunk;
 use crate::world::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
@@ -36,6 +37,7 @@ impl Plugin for ChunkLoadingsPlugin {
         app.init_resource::<PlayerChunk>();
         app.add_event::<ToLoadChunkEvent>();
         app.add_systems(Update, loading_and_unloading_chunks);
+        app.add_systems(Update, update_visible_sessions);
         app.add_event::<ChunkToUpdateEvent>();
     }
 }
@@ -84,12 +86,51 @@ fn loading_and_unloading_chunks(
 
     // Étape 2 : Décharger ces chunks et les retirer de chunks_loaded
     for pos in chunks_to_unload {
-        if let Some(entity) = world_data.chunks_entities.get(&pos) {
-            for et in entity {
-                commands.entity(*et).despawn();
+        for section in 0..WORLD_HEIGHT / SECTION_HEIGHT{
+            if let Some(entity) = world_data.chunks_sections_meshes.get(&(pos.0, pos.1, section as i32)) {
+                for (et,_) in entity {
+                    commands.entity(*et).despawn();
+                }
+                world_data.chunks_sections_meshes.remove(&(pos.0, pos.1, section as i32));
+                world_data.chunks_loaded.remove(&pos);
             }
-            world_data.chunks_entities.remove(&pos);
-            world_data.chunks_loaded.remove(&pos);
+        }
+
+    }
+}
+
+
+pub fn update_visible_sessions(
+    camera_query: Query<(&GlobalTransform, &Frustum), With<Camera3d>>,
+    mut visibility_query: Query<&mut Visibility>,
+    transform_query: Query<&GlobalTransform>,
+    world_data: Res<WorldData>,
+) {
+    if let Ok((_camera_transform, frustum)) = camera_query.get_single() {
+        for (_section_coord, section_meshes) in world_data.chunks_sections_meshes.iter() {
+            for (entity, aabb) in section_meshes.iter() {
+                if let (Ok(model_transform), Ok(mut visibility)) = (
+                    transform_query.get(*entity),
+                    visibility_query.get_mut(*entity),
+                ) {
+                    // Get affine transform (local->world)
+                    let model_matrix = model_transform.affine();
+
+                    // Frustum culling : intersects_obb prend un AABB local et la transform vers le monde
+                    let visible = frustum.intersects_obb(
+                        aabb,
+                        &model_matrix,
+                        false,
+                        false,
+                    );
+
+                    if visible && *visibility != Visibility::Visible {
+                        *visibility = Visibility::Visible;
+                    } else if !visible && *visibility != Visibility::Hidden {
+                        *visibility = Visibility::Hidden;
+                    }
+                }
+            }
         }
     }
 }

@@ -21,12 +21,6 @@ pub struct ClimateParams {
 pub struct BiomeMap {
 }
 
-/// Fonction de lissage de distance pour poids
-fn falloff_weight(dist: f64, radius: f64) -> f64 {
-    let t = (dist / radius).clamp(0.0, 1.0);
-    (1.0 - t).powi(2)
-}
-
 
 impl BiomeMap {
 
@@ -75,17 +69,6 @@ impl BiomeMap {
 
 fn normalize(value: f64) -> f64 {
     (value - -5.0 )/(5.0 - -5.0)
-}
-
-fn sample_environment(perlin: &Perlin, x: f64, z: f64) -> (f64, f64, f64) {
-    let temp: f64 = 0.0;
-    let humidity: f64 = 0.0;
-
-    let frequency = 0.0005; // plus petit = plus large, plus grand = plus rugueux
-    let amplitude = 2.0;
-    let altitude = perlin.get([x * frequency, z * frequency]) * amplitude;
-
-    (temp, humidity, altitude)
 }
 
 pub fn choose_biome(params: &ClimateParams) -> Vec<(f64, BiomeType)> {
