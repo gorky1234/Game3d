@@ -180,7 +180,9 @@ fn apply_generate_chunks(
         // supposant de l'air, alors qu'il y a maintenant un chunk réel juste à
         // côté) -- c'est ce qui créait un mur visible à la jonction entre deux
         // chunks, surtout marqué sur l'eau (deux couches transparentes superposées).
-        for neighbor in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+        // Diagonales comprises : le terrain lisse d'un chunk dépend de ses 8
+        // voisins (flou de densité en bordure).
+        for neighbor in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1), (x - 1, z - 1), (x + 1, z - 1), (x - 1, z + 1), (x + 1, z + 1)] {
             if world_data.chunks_loaded.contains_key(&neighbor) {
                 to_update_mesh.write(ChunkToUpdateEvent { x: neighbor.0, z: neighbor.1 });
             }

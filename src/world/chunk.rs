@@ -1,5 +1,6 @@
 use crate::constants::{CHUNK_SIZE, SECTION_HEIGHT};
 use crate::world::block::BlockType;
+use crate::generation::vegetation::TreeInstance;
 
 #[derive(Debug, Clone)]
 pub struct ChunkSection {
@@ -24,6 +25,10 @@ pub struct Chunk {
     pub x: i32,
     pub z: i32,
     pub sections: Vec<ChunkSection>,
+    /// Arbres dont le pied est dans ce chunk : leur rendu est reconstruit à
+    /// partir de leur squelette (tree_mesh.rs), les blocs de bois/feuilles
+    /// restant de simples données.
+    pub trees: Vec<TreeInstance>,
 }
 
 impl Chunk {
@@ -33,6 +38,7 @@ impl Chunk {
             x,
             z,
             sections: vec![],
+            trees: vec![],
         }
     }
     pub fn get_block_at(&self, x: usize, y: usize, z: usize) -> BlockType {

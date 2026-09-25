@@ -8,7 +8,8 @@ use bevy::pbr::StandardMaterial;
 use bevy::prelude::{default, Res, ResMut, Resource};
 use bevy_mod_mipmap_generator::{generate_mipmaps, MipmapGeneratorPlugin};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
-use bevy::render::render_resource::AsBindGroup;
+use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::image::ImageLoaderSettings;
 use bevy::shader::ShaderRef;
 use crate::generation::chunk_generation_logic::ChunkGenerationPlugin;
 use crate::world::block::BlockType;
@@ -105,6 +106,9 @@ pub struct TextureAtlasMaterial {
     pub side_uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>,
     /// Cartes de feuillage (voir `filename_to_card_block_type`).
     pub card_uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>,
+    /// Terrain lisse (voir smooth_terrain.rs et terrain.wgsl).
+    pub terrain_handle: Handle<TerrainMaterial>,
+    pub shadow_proxy_handle: Handle<ShadowProxyMaterial>,
     /// Variantes d'herbe (voir `plant_mesh`) : tapis d'herbe courte posé sur
     /// les blocs d'herbe, et graminée à épis qui remplace une partie des
     /// touffes hautes.
@@ -137,6 +141,60 @@ impl MaterialExtension for WindExtension {
     }
 }
 
+/// Matériau du terrain lisse : le `StandardMaterial` (éclairage) dont
+/// terrain.wgsl calcule couleur, normale et rugosité par projection
+/// triplanaire des tuiles de l'atlas.
+pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
+
+#[derive(Clone, Copy, Default, Debug, Reflect, ShaderType)]
+pub struct TerrainUniform {
+    /// Tuile (coin UV, taille UV) du dessus puis du côté de chaque couche :
+    /// herbe, terre, roche, sable, neige.
+    pub tiles: [Vec4; 10],
+    /// x : blocs couverts par une répétition de tuile.
+    pub params: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+pub struct TerrainExtension {
+    #[uniform(100)]
+    pub terrain: TerrainUniform,
+    #[texture(101)]
+    #[sampler(102)]
+    pub color: Handle<Image>,
+    #[texture(103)]
+    #[sampler(104)]
+    pub normal: Handle<Image>,
+    #[texture(105)]
+    #[sampler(106)]
+    pub roughness: Handle<Image>,
+}
+
+impl MaterialExtension for TerrainExtension {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/terrain.wgsl".into()
+    }
+}
+
+/// Volumes d'ombre des houppiers : visibles seulement dans les cartes d'ombre
+/// (voir shadow_proxy.wgsl et `tree_meshes`).
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone, Default)]
+pub struct ShadowProxyMaterial {}
+
+impl Material for ShadowProxyMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/shadow_proxy.wgsl".into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        "shaders/shadow_proxy.wgsl".into()
+    }
+
+    fn prepass_vertex_shader() -> ShaderRef {
+        "shaders/shadow_proxy.wgsl".into()
+    }
+}
+
 /// Matériau de l'eau : le `StandardMaterial` (éclairage, reflets) dont
 /// water.wgsl remplace la normale (vagues) et la couleur (profondeur, écume).
 pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
@@ -160,6 +218,8 @@ impl Plugin for TexturePlugin {
         app.add_plugins(MipmapGeneratorPlugin);
         app.add_plugins(MaterialPlugin::<PlantMaterial>::default());
         app.add_plugins(MaterialPlugin::<WaterMaterial>::default());
+        app.add_plugins(MaterialPlugin::<TerrainMaterial>::default());
+        app.add_plugins(MaterialPlugin::<ShadowProxyMaterial>::default());
         app.add_systems(Update, generate_mipmaps::<StandardMaterial>);  // Ajout du système générateur de mipmaps
         app.add_systems(Startup, setup_texture_atlas);
     }
@@ -171,10 +231,15 @@ pub fn setup_texture_atlas(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut plant_materials: ResMut<Assets<PlantMaterial>>,
     mut water_materials: ResMut<Assets<WaterMaterial>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    mut shadow_proxy_materials: ResMut<Assets<ShadowProxyMaterial>>,
 ) {
     let texture_handle = asset_server.load("atlas_texture.png");
-    let normal_map_handle = asset_server.load("atlas_texture_normal.png");
-    let metallic_roughness_handle = asset_server.load("atlas_texture_metallic_roughness.png");
+    // Normales et rugosité : données, pas des couleurs — chargées sans
+    // conversion sRGB (par défaut, Bevy les linéarisait : normales faussées).
+    let linear = |settings: &mut ImageLoaderSettings| settings.is_srgb = false;
+    let normal_map_handle: Handle<Image> = asset_server.load_builder().with_settings(linear).load("atlas_texture_normal.png");
+    let metallic_roughness_handle: Handle<Image> = asset_server.load_builder().with_settings(linear).load("atlas_texture_metallic_roughness.png");
 
     // Eau : surface lisse (reflets nets du soleil sur les vagues de
     // water.wgsl), sans texture de l'atlas (la tuile d'eau, claire et de
@@ -269,6 +334,34 @@ pub fn setup_texture_atlas(
         }
     }
 
+    // Tuiles du terrain lisse : (dessus, côté) de chaque couche. Sur les
+    // pentes raides, l'herbe laisse voir la terre, la neige la roche.
+    let tile = |name: &str| -> Vec4 {
+        let block = filename_to_block_type(name).expect("tuile de terrain inconnue");
+        let (base, size) = uv_map[&block];
+        Vec4::new(base[0], base[1], size[0], size[1])
+    };
+    let layers = [("grass.png", "dirt.png"), ("dirt.png", "dirt.png"), ("rock.png", "rock.png"), ("sand.png", "sand.png"), ("snow.png", "rock.png")];
+    let mut tiles = [Vec4::ZERO; 10];
+    for (i, (top, side)) in layers.iter().enumerate() {
+        tiles[2 * i] = tile(top);
+        tiles[2 * i + 1] = tile(side);
+    }
+    let terrain_material = terrain_materials.add(TerrainMaterial {
+        base: StandardMaterial {
+            perceptual_roughness: 1.0,
+            reflectance: 0.15,
+            specular_tint: Color::srgb(0.35, 0.35, 0.35),
+            ..default()
+        },
+        extension: TerrainExtension {
+            terrain: TerrainUniform { tiles, params: Vec4::new(4.0, 0.0, 0.0, 0.0) },
+            color: texture_handle.clone(),
+            normal: normal_map_handle.clone(),
+            roughness: metallic_roughness_handle.clone(),
+        },
+    });
+
     commands.insert_resource(TextureAtlasMaterial {
         opaque_handle: standard_material,
         water_handle: water_material,
@@ -276,6 +369,8 @@ pub fn setup_texture_atlas(
         uv_map,
         side_uv_map,
         card_uv_map,
+        terrain_handle: terrain_material,
+        shadow_proxy_handle: shadow_proxy_materials.add(ShadowProxyMaterial {}),
         short_grass_uv,
         seed_grass_uv,
     });

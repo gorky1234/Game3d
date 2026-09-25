@@ -17,6 +17,10 @@ use crate::camera::MovementSettings;
 use crate::constants::{CHUNK_SIZE, VIEW_DISTANCE};
 use crate::world::block::BlockType;
 use crate::world::load_save_chunk::WorldData;
+use crate::generation::generate_biome_map::BiomeMap;
+use crate::generation::generate_height_map::HeightMap;
+use crate::constants::SEA_LEVEL;
+use crate::render::chunk_loadings_mesh_logic::ChunkOpaqueSection;
 
 #[derive(Component, PartialEq, Eq)]
 pub enum PlayerMode {
@@ -36,6 +40,7 @@ impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
         // TAA : inclus dans les DefaultPlugins depuis Bevy 0.17.
         app.add_systems(Startup, spawn_player)
+            .add_systems(Update, wait_for_ground)
             .add_systems(Update, (player_movement, toggle_spectator_mode));
     }
 }
@@ -43,17 +48,23 @@ impl Plugin for PlayerPlugin {
 fn spawn_player(mut commands: Commands, quality: Res<GraphicsQuality>) {
 
     // Point Plain trouvé via `cargo run -- --find-plain-spawn` (utilise le même
-    // BiomeMap que la génération réelle).
+    // BiomeMap que la génération réelle). Hauteur calculée depuis le relief
+    // (l'ancienne valeur fixe, 130.8, était devenue souterraine) ; gravité
+    // coupée jusqu'à ce que le sol sous le joueur ait son collider (voir
+    // `wait_for_ground`), sinon il tombait à travers le monde encore vide.
+    let (spawn_x, spawn_z) = (-450.0, -500.0);
+    let ground = HeightMap::new().height_at(spawn_x as i64, spawn_z as i64, &BiomeMap::new(0)).max(SEA_LEVEL) as f32;
     let player = commands
         .spawn((
-            Transform::from_xyz(-450.0, 130.8, -500.0),
+            Transform::from_xyz(spawn_x, ground + 3.5, spawn_z),
             RigidBody::Dynamic,
             Collider::capsule_y(1.8, 0.5),
             Velocity::zero(),
             LockedAxes::ROTATION_LOCKED,
-            GravityScale(1.0),
+            GravityScale(0.0),
             Player,
             PlayerMode::Normal,
+            WaitingForGround,
         ))
         .id();
 
@@ -223,6 +234,30 @@ fn player_movement(
     }
 }
 
+
+/// Joueur en attente du collider du sol (voir `spawn_player`).
+#[derive(Component)]
+pub struct WaitingForGround;
+
+/// Rend la gravité au joueur dès qu'une section de terrain avec collider se
+/// trouve dans sa colonne de chunk.
+fn wait_for_ground(
+    mut commands: Commands,
+    mut players: Query<(Entity, &Transform, &PlayerMode, &mut GravityScale, &mut Velocity), (With<Player>, With<WaitingForGround>)>,
+    sections: Query<&Transform, (With<ChunkOpaqueSection>, With<Collider>, Without<Player>)>,
+) {
+    let Ok((entity, transform, mode, mut gravity, mut velocity)) = players.single_mut() else { return };
+    velocity.linear = Vec3::ZERO;
+    let chunk = |x: f32| (x / CHUNK_SIZE as f32).floor() as i32;
+    let (px, pz) = (chunk(transform.translation.x), chunk(transform.translation.z));
+    if sections.iter().any(|t| chunk(t.translation.x + 0.5) == px && chunk(t.translation.z + 0.5) == pz) {
+        if *mode == PlayerMode::Normal {
+            *gravity = GravityScale(1.0);
+        }
+        commands.entity(entity).remove::<WaitingForGround>();
+        info!("Sol prêt sous le joueur : gravité activée");
+    }
+}
 
 fn toggle_spectator_mode(
     keys: Res<ButtonInput<KeyCode>>,

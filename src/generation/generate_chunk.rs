@@ -114,9 +114,9 @@ pub async fn generate_chunk(x: i32, z: i32, perlin: &Perlin, biomes_map: &BiomeM
 
     // Après le terrain (et la recopie LOD) : les arbres sont posés à leur
     // position exacte, pas dupliqués par bloc de LOD.
-    place_vegetation(x, z, &mut sections, &heightmap, biomes_map, height_map, stride);
+    let trees = place_vegetation(x, z, &mut sections, &heightmap, biomes_map, height_map, stride);
 
-    Chunk { x, z, sections }
+    Chunk { x, z, sections, trees }
 }
 
 fn get_or_insert_block_id(palette: &mut Vec<BlockType>, block_type: BlockType) -> usize {

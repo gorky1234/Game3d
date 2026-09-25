@@ -13,7 +13,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::asset::AssetServer;
 use bevy::color::palettes::basic::SILVER;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
-use bevy::camera::primitives::Aabb;
+use bevy::camera::primitives::{Aabb, MeshAabb};
 use bevy::light::NotShadowCaster;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use bevy::tasks::futures_lite::future;
@@ -22,7 +22,10 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::FutureExt;
 use crate::player::Player;
 use crate::constants::{CHUNK_SIZE, COLLIDER_SYNC_INTERVAL_SECS, PHYSICS_DISTANCE, PHYSICS_DISTANCE_HYSTERESIS, SECTION_HEIGHT, VIEW_DISTANCE, WORLD_HEIGHT};
-use crate::render::generate_mesh_chunk::{extract_edge, generate_mesh_from_chunk, ChunkEdges};
+use crate::render::generate_mesh_chunk::{extract_edge, generate_mesh_from_chunk, ChunkEdges, SectionMeshes};
+use crate::render::smooth_terrain::Neighborhood;
+use crate::render::tree_mesh::TreeMeshes;
+use bevy::light::NotShadowReceiver;
 use crate::world::load_save_chunk::{refresh_queue_if_needed, QueueRefreshState, QueuedChunk, ToLoadChunkEvent, WorldData};
 
 #[derive(Message,Clone)]
@@ -58,7 +61,7 @@ pub struct ChunkMeshTasks {
     /// Coordonnées en file : une demande répétée (ex. remaillage déclenché
     /// par l'arrivée de plusieurs voisins) ne donne qu'un seul maillage.
     pending: HashSet<(i32, i32)>,
-    tasks: HashMap<(i32, i32), Task<Vec<(Mesh, Mesh, Mesh, Transform)>>>,
+    tasks: HashMap<(i32, i32), Task<(Vec<SectionMeshes>, TreeMeshes)>>,
 }
 
 /// Tâches de maillage simultanées : de quoi occuper les threads du pool sans
@@ -128,9 +131,6 @@ fn queue_chunk_mesh_tasks(
                 // avec ses cartes.
                 let stride = world_data.chunks_lod.get(&(x, z)).copied();
                 let leaf_cards = stride == Some(1);
-                // Distance intermédiaire : cubes de feuilles gardés, avec
-                // quelques touffes en bordure (voir `plant_mesh`).
-                let leaf_fringe = stride == Some(2);
                 let atlas_material = atlas_material.clone();
 
                 // Bords des chunks voisins déjà chargés : sans ça, le meshing
@@ -147,6 +147,13 @@ fn queue_chunk_mesh_tasks(
                 let east = world_data.chunks_loaded.get(&(x + 1, z)).cloned();
                 let north = world_data.chunks_loaded.get(&(x, z - 1)).cloned();
                 let south = world_data.chunks_loaded.get(&(x, z + 1)).cloned();
+                // Terrain lisse : les 8 voisins, diagonales comprises (le flou
+                // de densité déborde de 2 blocs au-delà du chunk).
+                let neighborhood = Neighborhood {
+                    chunks: [-1, 0, 1].map(|dx| [-1, 0, 1].map(|dz| world_data.chunks_loaded.get(&(x + dx, z + dz)).cloned())),
+                };
+                // Cellules du terrain lisse à la résolution de génération.
+                let terrain_step = stride.unwrap_or(1);
 
                 let task = thread_pool.spawn(async move {
                     let edges = ChunkEdges {
@@ -155,7 +162,7 @@ fn queue_chunk_mesh_tasks(
                         north: north.map(|c| extract_edge(&c, CHUNK_SIZE - 1, false, WORLD_HEIGHT)),
                         south: south.map(|c| extract_edge(&c, 0, false, WORLD_HEIGHT)),
                     };
-                    generate_mesh_from_chunk(&chunk_data, &atlas_material, &edges, leaf_cards, leaf_fringe).await
+                    generate_mesh_from_chunk(&chunk_data, &atlas_material, &edges, &neighborhood, terrain_step, leaf_cards).await
                 });
 
                 // Remplace (et annule) une éventuelle tâche en cours pour ce
@@ -180,7 +187,7 @@ pub(crate) fn poll_chunk_tasks(
         // existent à la fois, donc autant de résultats par image au maximum
         // (l'ancien plafond de 6 protégeait des arrivées groupées de dizaines
         // de chunks, qui ne peuvent plus se produire).
-        if let Some(sections) = future::block_on(future::poll_once(task)) {
+        if let Some((sections, TreeMeshes { bark: bark_mesh, foliage: foliage_mesh, shadow: shadow_mesh })) = future::block_on(future::poll_once(task)) {
             completed.push(coords);
 
             // Le chunk a pu être déchargé (joueur reparti) pendant que sa tâche
@@ -208,7 +215,52 @@ pub(crate) fn poll_chunk_tasks(
                 }
             }
 
-            for (index_section, (opaque_mesh, water_mesh, plant_mesh, transform)) in sections.into_iter().enumerate() {
+            // Arbres du chunk (rangés avec la section 0 pour le déchargement et
+            // le remplacement lors d'un remaillage). Aabb calculée depuis le
+            // maillage : les houppiers débordent du chunk.
+            let tree_key = (coords.0, coords.1, 0);
+            if bark_mesh.indices().is_some_and(|i| !i.is_empty()) {
+                let aabb = bark_mesh.compute_aabb().unwrap_or_default();
+                let entity = commands.spawn((
+                    Mesh3d(meshes.add(bark_mesh)),
+                    MeshMaterial3d(materials.opaque_handle.clone()),
+                    Transform::from_xyz((coords.0 * CHUNK_SIZE as i32) as f32, 0.0, (coords.1 * CHUNK_SIZE as i32) as f32),
+                    aabb,
+                    ChunkSectionMesh,
+                    // Troncs solides (collider près du joueur).
+                    ChunkOpaqueSection,
+                )).id();
+                world_data.chunks_sections_meshes.entry(tree_key).or_insert_with(Vec::new).push((entity, aabb));
+            }
+            if foliage_mesh.indices().is_some_and(|i| !i.is_empty()) {
+                let aabb = foliage_mesh.compute_aabb().unwrap_or_default();
+                // Pas d'ombre portée par les touffes elles-mêmes (moitié des FPS
+                // en forêt) : ce sont les volumes d'ombre ci-dessous qui la font.
+                let entity = commands.spawn((
+                    Mesh3d(meshes.add(foliage_mesh)),
+                    MeshMaterial3d(materials.plant_handle.clone()),
+                    Transform::from_xyz((coords.0 * CHUNK_SIZE as i32) as f32, 0.0, (coords.1 * CHUNK_SIZE as i32) as f32),
+                    aabb,
+                    ChunkSectionMesh,
+                    NotShadowCaster,
+                )).id();
+                world_data.chunks_sections_meshes.entry(tree_key).or_insert_with(Vec::new).push((entity, aabb));
+            }
+            if shadow_mesh.indices().is_some_and(|i| !i.is_empty()) {
+                let aabb = shadow_mesh.compute_aabb().unwrap_or_default();
+                let entity = commands.spawn((
+                    Mesh3d(meshes.add(shadow_mesh)),
+                    MeshMaterial3d(materials.shadow_proxy_handle.clone()),
+                    Transform::from_xyz((coords.0 * CHUNK_SIZE as i32) as f32, 0.0, (coords.1 * CHUNK_SIZE as i32) as f32),
+                    aabb,
+                    ChunkSectionMesh,
+                    NotShadowReceiver,
+                )).id();
+                world_data.chunks_sections_meshes.entry(tree_key).or_insert_with(Vec::new).push((entity, aabb));
+            }
+
+            for (index_section, section) in sections.into_iter().enumerate() {
+                let SectionMeshes { opaque: opaque_mesh, water: water_mesh, plants: plant_mesh, terrain: terrain_mesh, transform } = section;
                 let section_index: i32 = index_section.try_into().unwrap();
                 let chunk_key = (coords.0, coords.1, section_index.try_into().unwrap());
                 let aabb_local = Aabb {
@@ -223,6 +275,24 @@ pub(crate) fn poll_chunk_tasks(
                         CHUNK_SIZE as f32 / 2.0,
                     ),
                 };
+
+                // Terrain lisse : collider physique comme les cubes (voir
+                // `sync_chunk_colliders`).
+                if terrain_mesh.indices().is_some_and(|i| !i.is_empty()) {
+                    let entity = commands.spawn((
+                        Mesh3d(meshes.add(terrain_mesh)),
+                        MeshMaterial3d(materials.terrain_handle.clone()),
+                        transform,
+                        GlobalTransform::default(),
+                        aabb_local,
+                        ChunkSectionMesh,
+                        ChunkOpaqueSection,
+                    )).id();
+                    world_data.chunks_sections_meshes
+                        .entry(chunk_key)
+                        .or_insert_with(Vec::new)
+                        .push((entity, aabb_local));
+                }
 
                 // Mesh opaque : on saute les sections sans géométrie (ex. sections d'air pur),
                 // qui représentent la grande majorité des sections d'un chunk. Le collider

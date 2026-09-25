@@ -354,6 +354,7 @@ pub async fn load_chunk(x: i32, z: i32) -> anyhow::Result<Chunk> {
         x,
         z,
         sections: vec![],
+        trees: vec![],
     })
 }
 
@@ -441,7 +442,7 @@ impl WorldData {
 // Convertit NBT (Value) ⇄ chunk simplifié
 fn parse_nbt_to_chunk(x:i32, z:i32, nbt: Value) -> Chunk {
     // parsing minimal example – adapter selon structure NBT
-    Chunk { x, z, sections: vec![] }
+    Chunk { x, z, sections: vec![], trees: vec![] }
 }
 
 fn chunk_to_nbt(chunk: &Chunk) -> Value {
