@@ -16,9 +16,11 @@ use crate::player::Player;
 use crate::graphics_quality::GraphicsQuality;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension};
 use bevy::light::light_consts::lux::AMBIENT_DAYLIGHT;
-use bevy::prelude::{Commands, Component, default, Query, Res, ResMut, Resource, Time, Timer, TimerMode, Transform, With};
+use bevy::prelude::{Commands, Component, default, Local, Mix, Query, Res, ResMut, Resource, Time, Timer, TimerMode, Transform, With};
 use bevy::light::atmosphere::ScatteringMedium;
 use bevy::light::{Atmosphere, GlobalAmbientLight};
+use bevy::pbr::FogFalloff;
+use crate::world::weather::Weather;
 use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin};
 use bevy::prelude::{Asset, Sphere, Vec4};
 use bevy::camera::visibility::NoFrustumCulling;
@@ -47,7 +49,11 @@ const SUN_PATH_TILT: f32 = 35.0 * TAU / 360.0;
 /// toutes les surfaces lisses vues de biais (l'eau devenait blanche).
 const DAY_SKY_LIGHT: f32 = 2000.0;
 /// Intensité la nuit : assez pour deviner le relief.
-const NIGHT_SKY_LIGHT: f32 = 60.0;
+const NIGHT_SKY_LIGHT: f32 = 200.0;
+/// Éclairement (lux) du clair de lune : ~1/10 du soleil (bien plus que le
+/// vrai, comme dans les jeux) pour distinguer le paysage et les ombres portées
+/// sans casser l'ambiance nocturne.
+const MOON_ILLUMINANCE: f32 = 0.15 * AMBIENT_DAYLIGHT;
 /// Éclairement (lux) du soleil hors atmosphère : l'atmosphère de Bevy
 /// l'atténue ensuite (~15 % à midi, bien plus quand il est bas).
 const SUN_ILLUMINANCE: f32 = 1.45 * AMBIENT_DAYLIGHT;
@@ -91,7 +97,8 @@ pub struct SkyboxPlugin;
 
 impl Plugin for SkyboxPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(CycleTimer(Timer::from_seconds(SUN_UPDATE_INTERVAL_SECS, TimerMode::Repeating)))
+        app.init_resource::<SkyState>()
+            .insert_resource(CycleTimer(Timer::from_seconds(SUN_UPDATE_INTERVAL_SECS, TimerMode::Repeating)))
             // Toute la lumière "du ciel" vient de la carte d'environnement.
             .insert_resource(GlobalAmbientLight {
                 brightness: 0.0,
@@ -168,6 +175,11 @@ const FOG_VOLUME_SIZE: f32 = 300.0;
 const FOG_VOLUME_HEIGHT: f32 = 120.0;
 /// Densité de jour ; plus forte au lever/coucher (brume du soir).
 const FOG_VOLUME_DENSITY: f32 = 0.003;
+const FOG_VOLUME_MAX_DENSITY: f32 = 0.0065;
+/// Début et fin de la brume de distance par beau temps (voir la caméra dans
+/// player.rs) ; rapprochés par la météo et la brume matinale.
+const FOG_START: f32 = VIEW_DISTANCE as f32 * CHUNK_SIZE as f32 * 0.3;
+const FOG_END: f32 = VIEW_DISTANCE as f32 * CHUNK_SIZE as f32;
 
 #[derive(Component)]
 struct FogVolumeMarker;
@@ -266,8 +278,6 @@ const CLOUD_THICKNESS: f32 = 110.0;
 const CLOUD_DOME_RADIUS: f32 = 1000.0;
 /// Taille (en blocs) couverte par une répétition de la texture de densité.
 const CLOUD_TEXTURE_SPAN: f32 = 3000.0;
-/// Part du ciel couverte (0..1).
-const CLOUD_COVERAGE: f32 = 0.82;
 /// Distance (blocs) où les nuages commencent à se fondre dans la brume, et où
 /// ils ont disparu.
 const CLOUD_FADE: (f32, f32) = (2500.0, 5500.0);
@@ -283,6 +293,8 @@ struct CloudParams {
     layer: Vec4,
     wind_fade: Vec4,
     horizon: Vec4,
+    // x : intensité des étoiles, y : voile de brume sur le ciel.
+    misc: Vec4,
 }
 
 /// Nuages en volume : raymarching dans assets/shaders/clouds.wgsl, sur une
@@ -365,35 +377,54 @@ fn update_clouds(
     time: Res<Time>,
     players: Query<&Transform, (With<Player>, Without<Clouds>)>,
     mut clouds: Query<(&mut Transform, &Clouds)>,
-    suns: Query<(&DirectionalLight, &Transform), (With<Sun>, Without<Clouds>, Without<Player>)>,
     fogs: Query<&DistanceFog>,
+    sky: Res<SkyState>,
+    weather: Res<Weather>,
     mut materials: ResMut<Assets<CloudMaterial>>,
+    mut wind_offset: Local<Vec2>,
 ) {
     let Ok(player) = players.single() else { return };
-    let (daylight, sun_color, sun_dir) = suns
-        .single()
-        .map(|(l, t)| ((l.illuminance / SUN_ILLUMINANCE).clamp(0.0, 1.0), t.back().as_vec3()))
-        .map(|(daylight, dir)| (daylight, sun_tint(dir.y), dir))
-        .unwrap_or((1.0, LinearRgba::WHITE, Vec3::Y));
+    // Décalage accumulé (et non vitesse × temps total) : un changement de
+    // vent ne fait pas sauter les nuages.
+    *wind_offset += CLOUD_WIND * (0.6 + weather.current.wind) * time.delta_secs() / CLOUD_TEXTURE_SPAN;
+    let weather = weather.current;
+    let daylight = sky.daylight;
+    // La nuit, les nuages sont éclairés par la lune (à l'opposé du soleil).
+    let night = 1.0 - daylight;
+    let (light_dir, light_color, light_strength) = if sky.sun_dir.y > -0.02 {
+        let strength = (sky.sun_dir.y / 0.08).clamp(0.0, 1.0);
+        (sky.sun_dir, sun_tint(sky.sun_dir.y), strength.sqrt())
+    } else {
+        let moon = -sky.sun_dir;
+        (moon, Color::srgb(0.55, 0.65, 0.9).to_linear(), 0.12 * (moon.y / 0.08).clamp(0.0, 1.0))
+    };
     let horizon = fogs.iter().next().map_or(LinearRgba::WHITE, |f| f.color.to_linear());
     for (mut transform, clouds) in &mut clouds {
         // La sphère suit le joueur ; la densité est lue en coordonnées monde
         // dans le shader, donc les nuages restent ancrés au monde.
         transform.translation = player.translation;
         let Some(mut material) = materials.get_mut(&clouds.0) else { continue };
-        let sun = daylight.sqrt();
         // Valeurs de sortie directes (avant tonemapping) : ~1 = blanc lumineux.
-        let sun_light = Vec3::new(sun_color.red, sun_color.green, sun_color.blue) * 1.6 * sun;
-        let sky = 0.03 + 0.5 * sun;
-        let wind = CLOUD_WIND * time.elapsed_secs() / CLOUD_TEXTURE_SPAN;
+        // Par temps couvert, moins de soleil et une lumière grise uniforme :
+        // nuages gris sombre au lieu de cumulus blancs.
+        let grey = weather.cloud_grey;
+        let sun_light = Vec3::new(light_color.red, light_color.green, light_color.blue)
+            * 1.6 * light_strength * (1.0 - 0.85 * grey) * weather.sun.sqrt();
+        let ambient = (0.015 + 0.5 * daylight.sqrt()) * (1.0 - 0.45 * grey);
+        let ambient_top = Vec3::new(0.62, 0.72, 0.9).lerp(Vec3::splat(0.75), grey) * ambient;
+        let ambient_bottom = Vec3::new(0.42, 0.46, 0.55).lerp(Vec3::splat(0.45), grey) * ambient;
+        let wind = *wind_offset;
+        // Voile de brume sur tout le ciel quand elle est épaisse.
+        let haze = ((weather.fog * (1.0 + 4.0 * sky.mist) - 1.5) / 6.0).clamp(0.0, 0.85);
         material.params = CloudParams {
-            sun_dir: sun_dir.extend(0.0),
+            sun_dir: light_dir.extend(0.0),
             sun_color: sun_light.extend(0.0),
-            ambient_top: (Vec3::new(0.62, 0.72, 0.9) * sky).extend(0.0),
-            ambient_bottom: (Vec3::new(0.42, 0.46, 0.55) * sky).extend(0.0),
-            layer: Vec4::new(CLOUD_HEIGHT, CLOUD_THICKNESS, CLOUD_TEXTURE_SPAN, CLOUD_COVERAGE),
+            ambient_top: ambient_top.extend(0.0),
+            ambient_bottom: ambient_bottom.extend(0.0),
+            layer: Vec4::new(CLOUD_HEIGHT, CLOUD_THICKNESS, CLOUD_TEXTURE_SPAN, weather.cloud_coverage),
             wind_fade: Vec4::new(wind.x, wind.y, CLOUD_FADE.0, CLOUD_FADE.1),
             horizon: Vec4::new(horizon.red, horizon.green, horizon.blue, 0.0),
+            misc: Vec4::new(night * night * (1.0 - grey), haze, 0.0, 0.0),
         };
     }
 }
@@ -547,8 +578,11 @@ fn daylight_cycle(
     mut environments: Query<&mut EnvironmentMapLight>,
     mut volumes: Query<&mut FogVolume>,
     mut timer: ResMut<CycleTimer>,
+    mut sky: ResMut<SkyState>,
+    weather: Res<Weather>,
     time: Res<Time>,
 ) {
+    let weather = weather.current;
     timer.0.tick(time.delta());
     // Toujours à la toute première image (le timer n'a pas encore fini) pour
     // ne pas démarrer avec un soleil par défaut.
@@ -559,50 +593,93 @@ fn daylight_cycle(
     // elapsed_secs (pas elapsed_secs_wrapped, qui reboucle toutes les heures
     // et ferait sauter l'heure du jeu si DAY_LENGTH ne divise pas 3600).
     // Le ciel (`Atmosphere`) suit directement l'orientation de cette lumière.
-    let dir = sun_direction(sun_angle(current_hour(time.elapsed_secs())));
+    let hour = current_hour(time.elapsed_secs());
+    let dir = sun_direction(sun_angle(hour));
 
     // 0 sous l'horizon, 1 dès que le soleil est un peu haut ; transition
     // douce autour du lever/coucher.
     let elevation = dir.y;
     let daylight = ((elevation + 0.05) / 0.3).clamp(0.0, 1.0);
+    let mist = morning_mist(hour);
+    *sky = SkyState { sun_dir: dir, daylight, mist };
+    // Brume totale : météo × brume matinale.
+    let fog_amount = weather.fog * (1.0 + 4.0 * mist);
 
     if let Ok((mut light_transform, mut light)) = suns.single_mut() {
+        // Le jour, la lumière est le soleil ; la nuit, la lune, à l'opposé.
+        // Même entité (ombres portées aussi au clair de lune), et l'atmosphère
+        // dessine alors un ciel nocturne bleuté très sombre avec la lune à la
+        // place du disque solaire. Bascule quand le soleil passe sous
+        // l'horizon : les deux intensités y sont presque nulles.
+        let (light_dir, illuminance, color) = if elevation > -0.02 {
+            // Soleil nettement plus fort que le ciel (rapport ~4:1 comme en
+            // vrai) : c'est le contraste faces éclairées dorées / ombres
+            // bleutées qui donne du relief. L'atmosphère se charge de
+            // l'affaiblir et de le rougir quand il est bas : ici, juste
+            // l'extinction au passage sous l'horizon. Presque blanc : une
+            // teinte chaude ajoutée ici se cumulait à celle de l'atmosphère
+            // (terrain trop rouge, ciel brunâtre au couchant).
+            let strength = (elevation / 0.08).clamp(0.0, 1.0);
+            (dir, strength * SUN_ILLUMINANCE * weather.sun, Color::srgb(1.0, 0.98, 0.95))
+        } else {
+            let moon = -dir;
+            let strength = (moon.y / 0.08).clamp(0.0, 1.0);
+            (moon, strength * MOON_ILLUMINANCE * weather.sun, Color::srgb(0.62, 0.72, 1.0))
+        };
         // La lumière directionnelle éclaire le long de son -Z local : on la
-        // place du côté du soleil et on la tourne vers l'origine.
-        *light_transform = Transform::from_translation(dir).looking_at(Vec3::ZERO, Vec3::Y);
-        // Soleil nettement plus fort que le ciel (rapport ~4:1 comme en vrai) :
-        // c'est le contraste faces éclairées dorées / ombres bleutées qui
-        // donne du relief. L'atmosphère se charge de l'affaiblir et de le
-        // rougir quand il est bas : ici, juste l'extinction au passage sous
-        // l'horizon.
-        let strength = (elevation / 0.08).clamp(0.0, 1.0);
-        light.illuminance = strength * SUN_ILLUMINANCE;
-        // Presque blanc : l'atmosphère de Bevy multiplie déjà la lumière du
-        // soleil par sa transmittance (orangée quand il est bas) et calcule
-        // la couleur du ciel à partir d'elle. Une teinte chaude ajoutée ici
-        // s'y cumulait : terrain trop rouge et ciel brunâtre au couchant.
-        light.color = Color::srgb(1.0, 0.98, 0.95);
+        // place du côté de l'astre et on la tourne vers l'origine.
+        *light_transform = Transform::from_translation(light_dir).looking_at(Vec3::ZERO, Vec3::Y);
+        light.illuminance = illuminance;
+        light.color = color;
     }
 
     for mut environment in &mut environments {
-        environment.intensity = NIGHT_SKY_LIGHT + (DAY_SKY_LIGHT - NIGHT_SKY_LIGHT) * daylight;
+        environment.intensity = (NIGHT_SKY_LIGHT + (DAY_SKY_LIGHT - NIGHT_SKY_LIGHT) * daylight) * weather.sky;
     }
 
     for mut fog in &mut fogs {
-        fog.color = horizon_color(daylight);
+        // Par temps gris, brume grise plutôt que bleutée.
+        let grey = Color::srgb(0.58, 0.6, 0.62).to_linear() * (0.05 + 0.95 * daylight);
+        fog.color = Color::from(horizon_color(daylight).to_linear().mix(&grey, weather.cloud_grey));
+        // Brume plus proche quand elle est épaisse (brouillard, pluie, matin).
+        fog.falloff = FogFalloff::Linear {
+            start: FOG_START / fog_amount,
+            end: FOG_END / fog_amount.sqrt(),
+        };
         // Halo du soleil dans la brume : plus marqué et plus orangé quand il
         // est bas, absent la nuit.
         let low = 1.0 - elevation.clamp(0.0, 0.6) / 0.6;
-        fog.directional_light_color = Color::srgba(1.0, 0.78 - 0.2 * low, 0.5 - 0.25 * low, (0.55 + 0.4 * low) * daylight);
+        fog.directional_light_color = Color::srgba(1.0, 0.78 - 0.2 * low, 0.5 - 0.25 * low, (0.55 + 0.4 * low) * daylight * weather.sun);
     }
 
     for mut volume in &mut volumes {
         // Brume du soir plus épaisse et plus dorée quand le soleil est bas.
         let low = 1.0 - elevation.clamp(0.0, 0.5) / 0.5;
-        volume.density_factor = FOG_VOLUME_DENSITY * (1.0 + 0.8 * low) * daylight.max(0.15);
+        // Plafonnée : Bevy atténue la lumière du soleil sur tout le rayon de
+        // la boîte, une brume volumétrique trop dense n'est plus éclairée et
+        // vire au gris sombre. L'épaisseur du brouillard vient surtout de la
+        // brume de distance.
+        volume.density_factor = (FOG_VOLUME_DENSITY * (1.0 + 0.8 * low) * daylight.max(0.15) * fog_amount).min(FOG_VOLUME_MAX_DENSITY);
         volume.fog_color = Color::srgb(1.0, 0.92 - 0.1 * low, 0.82 - 0.2 * low);
     }
 }
 
 #[derive(Resource)]
 struct CycleTimer(Timer);
+
+/// État du ciel calculé par `daylight_cycle`, pour les systèmes qui ne
+/// peuvent pas le déduire de la lumière (la nuit, elle représente la lune).
+#[derive(Resource, Default)]
+struct SkyState {
+    /// Direction (unitaire) vers le soleil, même sous l'horizon.
+    sun_dir: Vec3,
+    /// 0 la nuit, 1 en plein jour.
+    daylight: f32,
+    /// Brume matinale (0..1), autour du lever du soleil.
+    mist: f32,
+}
+
+/// Brume du matin : maximale vers 6h45, dissipée vers 9h.
+fn morning_mist(hour: f32) -> f32 {
+    (1.0 - (hour - 6.75).abs() / 2.25).clamp(0.0, 1.0)
+}

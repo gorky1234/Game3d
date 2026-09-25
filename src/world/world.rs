@@ -5,6 +5,7 @@ use crate::world::chunk_loadings_logic::ChunkLoadingsPlugin;
 use crate::render::chunk_loadings_mesh_logic::GenerateMeshChunksPlugin;
 use crate::world::load_save_chunk::{WorldData, WorldDataPlugin};
 use crate::world::skybox::SkyboxPlugin;
+use crate::world::weather::WeatherPlugin;
 
 // --- PLUGIN ---
 pub struct WorldPlugin;
@@ -17,6 +18,7 @@ impl Plugin for WorldPlugin {
         app.add_plugins(ChunkGenerationPlugin);
         app.add_plugins(GenerateMeshChunksPlugin);
         app.add_plugins(SkyboxPlugin);
+        app.add_plugins(WeatherPlugin);
     }
 }
 

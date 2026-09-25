@@ -7,6 +7,9 @@ use bevy::asset::{Assets, AssetServer, Handle};
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::{default, Res, ResMut, Resource};
 use bevy_mod_mipmap_generator::{generate_mipmaps, MipmapGeneratorPlugin};
+use bevy::pbr::{ExtendedMaterial, MaterialExtension};
+use bevy::render::render_resource::AsBindGroup;
+use bevy::shader::ShaderRef;
 use crate::generation::chunk_generation_logic::ChunkGenerationPlugin;
 use crate::world::block::BlockType;
 
@@ -94,7 +97,7 @@ pub struct TextureAtlasMaterial {
     pub opaque_handle: Handle<StandardMaterial>,
     pub water_handle: Handle<StandardMaterial>, // <- pour l’eau
     /// Plantes en croix (herbe haute, fleurs) : découpe alpha, pas de culling.
-    pub plant_handle: Handle<StandardMaterial>,
+    pub plant_handle: Handle<PlantMaterial>,
     pub uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>, // (base_uv, size_uv)
     /// Faces latérales (voir `filename_to_side_block_type`), prioritaire sur
     /// `uv_map` pour les directions North/South/East/West.
@@ -104,10 +107,37 @@ pub struct TextureAtlasMaterial {
 }
 
 
+/// Matériau des plantes : le `StandardMaterial` habituel dont les sommets
+/// ondulent au vent (voir `WindExtension`).
+pub type PlantMaterial = ExtendedMaterial<StandardMaterial, WindExtension>;
+
+/// Vent dans la végétation : vertex shaders assets/shaders/plant_wind*.wgsl,
+/// paramètres mis à jour à chaque image par `update_wind` (weather.rs).
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+pub struct WindExtension {
+    /// x : temps (s), y : force (0..1), zw : direction horizontale.
+    #[uniform(100)]
+    pub params: Vec4,
+    /// x : durée de l'image (s), pour la position à l'image précédente.
+    #[uniform(100)]
+    pub extra: Vec4,
+}
+
+impl MaterialExtension for WindExtension {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/plant_wind.wgsl".into()
+    }
+
+    fn prepass_vertex_shader() -> ShaderRef {
+        "shaders/plant_wind_prepass.wgsl".into()
+    }
+}
+
 pub struct TexturePlugin;
 impl Plugin for TexturePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MipmapGeneratorPlugin);
+        app.add_plugins(MaterialPlugin::<PlantMaterial>::default());
         app.add_systems(Update, generate_mipmaps::<StandardMaterial>);  // Ajout du système générateur de mipmaps
         app.add_systems(Startup, setup_texture_atlas);
     }
@@ -117,6 +147,7 @@ pub fn setup_texture_atlas(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut plant_materials: ResMut<Assets<PlantMaterial>>,
 ) {
     let texture_handle = asset_server.load("atlas_texture.png");
     let normal_map_handle = asset_server.load("atlas_texture_normal.png");
@@ -161,15 +192,18 @@ pub fn setup_texture_atlas(
     // est inclinée vers le haut (voir `plant_mesh`), retournée elle pointait
     // vers le bas et la moitié des faces n'était éclairée que par le sol
     // (touffes noires). Légère transmission diffuse pour le contre-jour.
-    let plant_material = materials.add(StandardMaterial {
-        base_color_texture: Some(texture_handle.clone()),
-        alpha_mode: AlphaMode::Mask(0.5),
-        cull_mode: None,
-        double_sided: false,
-        diffuse_transmission: 0.2,
-        perceptual_roughness: 1.0,
-        reflectance: 0.1,
-        ..default()
+    let plant_material = plant_materials.add(PlantMaterial {
+        base: StandardMaterial {
+            base_color_texture: Some(texture_handle.clone()),
+            alpha_mode: AlphaMode::Mask(0.5),
+            cull_mode: None,
+            double_sided: false,
+            diffuse_transmission: 0.2,
+            perceptual_roughness: 1.0,
+            reflectance: 0.1,
+            ..default()
+        },
+        extension: WindExtension::default(),
     });
 
     let json_path = Path::new("assets/atlas_texture.json");

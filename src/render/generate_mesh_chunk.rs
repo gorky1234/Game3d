@@ -707,6 +707,10 @@ fn plant_mesh(
     let mut normals = Vec::new();
     let mut uvs = Vec::new();
     let mut colors: Vec<[f32; 4]> = Vec::new();
+    // Souplesse au vent (x : 0 = fixe, 1 = balancement complet) et phase
+    // aléatoire (y) de chaque sommet, lues par le shader de vent
+    // (assets/shaders/plant_wind.wgsl).
+    let mut sway: Vec<[f32; 2]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
     if section.palette.iter().any(|b| b.is_plant()) {
@@ -767,6 +771,9 @@ fn plant_mesh(
                         let (v_top, v_bottom) = (base_uv[1], base_uv[1] + size_uv[1]);
                         uvs.extend_from_slice(&[[u0, v_bottom], [u1, v_bottom], [u1, v_top], [u0, v_top]]);
                         colors.extend_from_slice(&[bottom, bottom, top, top]);
+                        // Pied fixe, sommet libre.
+                        let phase = plant_hash(wx, wy, wz, 8);
+                        sway.extend_from_slice(&[[0.0, phase], [0.0, phase], [1.0, phase], [1.0, phase]]);
                         indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
                     }
                 }
@@ -810,7 +817,10 @@ fn plant_mesh(
                     // les touffes tranchent sur le houppier).
                     let tint = terrain_tint(block, wx as f32, wy as f32, wz as f32);
 
-                    let mut quad = |corners: [Vec3; 4], normal: Vec3, bottom: f32| {
+                    let phase = plant_hash(wx, wy, wz, 17);
+                    // Touffes de feuilles : léger frémissement seulement (elles
+                    // tiennent au houppier), un peu plus en haut qu'en bas.
+                    let mut quad = |corners: [Vec3; 4], normal: Vec3, bottom: f32, (sway_low, sway_high): (f32, f32)| {
                         let base = positions.len() as u32;
                         positions.extend(corners.iter().map(|p| p.to_array()));
                         normals.extend_from_slice(&[normal.normalize().to_array(); 4]);
@@ -818,6 +828,7 @@ fn plant_mesh(
                         let (b, t) = (bottom * light, light);
                         let (b, t) = ([b * tint[0], b * tint[1], b * tint[2], 1.0], [t * tint[0], t * tint[1], t * tint[2], 1.0]);
                         colors.extend_from_slice(&[b, b, t, t]);
+                        sway.extend_from_slice(&[[sway_low, phase], [sway_low, phase], [sway_high, phase], [sway_high, phase]]);
                         indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
                     };
                     for (dx, dz) in [(c * half, s * half), (-s * half, c * half)] {
@@ -827,6 +838,7 @@ fn plant_mesh(
                             [center - d - up, center + d - up, center + d + up, center - d + up],
                             Vec3::new(-dz, 0.0, dx).normalize() * 0.5 + Vec3::Y * 0.85,
                             0.75,
+                            (0.08, 0.22),
                         );
                     }
                     // Quad horizontal seulement sur le dessus du houppier : partout
@@ -835,7 +847,7 @@ fn plant_mesh(
                     // en forêt sur GPU intégré).
                     if !occludes(block_at_offset(section_index, chunk, &ChunkEdges::default(), xi, yi + 1, zi)) {
                         let (ax, az) = (Vec3::new(c, 0.0, s) * half, Vec3::new(-s, 0.0, c) * half);
-                        quad([center - ax - az, center + ax - az, center + ax + az, center - ax + az], Vec3::Y, 1.0);
+                        quad([center - ax - az, center + ax - az, center + ax + az, center - ax + az], Vec3::Y, 1.0, (0.18, 0.18));
                     }
                 }
             }
@@ -847,6 +859,7 @@ fn plant_mesh(
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, sway);
     mesh.insert_indices(Indices::U32(indices));
     mesh
 }
