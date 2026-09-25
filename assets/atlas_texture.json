@@ -1,52 +1,188 @@
-{"frames": {
-
-"dirt.jpg":
 {
-	"frame": {"x":0,"y":0,"w":1024,"h":1024},
-	"rotated": false,
-	"trimmed": false,
-	"spriteSourceSize": {"x":0,"y":0,"w":1024,"h":1024},
-	"sourceSize": {"w":1024,"h":1024}
-},
-"grass.jpg":
-{
-	"frame": {"x":1024,"y":0,"w":1024,"h":1024},
-	"rotated": false,
-	"trimmed": false,
-	"spriteSourceSize": {"x":0,"y":0,"w":1024,"h":1024},
-	"sourceSize": {"w":1024,"h":1024}
-},
-"rock.jpg":
-{
-	"frame": {"x":0,"y":1024,"w":1024,"h":1024},
-	"rotated": false,
-	"trimmed": false,
-	"spriteSourceSize": {"x":0,"y":0,"w":1024,"h":1024},
-	"sourceSize": {"w":1024,"h":1024}
-},
-"sand.jpg":
-{
-	"frame": {"x":1024,"y":1024,"w":1024,"h":1024},
-	"rotated": false,
-	"trimmed": false,
-	"spriteSourceSize": {"x":0,"y":0,"w":1024,"h":1024},
-	"sourceSize": {"w":1024,"h":1024}
-},
-"water.jpg":
-{
-	"frame": {"x":0,"y":2048,"w":512,"h":512},
-	"rotated": false,
-	"trimmed": false,
-	"spriteSourceSize": {"x":0,"y":0,"w":512,"h":512},
-	"sourceSize": {"w":512,"h":512}
-}},
-"meta": {
-	"app": "https://www.codeandweb.com/texturepacker",
-	"version": "1.1",
-	"image": "texture_atlas.png",
-	"format": "RGBA8888",
-	"size": {"w":2048,"h":2560},
-	"scale": "1",
-	"smartupdate": "$TexturePacker:SmartUpdate:4cf6d1bb1e285d911cd9f9ff4a14462f:76b4a33becee347c8d837561b2e80153:67087b54f7aa7c7f6411022b7ef8a190$"
-}
+  "frames": {
+    "dirt.png": {
+      "frame": {
+        "x": 16,
+        "y": 16,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "grass.png": {
+      "frame": {
+        "x": 560,
+        "y": 16,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "rock.png": {
+      "frame": {
+        "x": 1104,
+        "y": 16,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "sand.png": {
+      "frame": {
+        "x": 1648,
+        "y": 16,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "snow.png": {
+      "frame": {
+        "x": 2192,
+        "y": 16,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "mud.png": {
+      "frame": {
+        "x": 16,
+        "y": 560,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "podzol.png": {
+      "frame": {
+        "x": 560,
+        "y": 560,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "sandstone.png": {
+      "frame": {
+        "x": 1104,
+        "y": 560,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "gravel.png": {
+      "frame": {
+        "x": 1648,
+        "y": 560,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "log.png": {
+      "frame": {
+        "x": 2192,
+        "y": 560,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "water.png": {
+      "frame": {
+        "x": 16,
+        "y": 1104,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "bricks.png": {
+      "frame": {
+        "x": 560,
+        "y": 1104,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "leaves.png": {
+      "frame": {
+        "x": 1104,
+        "y": 1104,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "pine_leaves.png": {
+      "frame": {
+        "x": 1648,
+        "y": 1104,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "cactus.png": {
+      "frame": {
+        "x": 2192,
+        "y": 1104,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "grass_side.png": {
+      "frame": {
+        "x": 16,
+        "y": 1648,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "snow_side.png": {
+      "frame": {
+        "x": 560,
+        "y": 1648,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "tall_grass.png": {
+      "frame": {
+        "x": 1104,
+        "y": 1648,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "flower_red.png": {
+      "frame": {
+        "x": 1648,
+        "y": 1648,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "flower_yellow.png": {
+      "frame": {
+        "x": 2192,
+        "y": 1648,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "leaf_card.png": {
+      "frame": {
+        "x": 16,
+        "y": 2192,
+        "w": 512,
+        "h": 512
+      }
+    },
+    "pine_card.png": {
+      "frame": {
+        "x": 560,
+        "y": 2192,
+        "w": 512,
+        "h": 512
+      }
+    }
+  },
+  "meta": {
+    "app": "build_hd_atlas.py (ambientCG CC0 1K + tuiles proc\u00e9durales)",
+    "image": "atlas_texture.png",
+    "size": {
+      "w": 2720,
+      "h": 2720
+    }
+  }
 }
