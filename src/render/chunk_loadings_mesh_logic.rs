@@ -126,7 +126,11 @@ fn queue_chunk_mesh_tasks(
                 // cubes, adoucis par la brume. Un
                 // chunk qui se rapproche est régénéré en plus fin, donc remaillé
                 // avec ses cartes.
-                let leaf_cards = world_data.chunks_lod.get(&(x, z)).is_some_and(|&stride| stride == 1);
+                let stride = world_data.chunks_lod.get(&(x, z)).copied();
+                let leaf_cards = stride == Some(1);
+                // Distance intermédiaire : cubes de feuilles gardés, avec
+                // quelques touffes en bordure (voir `plant_mesh`).
+                let leaf_fringe = stride == Some(2);
                 let atlas_material = atlas_material.clone();
 
                 // Bords des chunks voisins déjà chargés : sans ça, le meshing
@@ -151,7 +155,7 @@ fn queue_chunk_mesh_tasks(
                         north: north.map(|c| extract_edge(&c, CHUNK_SIZE - 1, false, WORLD_HEIGHT)),
                         south: south.map(|c| extract_edge(&c, 0, false, WORLD_HEIGHT)),
                     };
-                    generate_mesh_from_chunk(&chunk_data, &atlas_material, &edges, leaf_cards).await
+                    generate_mesh_from_chunk(&chunk_data, &atlas_material, &edges, leaf_cards, leaf_fringe).await
                 });
 
                 // Remplace (et annule) une éventuelle tâche en cours pour ce

@@ -480,7 +480,16 @@ fn fill_mask(
             let neighbor_block = if is_card_leaf(neighbor_block) { BlockType::Air } else { neighbor_block };
             if current_block != BlockType::Air && should_render_face(current_block, neighbor_block) {
                 let ao = if current_block == BlockType::Water {
-                    [3; 4]
+                    // Pas d'occlusion sur l'eau. Sur la surface, le champ sert
+                    // à transmettre la distance à la berge (écume, voir
+                    // `shore_distance` et water.wgsl) ; le greedy meshing ne
+                    // fusionne que des cases de même distance, la mer ouverte
+                    // reste en grands quads.
+                    if direction == Direction::Up {
+                        [shore_distance(section_index, chunk, edges, x, y, z); 4]
+                    } else {
+                        [3; 4]
+                    }
                 } else {
                     face_ao(section_index, chunk, edges, x, y, z, direction)
                 };
@@ -702,6 +711,7 @@ fn plant_mesh(
     world_origin: (i32, i32, i32),
     atlas: &TextureAtlasMaterial,
     leaf_cards: bool,
+    leaf_fringe: bool,
 ) -> Mesh {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
@@ -723,12 +733,22 @@ fn plant_mesh(
                     }
                     let Some(&(base_uv, size_uv)) = atlas.uv_map.get(&block) else { continue };
                     let (wx, wy, wz) = (world_origin.0 + x as i32, world_origin.1 + y as i32, world_origin.2 + z as i32);
+                    // ~30 % des touffes hautes : graminée à épis (variété).
+                    let seed_grass = block == BlockType::TallGrass && plant_hash(wx, wy, wz, 9) < 0.3;
+                    let (base_uv, size_uv) = match atlas.seed_grass_uv {
+                        Some(uv) if seed_grass => uv,
+                        _ => (base_uv, size_uv),
+                    };
                     let cx = x as f32 + 0.5 + (plant_hash(wx, wy, wz, 1) - 0.5) * 0.5;
                     let cz = z as f32 + 0.5 + (plant_hash(wx, wy, wz, 2) - 0.5) * 0.5;
                     // Fleurs nettement plus petites que l'herbe : de petites
                     // touches de couleur dans la prairie plutôt que de grosses
                     // fleurs de dessin animé à hauteur de genou.
-                    let size = if block == BlockType::TallGrass { 1.0 } else { 0.55 };
+                    let size = match block {
+                        BlockType::TallGrass if seed_grass => 1.15,
+                        BlockType::TallGrass => 1.0,
+                        _ => 0.55,
+                    };
                     let height = (0.75 + plant_hash(wx, wy, wz, 3) * 0.45) * size;
                     let r = 0.5 * (0.85 + plant_hash(wx, wy, wz, 4) * 0.3) * size;
                     let angle = plant_hash(wx, wy, wz, 5) * std::f32::consts::FRAC_PI_2;
@@ -781,12 +801,76 @@ fn plant_mesh(
         }
     }
 
+    // Tapis d'herbe courte : sur les blocs d'herbe à découvert sans touffe
+    // haute, de petites touffes basses qui cassent la surface plate du sol
+    // entre les touffes. Seulement dans les chunks proches (pleine
+    // résolution, comme les cartes de feuillage) : invisible de loin, et ce
+    // sont des milliers de quads à découpe alpha.
+    if let Some((base_uv, size_uv)) = atlas.short_grass_uv.filter(|_| leaf_cards && section.palette.contains(&BlockType::Grass)) {
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    if section.get_block(x, y, z) != BlockType::Grass {
+                        continue;
+                    }
+                    let (xi, yi, zi) = (x as i32, y as i32, z as i32);
+                    if block_at_offset(section_index, chunk, &ChunkEdges::default(), xi, yi + 1, zi) != BlockType::Air {
+                        continue;
+                    }
+                    let (wx, wy, wz) = (world_origin.0 + xi, world_origin.1 + yi, world_origin.2 + zi);
+                    if plant_hash(wx, wy, wz, 20) > SHORT_GRASS_DENSITY {
+                        continue;
+                    }
+                    let cx = x as f32 + 0.5 + (plant_hash(wx, wy, wz, 21) - 0.5) * 0.6;
+                    let cz = z as f32 + 0.5 + (plant_hash(wx, wy, wz, 22) - 0.5) * 0.6;
+                    let height = 0.3 + plant_hash(wx, wy, wz, 23) * 0.25;
+                    let r = 0.5 + plant_hash(wx, wy, wz, 24) * 0.2;
+                    let angle = plant_hash(wx, wy, wz, 25) * std::f32::consts::FRAC_PI_2;
+                    let (y0, y1) = (y as f32 + 1.0, y as f32 + 1.0 + height);
+                    // Même teinte que le sol et l'herbe haute (`meadow_dryness`).
+                    let dry = meadow_dryness(wx as f32, wz as f32);
+                    let tint = [0, 1, 2].map(|i| [0.62, 0.76, 0.64][i] + ([0.98, 0.86, 0.66][i] - [0.62, 0.76, 0.64][i]) * dry);
+                    // Pied à peine plus sombre : vues d'en haut, les touffes basses
+                    // se réduisent à leur pied, trop foncé il dessinait des croix
+                    // noires sur le sol.
+                    let bottom = [tint[0] * 0.75, tint[1] * 0.75, tint[2] * 0.75, 1.0];
+                    let top = [tint[0], tint[1], tint[2], 1.0];
+                    let phase = plant_hash(wx, wy, wz, 26);
+                    // Trois quads à 60° (étoile plutôt que croix), inclinés vers
+                    // l'extérieur (alternativement) : d'en haut ils gardent une
+                    // surface visible au lieu de n'être que des traits.
+                    for k in 0..3 {
+                        let a = angle + k as f32 * std::f32::consts::FRAC_PI_3;
+                        let (dx, dz) = (a.cos() * r, a.sin() * r);
+                        let lean = if k % 2 == 0 { 0.22 } else { -0.22 } * height;
+                        let (lx, lz) = (-dz / r * lean, dx / r * lean);
+                        let base = positions.len() as u32;
+                        positions.extend_from_slice(&[[cx - dx, y0, cz - dz], [cx + dx, y0, cz + dz], [cx + dx + lx, y1, cz + dz + lz], [cx - dx + lx, y1, cz - dz + lz]]);
+                        let n = Vec3::new(-dz, 0.0, dx).normalize() * 0.5 + Vec3::Y * 0.85;
+                        normals.extend_from_slice(&[n.normalize().to_array(); 4]);
+                        let (u0, u1) = (base_uv[0], base_uv[0] + size_uv[0]);
+                        let (v_top, v_bottom) = (base_uv[1], base_uv[1] + size_uv[1]);
+                        uvs.extend_from_slice(&[[u0, v_bottom], [u1, v_bottom], [u1, v_top], [u0, v_top]]);
+                        colors.extend_from_slice(&[bottom, bottom, top, top]);
+                        sway.extend_from_slice(&[[0.0, phase], [0.0, phase], [0.6, phase], [0.6, phase]]);
+                        indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+                    }
+                }
+            }
+        }
+    }
+
     // Cartes de feuillage : sur chaque bloc de feuilles exposé à l'air, deux
     // quads verticaux croisés (angle aléatoire) et un horizontal, de 1.7 bloc,
     // qui débordent du cube -- le houppier perd sa silhouette en marches
     // d'escalier et devient touffu.
+    //
+    // `leaf_fringe` (distance intermédiaire, cubes de feuilles conservés) :
+    // seulement ~45 % des blocs exposés, une grande touffe verticale (+ celle
+    // du dessus), qui déborde du cube et casse sa silhouette en escalier —
+    // les houppiers lointains n'ont plus l'air de champignons cubiques.
     let has_leaves = section.palette.iter().any(|b| matches!(b, BlockType::Leaves | BlockType::PineLeaves));
-    if leaf_cards && has_leaves {
+    if (leaf_cards || leaf_fringe) && has_leaves {
         for y in 0..16 {
             for z in 0..16 {
                 for x in 0..16 {
@@ -800,6 +884,9 @@ fn plant_mesh(
                         continue;
                     }
                     let (wx, wy, wz) = (world_origin.0 + xi, world_origin.1 + yi, world_origin.2 + zi);
+                    if !leaf_cards && plant_hash(wx, wy, wz, 18) > 0.45 {
+                        continue;
+                    }
                     let center = Vec3::new(
                         x as f32 + 0.5 + (plant_hash(wx, wy, wz, 11) - 0.5) * 0.3,
                         y as f32 + 0.5 + (plant_hash(wx, wy, wz, 12) - 0.5) * 0.3,
@@ -807,7 +894,7 @@ fn plant_mesh(
                     );
                     // ~2 blocs : les touffes voisines se chevauchent et
                     // remplissent le houppier (plus de cube dessous).
-                    let half = 0.9 * (0.9 + plant_hash(wx, wy, wz, 14) * 0.25);
+                    let half = if leaf_cards { 0.9 } else { 1.3 } * (0.9 + plant_hash(wx, wy, wz, 14) * 0.25);
                     let angle = plant_hash(wx, wy, wz, 15) * std::f32::consts::PI;
                     let (s, c) = angle.sin_cos();
                     let (u0, u1) = (base_uv[0], base_uv[0] + size_uv[0]);
@@ -831,7 +918,8 @@ fn plant_mesh(
                         sway.extend_from_slice(&[[sway_low, phase], [sway_low, phase], [sway_high, phase], [sway_high, phase]]);
                         indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
                     };
-                    for (dx, dz) in [(c * half, s * half), (-s * half, c * half)] {
+                    let vertical_cards: &[(f32, f32)] = if leaf_cards { &[(c * half, s * half), (-s * half, c * half)] } else { &[(c * half, s * half)] };
+                    for &(dx, dz) in vertical_cards {
                         let d = Vec3::new(dx, 0.0, dz);
                         let up = Vec3::Y * half;
                         quad(
@@ -935,14 +1023,38 @@ fn face_ao(section_index: usize, chunk: &Chunk, edges: &ChunkEdges, x: usize, y:
     [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)].map(|ao| ao.saturating_sub(darken))
 }
 
+/// Distance (0..3 blocs, Chebyshev) de la case d'eau (x, y, z) au bloc solide
+/// le plus proche au même niveau : 0 = contre la berge, 3 = large. Le rivage
+/// voxel est un mur vertical — l'eau y fait déjà un bloc de profondeur — donc
+/// la profondeur seule ne suffit pas à y placer l'écume.
+fn shore_distance(section_index: usize, chunk: &Chunk, edges: &ChunkEdges, x: usize, y: usize, z: usize) -> u8 {
+    for d in 1..=3i32 {
+        for dx in -d..=d {
+            for dz in -d..=d {
+                if dx.abs() != d && dz.abs() != d {
+                    continue;
+                }
+                if occludes(block_at_offset(section_index, chunk, edges, x as i32 + dx, y as i32, z as i32 + dz)) {
+                    return (d - 1) as u8;
+                }
+            }
+        }
+    }
+    3
+}
+
+/// Part des blocs d'herbe à découvert qui reçoivent une touffe d'herbe courte.
+const SHORT_GRASS_DENSITY: f32 = 0.6;
+
 /// Hauteur (blocs) de la colonne examinée pour l'occlusion du ciel (`face_ao`).
 const SKY_OCCLUSION_HEIGHT: i32 = 8;
 
 /// Par section : (maillage opaque, maillage d'eau, maillage de plantes, position).
 ///
 /// `leaf_cards` : ajouter les cartes de feuillage (seulement pour les chunks
-/// proches, voir `queue_chunk_mesh_tasks`).
-pub async fn generate_mesh_from_chunk(chunk: &Chunk, texture_atlas: &TextureAtlasMaterial, edges: &ChunkEdges, leaf_cards: bool) -> Vec<(Mesh, Mesh, Mesh, Transform)> {
+/// proches, voir `queue_chunk_mesh_tasks`) ; `leaf_fringe` : quelques touffes
+/// en bordure des cubes de feuilles (distance intermédiaire).
+pub async fn generate_mesh_from_chunk(chunk: &Chunk, texture_atlas: &TextureAtlasMaterial, edges: &ChunkEdges, leaf_cards: bool, leaf_fringe: bool) -> Vec<(Mesh, Mesh, Mesh, Transform)> {
     let mut meshes = Vec::new();
     let chunk_x = chunk.x;
     let chunk_z = chunk.z;
@@ -959,11 +1071,10 @@ pub async fn generate_mesh_from_chunk(chunk: &Chunk, texture_atlas: &TextureAtla
 
         let origin = (chunk_x * 16, section.y as i32 * 16, chunk_z * 16);
         let opaque_mesh = quads_to_mesh(&opaque_quads, texture_atlas, origin);
-        let mut water_mesh = quads_to_mesh(&water_quads, texture_atlas, origin);
-        // Pas de couleur de sommet sur l'eau : dans le shader PBR de Bevy, elle
-        // REMPLACE la couleur de base du matériau (au lieu de la multiplier) --
-        // l'eau perdait sa teinte et sa transparence et devenait blanche opaque.
-        water_mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR);
+        let water_mesh = quads_to_mesh(&water_quads, texture_atlas, origin);
+        // Couleur de sommet de l'eau : pas une couleur mais la distance à la
+        // berge (niveau d'« occlusion », voir `shore_distance`), lue par
+        // water.wgsl qui calcule lui-même couleur et opacité.
 
         let transform = Transform::from_xyz(
             (chunk_x * 16) as f32,
@@ -971,7 +1082,7 @@ pub async fn generate_mesh_from_chunk(chunk: &Chunk, texture_atlas: &TextureAtla
             (chunk_z * 16) as f32,
         );
 
-        let plant_mesh = plant_mesh(section, section_index, chunk, origin, texture_atlas, leaf_cards);
+        let plant_mesh = plant_mesh(section, section_index, chunk, origin, texture_atlas, leaf_cards, leaf_fringe);
 
         meshes.push((opaque_mesh, water_mesh, plant_mesh, transform));
     }

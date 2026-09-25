@@ -95,7 +95,8 @@ fn filename_to_card_block_type(name: &str) -> Option<BlockType> {
 #[derive(Resource,Clone)]
 pub struct TextureAtlasMaterial {
     pub opaque_handle: Handle<StandardMaterial>,
-    pub water_handle: Handle<StandardMaterial>, // <- pour l’eau
+    /// Eau : vagues, couleur selon la profondeur, écume (voir `WaterExtension`).
+    pub water_handle: Handle<WaterMaterial>,
     /// Plantes en croix (herbe haute, fleurs) : découpe alpha, pas de culling.
     pub plant_handle: Handle<PlantMaterial>,
     pub uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>, // (base_uv, size_uv)
@@ -104,6 +105,11 @@ pub struct TextureAtlasMaterial {
     pub side_uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>,
     /// Cartes de feuillage (voir `filename_to_card_block_type`).
     pub card_uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>,
+    /// Variantes d'herbe (voir `plant_mesh`) : tapis d'herbe courte posé sur
+    /// les blocs d'herbe, et graminée à épis qui remplace une partie des
+    /// touffes hautes.
+    pub short_grass_uv: Option<([f32; 2], [f32; 2])>,
+    pub seed_grass_uv: Option<([f32; 2], [f32; 2])>,
 }
 
 
@@ -112,15 +118,13 @@ pub struct TextureAtlasMaterial {
 pub type PlantMaterial = ExtendedMaterial<StandardMaterial, WindExtension>;
 
 /// Vent dans la végétation : vertex shaders assets/shaders/plant_wind*.wgsl,
-/// paramètres mis à jour à chaque image par `update_wind` (weather.rs).
+/// paramètres mis à jour par `update_wind` (weather.rs) quand le vent change.
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
 pub struct WindExtension {
-    /// x : temps (s), y : force (0..1), zw : direction horizontale.
+    /// y : force (0..1), zw : direction horizontale (le temps est lu dans
+    /// les variables globales de Bevy, côté shader).
     #[uniform(100)]
     pub params: Vec4,
-    /// x : durée de l'image (s), pour la position à l'image précédente.
-    #[uniform(100)]
-    pub extra: Vec4,
 }
 
 impl MaterialExtension for WindExtension {
@@ -133,11 +137,29 @@ impl MaterialExtension for WindExtension {
     }
 }
 
+/// Matériau de l'eau : le `StandardMaterial` (éclairage, reflets) dont
+/// water.wgsl remplace la normale (vagues) et la couleur (profondeur, écume).
+pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
+
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+pub struct WaterExtension {
+    /// y : force des vagues (0..1), zw : direction du vent.
+    #[uniform(100)]
+    pub params: Vec4,
+}
+
+impl MaterialExtension for WaterExtension {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/water.wgsl".into()
+    }
+}
+
 pub struct TexturePlugin;
 impl Plugin for TexturePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MipmapGeneratorPlugin);
         app.add_plugins(MaterialPlugin::<PlantMaterial>::default());
+        app.add_plugins(MaterialPlugin::<WaterMaterial>::default());
         app.add_systems(Update, generate_mipmaps::<StandardMaterial>);  // Ajout du système générateur de mipmaps
         app.add_systems(Startup, setup_texture_atlas);
     }
@@ -148,24 +170,31 @@ pub fn setup_texture_atlas(
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut plant_materials: ResMut<Assets<PlantMaterial>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
 ) {
     let texture_handle = asset_server.load("atlas_texture.png");
     let normal_map_handle = asset_server.load("atlas_texture_normal.png");
     let metallic_roughness_handle = asset_server.load("atlas_texture_metallic_roughness.png");
 
-    // Eau : couleur profonde bleu-vert légèrement transparente, surface lisse
-    // (reflets nets du soleil sur les vaguelettes de la normal map). Pas de
-    // texture de couleur ni de rugosité : la tuile d'eau de l'atlas est claire
-    // et sa rugosité variable, ce qui donnait une surface laiteuse. Reflet
-    // physique (~2 % de face, fort à l'angle rasant) : l'eau reflète le ciel de
-    // la carte d'environnement (voir `sky_environment` dans skybox.rs).
-    let water_material = materials.add(StandardMaterial {
-        normal_map_texture: Some(normal_map_handle.clone()),
-        base_color: Color::srgba(0.02, 0.1, 0.17, 0.9),
-        perceptual_roughness: 0.06,
-        reflectance: 0.35,
-        alpha_mode: AlphaMode::Blend,
-        ..default()
+    // Eau : surface lisse (reflets nets du soleil sur les vagues de
+    // water.wgsl), sans texture de l'atlas (la tuile d'eau, claire et de
+    // rugosité variable, donnait une surface laiteuse). Reflet physique (~2 %
+    // de face, fort à l'angle rasant) : l'eau reflète le ciel de la carte
+    // d'environnement (voir `sky_environment` dans skybox.rs).
+    let water_material = water_materials.add(WaterMaterial {
+        base: StandardMaterial {
+            // Couleur, opacité et normale calculées par water.wgsl.
+            base_color: Color::srgba(0.02, 0.1, 0.17, 0.9),
+            perceptual_roughness: 0.05,
+            reflectance: 0.35,
+            // Le ciel de la carte d'environnement est plus clair à l'horizon
+            // que celui de l'atmosphère : reflet rasant un peu atténué, sinon
+            // l'eau vue de loin virait au blanc laiteux.
+            specular_tint: Color::srgb(0.7, 0.7, 0.7),
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        },
+        extension: WaterExtension::default(),
     });
 
 
@@ -216,6 +245,8 @@ pub fn setup_texture_atlas(
     let mut uv_map = HashMap::new();
     let mut side_uv_map = HashMap::new();
     let mut card_uv_map = HashMap::new();
+    let mut short_grass_uv = None;
+    let mut seed_grass_uv = None;
 
     for (filename, frame_data) in atlas_data.frames.iter() {
         let frame = &frame_data.frame;
@@ -231,6 +262,11 @@ pub fn setup_texture_atlas(
         if let Some(block_type) = filename_to_card_block_type(filename.as_str()) {
             card_uv_map.insert(block_type, rect);
         }
+        match filename.as_str() {
+            "grass_short.png" => short_grass_uv = Some(rect),
+            "grass_seed.png" => seed_grass_uv = Some(rect),
+            _ => {}
+        }
     }
 
     commands.insert_resource(TextureAtlasMaterial {
@@ -240,6 +276,8 @@ pub fn setup_texture_atlas(
         uv_map,
         side_uv_map,
         card_uv_map,
+        short_grass_uv,
+        seed_grass_uv,
     });
 }
 

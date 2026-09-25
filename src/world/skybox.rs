@@ -293,7 +293,8 @@ struct CloudParams {
     layer: Vec4,
     wind_fade: Vec4,
     horizon: Vec4,
-    // x : intensité des étoiles, y : voile de brume sur le ciel.
+    // x : intensité des étoiles, y : voile de brume sur le ciel, z : 1 avec
+    // TAA (bruit d'échantillonnage renouvelé à chaque image), 0 sans (figé).
     misc: Vec4,
 }
 
@@ -382,6 +383,7 @@ fn update_clouds(
     weather: Res<Weather>,
     mut materials: ResMut<Assets<CloudMaterial>>,
     mut wind_offset: Local<Vec2>,
+    quality: Res<GraphicsQuality>,
 ) {
     let Ok(player) = players.single() else { return };
     // Décalage accumulé (et non vitesse × temps total) : un changement de
@@ -424,7 +426,7 @@ fn update_clouds(
             layer: Vec4::new(CLOUD_HEIGHT, CLOUD_THICKNESS, CLOUD_TEXTURE_SPAN, weather.cloud_coverage),
             wind_fade: Vec4::new(wind.x, wind.y, CLOUD_FADE.0, CLOUD_FADE.1),
             horizon: Vec4::new(horizon.red, horizon.green, horizon.blue, 0.0),
-            misc: Vec4::new(night * night * (1.0 - grey), haze, 0.0, 0.0),
+            misc: Vec4::new(night * night * (1.0 - grey), haze, if *quality == GraphicsQuality::High { 1.0 } else { 0.0 }, 0.0),
         };
     }
 }
