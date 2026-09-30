@@ -1,4 +1,4 @@
-use crate::constants::{SEA_LEVEL, WORLD_HEIGHT};
+use crate::constants::SEA_LEVEL;
 use crate::world::block::BlockType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -12,35 +12,33 @@ pub enum BiomeType {
     Forest,
     Tundra,
     Swamp,
+    /// Forêt boréale de conifères (zone fraîche, entre Tundra et tempéré).
+    Taiga,
+    /// Prairie sèche chaude à arbres épars.
+    Savanna,
+    /// Forêt tropicale humide : dense, relief collineux.
+    Jungle,
+    /// Désert très sec en plateaux étagés (mesas).
+    Badlands,
 }
-
-pub const ALL_BIOMES: [BiomeType; 9] = [
-    BiomeType::Mountain,
-    BiomeType::Plain,
-    BiomeType::Beach,
-    BiomeType::Ocean,
-    BiomeType::Abyss,
-    BiomeType::Desert,
-    BiomeType::Forest,
-    BiomeType::Tundra,
-    BiomeType::Swamp,
-];
 
 /// Biomes "intérieurs", départagés entre eux par température/humidité une fois
 /// qu'on est dans la bande de continentalité "terre non montagneuse" -- voir
-/// `BiomeMap::get_biome`.
-pub const INLAND_BIOMES: [BiomeType; 5] = [
+/// `BiomeMap::get_biome`. L'ordre est celui de `BiomeMap::inland_shares`.
+pub const INLAND_BIOMES: [BiomeType; 9] = [
     BiomeType::Plain,
     BiomeType::Forest,
     BiomeType::Desert,
     BiomeType::Swamp,
     BiomeType::Tundra,
+    BiomeType::Taiga,
+    BiomeType::Savanna,
+    BiomeType::Jungle,
+    BiomeType::Badlands,
 ];
 
 #[derive(Debug, Clone)]
 pub struct Biome {
-    pub temperature: f64,
-    pub humidity: f64,
     pub continentalness: f64,
 
     pub base_height: f64,   // Hauteur moyenne
@@ -51,7 +49,6 @@ pub struct Biome {
     /// générale ; moins il y en a, plus de grandes formes lisses (utile pour
     /// des dunes larges et nettes, par exemple, que trop de détail fin brouille).
     pub octaves: usize,
-    pub size_factor: f64,
     pub surface_block: BlockType,  // ID du bloc de surface (ex: herbe)
     pub underground_block: BlockType, // ID du bloc sous-jacent (ex: terre)
 }
@@ -59,21 +56,20 @@ pub struct Biome {
 pub fn get_biome_data(biome_type: BiomeType) -> Biome {
     match biome_type {
         BiomeType::Mountain => Biome {
-            temperature: 0.0,
-            humidity: 0.0,
             continentalness: 0.85,
 
             base_height: (SEA_LEVEL + 30) as f64,
-            amplitude: 140.0,
-            frequency: 0.005,
+            // Massifs plus larges (longueur d'onde ~330 blocs au lieu de 200) :
+            // à 0.005, versants de 70° et pics en aiguille. Amplitude montée
+            // (150 -> 210) pour des sommets qui dominent le paysage, jusqu'au
+            // plafond doux sous le haut du monde (voir `soft_ceiling`).
+            amplitude: 210.0,
+            frequency: 0.003,
             octaves: 5,
-            size_factor: 1.5,
             surface_block: BlockType::Rock,
             underground_block: BlockType::Rock,
         },
         BiomeType::Plain => Biome {
-            temperature: 15.0,
-            humidity: 45.0,
             continentalness: 0.3,
 
             // Était SEA+4 / 5.0 / 0.0004 : longueur d'onde ~2500 blocs pour 5
@@ -87,14 +83,11 @@ pub fn get_biome_data(biome_type: BiomeType) -> Biome {
             amplitude: 22.0,
             frequency: 0.003,
             octaves: 5,
-            size_factor: 1.3, // biome intérieur le plus commun -> grandes étendues
 
             surface_block: BlockType::Grass,
             underground_block: BlockType::Dirt,
         },
         BiomeType::Beach => Biome {
-            temperature: 0.0,
-            humidity: 0.0,
             continentalness: -0.1,
 
             // Était 5.0 / 0.0004 (longueur d'onde ~2500 blocs, plus large que la
@@ -104,47 +97,33 @@ pub fn get_biome_data(biome_type: BiomeType) -> Biome {
             amplitude: 4.0,
             frequency: 0.007,
             octaves: 5,
-            size_factor: 1.2,
 
             surface_block: BlockType::Sand,
             underground_block: BlockType::Gravel,
         },
         BiomeType::Ocean => Biome {
-            temperature: 0.0,
-            humidity: 1.0,
             continentalness: -0.35,
 
             base_height: (SEA_LEVEL - 80) as f64,  // Niveau bas, sous la mer
             amplitude: 25.0,
             frequency: 0.000025,
-            // La taille "physique" des océans vient déjà de la géométrie des
-            // plaques (continentalness_at) ; un size_factor trop grand ici
-            // étendait aussi son emprise dans le mélange climatique bien au-delà
-            // de sa zone réelle, assez pour tirer la hauteur moyenne sous le
-            // niveau de la mer en plein milieu de biomes terrestres.
             octaves: 5,
-            size_factor: 1.2,
 
             surface_block: BlockType::Air,
             underground_block: BlockType::Sand, // Ou terre meuble sous l'eau
         },
         BiomeType::Abyss => Biome {
-            temperature: 0.0,
-            humidity: 1.0,
             continentalness: -0.75,
 
             base_height: (SEA_LEVEL - 110) as f64,  // Niveau bas, sous la mer
             amplitude: 100.0,
             frequency: 0.000025,
             octaves: 5,
-            size_factor: 1.3, // fosses profondes, larges mais moins que l'océan ouvert
 
             surface_block: BlockType::Air,
             underground_block: BlockType::Rock, // Ou terre meuble sous l'eau
         },
         BiomeType::Desert => Biome {
-            temperature: 32.0,
-            humidity: 12.0,
             continentalness: 0.3,
 
             base_height: (SEA_LEVEL + 24) as f64,
@@ -165,52 +144,94 @@ pub fn get_biome_data(biome_type: BiomeType) -> Biome {
             // base déjà élevée, brouillait les crêtes en un bruit chaotique au
             // lieu de vagues de dune nettes. 2 octaves = grandes formes lisses.
             octaves: 2,
-            size_factor: 0.9,
 
             surface_block: BlockType::Sand,
             underground_block: BlockType::Sandstone,
         },
         BiomeType::Forest => Biome {
-            temperature: 10.0,
-            humidity: 70.0,
             continentalness: 0.3,
 
             base_height: (SEA_LEVEL + 14) as f64,
             amplitude: 10.0, // relief plus vallonné que la plaine
             frequency: 0.0009,
             octaves: 5,
-            size_factor: 0.8, // poches plus localisées que la plaine
 
             surface_block: BlockType::Podzol,
             underground_block: BlockType::Dirt,
         },
         BiomeType::Tundra => Biome {
-            temperature: -15.0,
-            humidity: 35.0,
             continentalness: 0.3,
 
             base_height: (SEA_LEVEL + 10) as f64,
             amplitude: 6.0,
             frequency: 0.0004,
             octaves: 5,
-            size_factor: 1.0,
 
-            surface_block: BlockType::Snow,
-            underground_block: BlockType::Rock,
+            // Neige seulement là où il fait assez froid (voir `surface_block`) ;
+            // ailleurs, herbe rase à lichens et cailloux.
+            surface_block: BlockType::Grass,
+            underground_block: BlockType::Dirt,
         },
         BiomeType::Swamp => Biome {
-            temperature: 24.0,
-            humidity: 88.0,
             continentalness: 0.3,
 
             base_height: (SEA_LEVEL + 1) as f64,
             amplitude: 2.0, // quasi plat, zone humide basse
             frequency: 0.0004,
             octaves: 5,
-            size_factor: 0.5, // marécages en petites poches localisées
 
             surface_block: BlockType::Mud,
             underground_block: BlockType::Mud,
+        },
+        BiomeType::Taiga => Biome {
+            continentalness: 0.3,
+
+            // Collines boisées douces, un peu plus marquées que la plaine.
+            base_height: (SEA_LEVEL + 18) as f64,
+            amplitude: 16.0,
+            frequency: 0.002,
+            octaves: 5,
+
+            surface_block: BlockType::Podzol,
+            underground_block: BlockType::Dirt,
+        },
+        BiomeType::Savanna => Biome {
+            continentalness: 0.3,
+
+            // Grandes étendues ondulées (longueur d'onde ~800 blocs).
+            base_height: (SEA_LEVEL + 20) as f64,
+            amplitude: 14.0,
+            frequency: 0.0012,
+            octaves: 4,
+
+            surface_block: BlockType::Grass,
+            underground_block: BlockType::Dirt,
+        },
+        BiomeType::Jungle => Biome {
+            continentalness: 0.3,
+
+            // Collines serrées et raides (longueur d'onde ~280 blocs) : relief
+            // tropical très découpé par l'érosion (voir `erosion_strength`).
+            base_height: (SEA_LEVEL + 22) as f64,
+            amplitude: 30.0,
+            frequency: 0.0036,
+            octaves: 5,
+
+            surface_block: BlockType::Grass,
+            underground_block: BlockType::Dirt,
+        },
+        BiomeType::Badlands => Biome {
+            continentalness: 0.3,
+
+            // Plateaux hauts, découpés en terrasses (voir `terrace` dans
+            // generate_height_map.rs) : buttes et mesas.
+            base_height: (SEA_LEVEL + 34) as f64,
+            amplitude: 48.0,
+            frequency: 0.0025,
+            octaves: 4,
+
+            surface_block: BlockType::RedSand,
+            underground_block: BlockType::RedSand,
         },
     }
 }

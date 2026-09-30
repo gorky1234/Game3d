@@ -1,0 +1,15 @@
+/target
+# Sources brutes (130 Mo) des cartes NASA : voir tools/gen_night_sky.py
+/tools/nasa/
+# Cache des textures compressées en BC7 (voir src/texture.rs)
+/texture_cache/
+# Réglages de l'IDE
+/.idea/
+# Textures sources téléchargées (Poly Haven), voir tools/gen_*.py
+/tools/polyhaven/
+# Sauvegardes faites par les scripts de textures avant de réécrire l'atlas
+/assets/backup_*/
+# Cartes de debug (--export-biome-map, --export-relief-map, --export-top-view)
+/biome_map*.png
+/relief_map.png
+/top_view.png

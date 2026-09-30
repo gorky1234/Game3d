@@ -5,7 +5,10 @@ pub const WORLD_SIZE: usize = 100000;
 
 pub const SEA_LEVEL: usize = 126;
 
-pub  const VIEW_DISTANCE: i32 = 64;
+/// Rayon (en chunks) de la zone chargée. 48 (768 blocs) plutôt que 64 : la
+/// brume y masque déjà ~82 % du terrain (voir `FOG_DENSITY`, skybox.rs, fixée
+/// indépendamment), rendu identique mesuré, 36 % de chunks en moins.
+pub const VIEW_DISTANCE: i32 = 48;
 
 /// Rayon (en chunks) au-delà duquel un chunk est généré à résolution réduite
 /// (LOD) au lieu de bloc-par-bloc : LOD0 (résolution pleine) jusqu'à
@@ -15,6 +18,14 @@ pub  const VIEW_DISTANCE: i32 = 64;
 /// ce qui peut recevoir un collider doit toujours être en pleine résolution.
 pub const LOD0_DISTANCE: i32 = 6;
 pub const LOD1_DISTANCE: i32 = 14;
+
+/// Rayon (en chunks) au-delà duquel un chunk déjà maillé libère ses blocs (voir
+/// `strip_far_chunks`) : seul son maillage reste, plus le dessus de ses
+/// colonnes pour mailler la frontière de ses voisins. Au-delà de LOD1_DISTANCE
+/// (+1 de marge), là où plus aucune régénération LOD ne touche ses voisins ; un
+/// chunk libéré qui revient à LOD1_DISTANCE est régénéré (voir
+/// `loading_and_unloading_chunks`).
+pub const KEEP_BLOCKS_DISTANCE: i32 = LOD1_DISTANCE + 1;
 
 /// Rayon (en chunks) autour du joueur dans lequel les sections de chunk ont un
 /// collider physique. Au-delà, elles restent affichées (visuel + frustum culling)

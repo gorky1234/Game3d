@@ -5,22 +5,20 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use bevy::app::{App, Plugin, Update};
-use bevy::log::{error, info};
-use bevy::math::{IVec2, Vec3};
-use bevy::prelude::{Entity, Message, MessageReader, MessageWriter, Local, Query, ResMut, Resource, Transform, With};
+use bevy::math::{IVec2, Vec2, Vec3};
+use bevy::prelude::{Entity, Message, MessageReader, MessageWriter, Local, Query, Res, ResMut, Resource, Transform, With};
 use bevy::tasks::{AsyncComputeTaskPool, Task};
-use mca::{RegionReader, RegionWriter, RawChunk};
-use fastnbt::{to_writer, from_bytes, SerOpts};
+use mca::{RegionReader, RegionWriter};
+use fastnbt::{to_writer, from_bytes};
 use fastnbt::Value;
-use flate2::Status;
 use futures::FutureExt;
-use noise::{NoiseFn, Perlin};
-use crate::constants::{CHUNK_SIZE, LOD0_DISTANCE, LOD1_DISTANCE, SECTION_HEIGHT, VIEW_DISTANCE, WORLD_HEIGHT};
-use crate::generation::chunk_generation_logic::ToGenerateChunkEvent;
+use crate::constants::{CHUNK_SIZE, LOD0_DISTANCE, LOD1_DISTANCE, SEA_LEVEL, SECTION_HEIGHT, VIEW_DISTANCE, WORLD_HEIGHT};
+use crate::generation::chunk_generation_logic::{BiomeMapArc, ToGenerateChunkEvent};
+use crate::generation::generate_biome_map::BiomeMap;
+use crate::generation::generate_height_map::HeightMap;
 use crate::player::Player;
 use crate::world::block::BlockType;
 use crate::world::chunk::Chunk;
-use crate::render::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
 use bevy::camera::primitives::Aabb;
 
 const MAX_LOAD_TASKS: usize = 5;
@@ -217,6 +215,14 @@ pub struct ToLoadChunkEvent {
     pub z: i32,
 }
 
+/// Les blocs du chunk (x, z) ont changé (généré, chargé, modifié, ou un
+/// voisin est arrivé) : son maillage est à refaire.
+#[derive(Message, Clone)]
+pub struct ChunkToUpdateEvent {
+    pub x: i32,
+    pub z: i32,
+}
+
 #[derive(Default, Message)]
 pub struct ToUnloadChunkEvent {
     pub x: i32,
@@ -238,9 +244,12 @@ impl Plugin for WorldDataPlugin {
             .add_message::<ToUnloadChunkEvent>()
 
             .add_message::<ToLoadChunkEvent>()
+            .add_message::<ChunkToUpdateEvent>()
             .add_message::<ChunkLoadedEvent>()
             .init_resource::<ChunkLoadQueue>()
+            .init_resource::<LodVisibility>()
             .add_systems(Update, enqueue_load_requests)
+            .add_systems(Update, classify_lod_visibility)
             .add_systems(Update, load_chunks_system)
             .add_systems(Update, collect_load_chunks_system)
             .add_systems(Update, apply_loaded_chunks);
@@ -249,29 +258,32 @@ impl Plugin for WorldDataPlugin {
 
 fn enqueue_load_requests(
     mut queue: ResMut<ChunkLoadQueue>,
+    visibility: Res<LodVisibility>,
     mut event_reader: MessageReader<ToLoadChunkEvent>,
     player_query: Query<&Transform, With<Player>>,
 ) {
     let player = player_query.single().ok();
     for event in event_reader.read() {
-        if queue.pending.insert((event.x, event.z)) {
+        if !visibility.deferred.contains(&(event.x, event.z)) && queue.pending.insert((event.x, event.z)) {
             queue.queue.push(QueuedChunk::new(event.x, event.z, player));
         }
     }
 }
 
-use std::time::{Duration, SystemTime};
 fn load_chunks_system(
     mut queue: ResMut<ChunkLoadQueue>,
+    mut visibility: ResMut<LodVisibility>,
     mut refresh_state: Local<QueueRefreshState>,
     player_query: Query<&Transform, With<Player>>,
 ) {
     let task_pool = AsyncComputeTaskPool::get();
 
-    if let Ok(player) = player_query.single() {
+    let player = player_query.single().ok();
+    if let Some(player) = player {
         let queue = &mut *queue;
         refresh_queue_if_needed(&mut refresh_state, &mut queue.queue, &mut queue.pending, player);
     }
+    let player_chunk = player.map(player_chunk_of);
 
     while queue.current_tasks.len() < MAX_LOAD_TASKS {
         let Some(item) = queue.queue.pop() else {
@@ -279,6 +291,13 @@ fn load_chunks_system(
         };
         let (x, z) = (item.x, item.z);
         queue.pending.remove(&(x, z));
+        // Chunk LOD pas (encore) reconnu visible : mis en attente au lieu
+        // d'être chargé, voir `LodVisibility`.
+        if lod_culling_enabled() && player_chunk.is_some_and(|pc| chunk_lod_stride(x, z, pc) > 1) && !visibility.approved.remove(&(x, z)) {
+            visibility.deferred.insert((x, z));
+            visibility.dirty = true;
+            continue;
+        }
 
         let task = task_pool.spawn(async move {
             let chunk = load_chunk(x, z).await.expect("Erreur chargement chunk");
@@ -287,6 +306,184 @@ fn load_chunks_system(
 
         queue.current_tasks.push(task);
     }
+}
+
+// --- Chunks LOD invisibles ---
+
+/// Demi-angle horizontal (radians) du cône dans lequel un chunk LOD est
+/// considéré visible : le champ de vision horizontal de la caméra fait ~46°
+/// de demi-angle (60° vertical, 16:9), plus une marge pour qu'un petit
+/// mouvement de tête ne découvre pas de trou.
+const LOD_VIEW_HALF_ANGLE: f32 = 62.0 * std::f32::consts::PI / 180.0;
+/// Hauteur des yeux au-dessus de la position du joueur.
+const EYE_HEIGHT: f32 = 1.6;
+/// Marge (blocs) ajoutée au sommet d'un chunk (arbres) et retirée aux
+/// obstacles (échantillonnage grossier du relief) : dans le doute, visible.
+const LOD_TOP_MARGIN: f32 = 24.0;
+const LOD_OCCLUDER_MARGIN: f32 = 4.0;
+/// Pas (blocs) de la grille d'échantillonnage du relief : un demi-chunk.
+const HORIZON_STEP: f32 = CHUNK_SIZE as f32 / 2.0;
+/// Rotation (cosinus) au-delà de laquelle la visibilité est recalculée : ~10°.
+const LOD_REFRESH_MIN_DOT: f32 = 0.985;
+
+/// `GAME3D_NO_LOD_CULLING` (n'importe quelle valeur) désactive la mise en
+/// attente des chunks LOD invisibles : tout est chargé, comme avant.
+fn lod_culling_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GAME3D_NO_LOD_CULLING").is_none())
+}
+
+/// Chunks LOD (au-delà de LOD0_DISTANCE) jamais vus : pas chargés tant qu'ils
+/// sont hors du champ de vision ou cachés derrière le relief (test sur la
+/// carte de hauteur procédurale, sans charger les chunks). Une fois chargé,
+/// un chunk le reste jusqu'à sortir de VIEW_DISTANCE, même hors de vue.
+#[derive(Resource, Default)]
+pub struct LodVisibility {
+    /// Chunks retirés de la file de chargement faute d'être visibles.
+    deferred: HashSet<(i32, i32)>,
+    /// Chunks reconnus visibles, remis dans la file de chargement.
+    approved: HashSet<(i32, i32)>,
+    /// Hauteur du relief (surface de l'eau comprise) aux points de la grille
+    /// de pas HORIZON_STEP, calculée à la demande. `None` pendant qu'une
+    /// tâche de classement l'utilise.
+    heights: Option<HashMap<(i32, i32), f32>>,
+    task: Option<Task<(Vec<(i32, i32)>, HashMap<(i32, i32), f32>)>>,
+    /// Chunk et direction du joueur au dernier classement.
+    last: Option<(IVec2, Vec3)>,
+    /// De nouveaux chunks ont été mis en attente depuis le dernier classement.
+    dirty: bool,
+}
+
+/// Parmi `candidates`, les chunks visibles depuis `eye` en regardant vers
+/// `forward` (horizontal, unitaire) : dans le cône de vision, et dont le
+/// sommet n'est pas caché par le relief entre le joueur et eux.
+fn visible_lod_chunks(
+    candidates: &[(i32, i32)],
+    eye: Vec3,
+    forward: Vec2,
+    heights: &mut HashMap<(i32, i32), f32>,
+    biome_map: &BiomeMap,
+    height_map: &HeightMap,
+) -> Vec<(i32, i32)> {
+    let mut h = |ix: i32, iz: i32| -> f32 {
+        *heights.entry((ix, iz)).or_insert_with(|| {
+            let (x, z) = ((ix as f32 * HORIZON_STEP) as i64, (iz as f32 * HORIZON_STEP) as i64);
+            height_map.height_at(x, z, biome_map).max(SEA_LEVEL) as f32
+        })
+    };
+    let eye2 = Vec2::new(eye.x, eye.z);
+    candidates
+        .iter()
+        .copied()
+        .filter(|&(cx, cz)| {
+            let center = Vec2::new((cx as f32 + 0.5) * CHUNK_SIZE as f32, (cz as f32 + 0.5) * CHUNK_SIZE as f32);
+            let to = center - eye2;
+            let dist = to.length();
+            if dist < 1.0 {
+                return true;
+            }
+            let dir = to / dist;
+            // Champ de vision (le chunk est vu dès qu'un de ses bords y entre).
+            let angle = dir.dot(forward).clamp(-1.0, 1.0).acos();
+            let half_size = (CHUNK_SIZE as f32 * 0.75 / dist).atan();
+            if angle - half_size > LOD_VIEW_HALF_ANGLE {
+                return false;
+            }
+            // Relief : le sommet du chunk (max sur sa grille de 3x3 points)
+            // doit dépasser la ligne d'horizon le long du trajet.
+            let (gx, gz) = (cx * 2, cz * 2);
+            let mut top = f32::MIN;
+            for i in 0..=2 {
+                for j in 0..=2 {
+                    top = top.max(h(gx + i, gz + j));
+                }
+            }
+            let target = (top + LOD_TOP_MARGIN - eye.y) / dist;
+            let mut t = HORIZON_STEP;
+            while t < dist - CHUNK_SIZE as f32 {
+                let p = eye2 + dir * t;
+                let occluder = h((p.x / HORIZON_STEP).round() as i32, (p.y / HORIZON_STEP).round() as i32) - LOD_OCCLUDER_MARGIN;
+                if (occluder - eye.y) / t > target {
+                    return false;
+                }
+                t += HORIZON_STEP;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Reclasse les chunks en attente quand le joueur change de chunk, tourne
+/// sensiblement ou que de nouveaux chunks attendent (tâche en arrière-plan :
+/// le premier classement calcule des dizaines de milliers de hauteurs).
+fn classify_lod_visibility(
+    mut visibility: ResMut<LodVisibility>,
+    mut queue: ResMut<ChunkLoadQueue>,
+    player_query: Query<&Transform, With<Player>>,
+    biome_map: Option<Res<BiomeMapArc>>,
+    height_map: Option<Res<HeightMap>>,
+) {
+    let Ok(player) = player_query.single() else { return };
+    let player_chunk = player_chunk_of(player);
+    let visibility = &mut *visibility;
+
+    // Résultat d'un classement : chunks visibles remis en file.
+    if let Some(task) = &mut visibility.task {
+        let Some((visible, heights)) = task.now_or_never() else { return };
+        visibility.task = None;
+        visibility.heights = Some(heights);
+        for pos in visible {
+            if visibility.deferred.remove(&pos) && chunk_in_view(pos.0, pos.1, player_chunk) && queue.pending.insert(pos) {
+                visibility.approved.insert(pos);
+                queue.queue.push(QueuedChunk::new(pos.0, pos.1, Some(player)));
+            }
+        }
+    }
+
+    let forward = player.forward().as_vec3();
+    let moved = visibility.last.is_none_or(|(chunk, dir)| chunk != player_chunk || dir.dot(forward) < LOD_REFRESH_MIN_DOT);
+    if !(moved || visibility.dirty) || visibility.deferred.is_empty() {
+        return;
+    }
+    let (Some(biome_map), Some(height_map)) = (biome_map, height_map) else { return };
+    visibility.last = Some((player_chunk, forward));
+    visibility.dirty = false;
+
+    // Hors de portée : oubliés (redemandés par `loading_and_unloading_chunks`
+    // si le joueur revient). Redevenus proches (LOD0) : chargés sans test.
+    let mut near = Vec::new();
+    visibility.deferred.retain(|&(x, z)| {
+        if !chunk_in_view(x, z, player_chunk) {
+            return false;
+        }
+        if chunk_lod_stride(x, z, player_chunk) == 1 {
+            near.push((x, z));
+            return false;
+        }
+        true
+    });
+    for pos in near {
+        if queue.pending.insert(pos) {
+            queue.queue.push(QueuedChunk::new(pos.0, pos.1, Some(player)));
+        }
+    }
+
+    let candidates: Vec<(i32, i32)> = visibility.deferred.iter().copied().collect();
+    let mut heights = visibility.heights.take().unwrap_or_default();
+    // Cache borné : au-delà, on repart de zéro (le joueur a beaucoup voyagé).
+    if heights.len() > 400_000 {
+        heights.clear();
+    }
+    let eye = player.translation + Vec3::Y * EYE_HEIGHT;
+    let forward2 = Vec2::new(forward.x, forward.z).normalize_or(Vec2::NEG_Y);
+    let biome_map = biome_map.0.clone();
+    let height_map = height_map.clone();
+    visibility.task = Some(AsyncComputeTaskPool::get().spawn(async move {
+        let start = std::time::Instant::now();
+        let visible = visible_lod_chunks(&candidates, eye, forward2, &mut heights, &biome_map, &height_map);
+        bevy::log::debug!("chunks LOD : {} en attente, {} visibles ({} hauteurs en cache) en {:?}", candidates.len(), visible.len(), heights.len(), start.elapsed());
+        (visible, heights)
+    }));
 }
 
 fn collect_load_chunks_system(
@@ -355,6 +552,10 @@ pub async fn load_chunk(x: i32, z: i32) -> anyhow::Result<Chunk> {
         z,
         sections: vec![],
         trees: vec![],
+        surface_fill: vec![],
+        surface_y: vec![],
+        columns: vec![],
+        modified: false,
     })
 }
 
@@ -432,17 +633,40 @@ impl WorldData {
         BlockType::Air
     }
 
-    /// Modifie le bloc aux coordonnées mondiales (wx, wy, wz) si le chunk est chargé
-    /// Retourne true si modification faite, false sinon
-    pub fn set_block(&mut self, wx: i32, wy: i32, wz: i32, palette_index: u8) {
-
+    /// Remplace le bloc aux coordonnées monde (wx, wy, wz) si son chunk est
+    /// chargé. Renvoie le bloc remplacé, ou `None` si rien n'a changé (chunk
+    /// absent, hors du monde, même bloc). Copie-sur-écriture du chunk
+    /// (`Arc::make_mut`) : une tâche de maillage en cours garde l'ancienne
+    /// version, sans verrou. Ne remaille rien : voir `block_interaction`.
+    pub fn set_block(&mut self, wx: i32, wy: i32, wz: i32, block: BlockType) -> Option<BlockType> {
+        if wy < 0 || wy >= WORLD_HEIGHT as i32 {
+            return None;
+        }
+        let cs = CHUNK_SIZE as i32;
+        let key = (wx.div_euclid(cs), wz.div_euclid(cs));
+        let (lx, lz) = (wx.rem_euclid(cs) as usize, wz.rem_euclid(cs) as usize);
+        let chunk = Arc::make_mut(self.chunks_loaded.get_mut(&key)?);
+        let section_y = wy as usize / SECTION_HEIGHT;
+        let section = chunk.sections.iter_mut().find(|s| s.y as usize == section_y)?;
+        let ly = wy as usize % SECTION_HEIGHT;
+        let old = section.get_block(lx, ly, lz);
+        if old == block {
+            return None;
+        }
+        section.set_block(lx, ly, lz, block);
+        section.refresh_is_empty();
+        chunk.modified = true;
+        if !chunk.columns.is_empty() {
+            chunk.columns[lz * CHUNK_SIZE + lx] = chunk.compute_column(lx, lz);
+        }
+        Some(old)
     }
 }
 
 // Convertit NBT (Value) ⇄ chunk simplifié
 fn parse_nbt_to_chunk(x:i32, z:i32, nbt: Value) -> Chunk {
     // parsing minimal example – adapter selon structure NBT
-    Chunk { x, z, sections: vec![], trees: vec![] }
+    Chunk { x, z, sections: vec![], trees: vec![], surface_fill: vec![], surface_y: vec![], columns: vec![], modified: false }
 }
 
 fn chunk_to_nbt(chunk: &Chunk) -> Value {

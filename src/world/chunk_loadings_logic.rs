@@ -1,14 +1,9 @@
-use std::sync::{Arc, Mutex};
 use bevy::app::{App, Plugin, Update};
 use bevy::math::IVec2;
-use bevy::prelude::{Commands, Component, MessageReader, MessageWriter, IntoScheduleConfigs, Query, ResMut, Resource, Transform, With};
-use bevy::tasks::{AsyncComputeTaskPool, Task};
-use futures::FutureExt;
+use bevy::prelude::{Commands, MessageWriter, SystemSet, IntoScheduleConfigs, Query, ResMut, Resource, Transform, With};
 use crate::constants::{CHUNK_SIZE, LOD1_DISTANCE, SECTION_HEIGHT, VIEW_DISTANCE, WORLD_HEIGHT, WORLD_SIZE};
 use crate::generation::chunk_generation_logic::ToGenerateChunkEvent;
 use crate::player::Player;
-use crate::world::chunk::Chunk;
-use crate::render::chunk_loadings_mesh_logic::{poll_chunk_tasks, ChunkToUpdateEvent};
 use crate::world::load_save_chunk::{chunk_lod_stride, ToLoadChunkEvent, WorldData};
 
 // --- RESOURCES ---
@@ -25,10 +20,13 @@ impl Default for PlayerChunk {
     }
 }
 
-#[derive(Component)]
-struct LoadingChunkTask(Task<anyhow::Result<()>>);
 
 
+
+/// Chargement et déchargement des chunks autour du joueur (le déchargement
+/// détruit les entités de maillage des chunks trop loin).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChunkUnloadSet;
 
 // --- PLUGIN ---
 pub struct ChunkLoadingsPlugin;
@@ -38,15 +36,9 @@ impl Plugin for ChunkLoadingsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PlayerChunk>();
         app.add_message::<ToLoadChunkEvent>();
-        // .after() (pas juste l'ordre d'ajout des plugins, qui n'a aucune
-        // influence sur l'ordonnancement) : voir la note au-dessus de
-        // `loading_and_unloading_chunks` -- il faut que les entités tout juste
-        // spawnées par poll_chunk_tasks soient réellement créées (composants
-        // insérés) avant que ce système ne puisse les redéchager dans la même
-        // frame, sinon la commande d'insertion de poll_chunk_tasks panique en
-        // trouvant l'entité déjà détruite.
-        app.add_systems(Update, loading_and_unloading_chunks.after(poll_chunk_tasks));
-        app.add_message::<ChunkToUpdateEvent>();
+        // Ordonné après le maillage (poll_chunk_tasks) par le rendu, voir
+        // `GenerateMeshChunksPlugin`.
+        app.add_systems(Update, loading_and_unloading_chunks.in_set(ChunkUnloadSet));
     }
 }
 
@@ -232,7 +224,11 @@ fn loading_and_unloading_chunks(
         for z in -LOD1_DISTANCE..=LOD1_DISTANCE {
             let pos = (new_chunk.x + x, new_chunk.y + z);
             if let Some(&current_stride) = world_data.chunks_lod.get(&pos) {
-                if chunk_lod_stride(pos.0, pos.1, new_chunk) < current_stride {
+                // Chunk aux blocs libérés revenu à portée (voir
+                // `strip_far_chunks`) : régénéré, ses voisins proches
+                // pouvant de nouveau être remaillés à tout moment.
+                let stripped = world_data.chunks_loaded.get(&pos).is_some_and(|c| c.is_stripped());
+                if stripped || chunk_lod_stride(pos.0, pos.1, new_chunk) < current_stride {
                     generate_events.write(ToGenerateChunkEvent { x: pos.0, z: pos.1, lod_upgrade: true });
                 }
             }

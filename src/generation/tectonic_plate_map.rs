@@ -72,6 +72,11 @@ const BASE_BLEND_SHARPNESS: f64 = 4.0;
 /// juste moins de frontières au total qui la déclenchent).
 const BOUNDARY_SHARPNESS: f64 = 2.0;
 
+/// Plaques voisines prises en compte (voir `continentalness_at`), et netteté
+/// du passage d'une voisine à l'autre (plus grand = transition plus étroite).
+const NEIGHBOR_PLATES: usize = 4;
+const NEIGHBOR_BLEND: f64 = 40.0;
+
 impl TectonicPlateMap {
     pub fn new(seed: u64, size_world: i64, num_plates: usize) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -154,76 +159,138 @@ impl TectonicPlateMap {
     /// avec des pics marqués aux frontières de plaques en collision (montagnes) et des
     /// creux aux frontières océaniques en collision (fosses).
     pub fn continentalness_at(&self, x: f64, z: f64) -> f64 {
-        // Plaque la plus proche et 2e plus proche, en un seul passage (balayage
-        // linéaire sur NUM_TECTONIC_PLATES plaques : trivial même appelé par colonne).
-        let mut best: (f64, usize) = (f64::MAX, 0);
-        let mut second: (f64, usize) = (f64::MAX, 0);
+        self.features_at(x, z).continentalness
+    }
 
+    /// Plaques : (centre, océanique, dérive), pour les points chauds.
+    pub fn plates(&self) -> impl Iterator<Item = ((f64, f64), bool, (f64, f64))> + '_ {
+        self.plates.iter().map(|p| (p.center, p.kind == PlateKind::Oceanic, p.drift))
+    }
+
+    /// Continentalité et reliefs liés aux frontières de plaques (voir
+    /// `PlateFeatures`).
+    pub fn features_at(&self, x: f64, z: f64) -> PlateFeatures {
+        // Les NEIGHBOR_PLATES plaques les plus proches, triées (balayage
+        // linéaire sur NUM_TECTONIC_PLATES plaques : trivial même par colonne).
+        let mut nearest = [(f64::MAX, 0usize); NEIGHBOR_PLATES];
         for (i, plate) in self.plates.iter().enumerate() {
             let dx = x - plate.center.0;
             let dz = z - plate.center.1;
             let dist_sq = dx * dx + dz * dz;
-
-            if dist_sq < best.0 {
-                second = best;
-                best = (dist_sq, i);
-            } else if dist_sq < second.0 {
-                second = (dist_sq, i);
+            if dist_sq < nearest[NEIGHBOR_PLATES - 1].0 {
+                let mut k = NEIGHBOR_PLATES - 1;
+                while k > 0 && nearest[k - 1].0 > dist_sq {
+                    nearest[k] = nearest[k - 1];
+                    k -= 1;
+                }
+                nearest[k] = (dist_sq, i);
             }
         }
 
-        let p1 = &self.plates[best.1];
-        let p2 = &self.plates[second.1];
-        let d1 = best.0.sqrt();
-        let d2 = second.0.sqrt();
+        let p1 = &self.plates[nearest[0].1];
+        let d1 = nearest[0].0.sqrt();
+        let d2 = nearest[1].0.sqrt();
 
-        // Moyenne pondérée entre les deux niveaux de base, PAS juste celui de la
-        // plaque la plus proche : `p1`/`p2` échangent leurs rôles exactement à la
-        // frontière de Voronoi (d1 == d2), donc utiliser seul `p1.base_level` y
-        // crée un saut instantané (jusqu'à ~1.0, continent contre océan) -- le
-        // mur vertical net à la frontière plutôt qu'une pente.
+        // Contribution de la paire (p1, voisine pj) : mélange des niveaux de
+        // base et poussée à leur frontière. Moyenne pondérée entre les deux
+        // niveaux de base, PAS juste celui de la plaque la plus proche : `p1`/`pj`
+        // échangent leurs rôles exactement à la frontière de Voronoi (d1 == dj),
+        // donc utiliser seul `p1.base_level` y crée un saut instantané (jusqu'à
+        // ~1.0, continent contre océan) -- le mur vertical net à la frontière
+        // plutôt qu'une pente.
         //
-        // Une simple moyenne linéaire (d2/(d1+d2)) reste continue mais "dilue"
-        // sur une trop grande partie de chaque cellule (ex: d2 = 2*d1, pourtant
+        // Une simple moyenne linéaire (dj/(d1+dj)) reste continue mais "dilue"
+        // sur une trop grande partie de chaque cellule (ex: dj = 2*d1, pourtant
         // pas près du bord, donne déjà 33% de mélange) : la continentalité ne
         // reste presque jamais franchement proche de sa plaque, elle traîne dans
         // la zone médiane -- où le moindre bruit suffit à faire basculer la
         // classification d'une catégorie à l'autre (grésillement d'îlots
-        // Ocean/Abyss un peu partout). En élevant d1/d2 à une puissance avant de
+        // Ocean/Abyss un peu partout). En élevant d1/dj à une puissance avant de
         // pondérer, la moyenne reste proche de p1 sur une bien plus grande partie
         // de sa cellule, et ne se mélange franchement que tout près du vrai bord
         // -- tout en restant parfaitement continue et symétrique (toujours 50/50
         // pile à la frontière, quelle que soit la puissance).
-        let d1p = d1.powf(BASE_BLEND_SHARPNESS);
-        let d2p = d2.powf(BASE_BLEND_SHARPNESS);
-        let base_weight_total = (d1p + d2p).max(1e-9);
-        let mut value = (d2p * p1.base_level + d1p * p2.base_level) / base_weight_total;
+        let pair = |pj: &Plate, dj: f64| -> (f64, f64, f64) {
+            let (mut rift, mut arc) = (0.0, 0.0);
+            let d1p = d1.powf(BASE_BLEND_SHARPNESS);
+            let djp = dj.powf(BASE_BLEND_SHARPNESS);
+            let mut value = (djp * p1.base_level + d1p * pj.base_level) / (d1p + djp).max(1e-9);
 
-        // Proche de 1 quand on est sur la frontière de Voronoi entre p1 et p2
-        // (d1 ≈ d2, donc d1/d2 ≈ 1), proche de 0 loin à l'intérieur d'une plaque
-        // (d1 << d2, donc d1/d2 ≈ 0). Rampe large (exposant 1.0) : la zone de
-        // relief monte/descend sur une bonne partie de la distance entre les
-        // deux plaques, pas juste sur une ligne fine.
-        let boundary_proximity = (d1 / d2.max(1e-6)).clamp(0.0, 1.0).powf(BOUNDARY_SHARPNESS);
+            // Proche de 1 sur la frontière de Voronoi entre p1 et pj (d1 ≈ dj),
+            // proche de 0 loin à l'intérieur d'une plaque (d1 << dj). Rampe
+            // large (exposant 1.0) : la zone de relief monte/descend sur une
+            // bonne partie de la distance entre les deux plaques, pas juste sur
+            // une ligne fine.
+            let boundary_proximity = (d1 / dj.max(1e-6)).clamp(0.0, 1.0).powf(BOUNDARY_SHARPNESS);
+            if boundary_proximity > 0.0 {
+                let axis_len = (d1 + dj).max(1e-6);
+                let axis = ((pj.center.0 - p1.center.0) / axis_len, (pj.center.1 - p1.center.1) / axis_len);
+                // Vitesse de p1 relative à pj, projetée sur l'axe qui les
+                // relie : positif si les deux plaques convergent. Clampée pour
+                // éviter qu'un fort différentiel de vitesse ne fasse déborder
+                // `value` très au-delà de [-1, 1] (ça créait un plateau écrêté
+                // suivi d'une chute nette -- un mur -- plutôt qu'une pente).
+                let relative_drift = (p1.drift.0 - pj.drift.0, p1.drift.1 - pj.drift.1);
+                let convergence = (relative_drift.0 * axis.0 + relative_drift.1 * axis.1).clamp(-1.0, 1.0);
+                value += convergence * boundary_weight(p1.kind, pj.kind) * boundary_proximity;
+                let ratio = (d1 / dj.max(1e-6)).clamp(0.0, 1.0);
+                // Rift : deux plaques continentales qui s'écartent, fossé
+                // étroit le long de la frontière.
+                if p1.kind == PlateKind::Continental && pj.kind == PlateKind::Continental && convergence < 0.0 {
+                    rift = smoothstep(0.9, 0.985, ratio) * smoothstep(0.15, 0.5, -convergence);
+                }
+                // Arc volcanique : une plaque océanique (pj) plonge sous p1 ;
+                // les volcans s'alignent en retrait de la frontière, côté p1
+                // (chaîne sur un continent, arc d'îles en plein océan).
+                if pj.kind == PlateKind::Oceanic && convergence > 0.0 {
+                    arc = smoothstep(0.55, 0.72, ratio) * (1.0 - smoothstep(0.86, 0.95, ratio)) * smoothstep(0.15, 0.5, convergence);
+                }
+            }
+            (value, rift, arc)
+        };
 
-        if boundary_proximity > 0.0 {
-            let axis_len = (d1 + d2).max(1e-6);
-            let axis = ((p2.center.0 - p1.center.0) / axis_len, (p2.center.1 - p1.center.1) / axis_len);
-
-            // Vitesse de p1 relative à p2, projetée sur l'axe qui les relie :
-            // positif si les deux plaques convergent l'une vers l'autre. Clampée
-            // pour éviter qu'un fort différentiel de vitesse ne fasse déborder
-            // `value` très au-delà de [-1, 1] (ça créait un plateau écrêté suivi
-            // d'une chute nette -- un mur -- plutôt qu'une pente).
-            let relative_drift = (p1.drift.0 - p2.drift.0, p1.drift.1 - p2.drift.1);
-            let convergence = (relative_drift.0 * axis.0 + relative_drift.1 * axis.1).clamp(-1.0, 1.0);
-
-            let weight = boundary_weight(p1.kind, p2.kind);
-            value += convergence * weight * boundary_proximity;
+        // Voisines mêlées en douceur, pondérées par (d2/dj)^NEIGHBOR_BLEND :
+        // ~100 % la 2e plus proche dès que la 3e est 10 % plus loin, 50/50 là
+        // où elles sont à égale distance (transition sur quelques centaines de
+        // blocs ; à 8, elle débordait sur des régions entières et déplaçait les
+        // chaînes de montagnes). Ne prendre que la 2e (ancien calcul)
+        // faisait sauter niveau de base et poussée d'un coup sur la ligne où
+        // elles échangent leur rang -- falaise rectiligne de dizaines de blocs
+        // en travers d'un biome.
+        let (mut value, mut rift, mut arc, mut total) = (0.0, 0.0, 0.0, 0.0);
+        for &(dist_sq, j) in &nearest[1..] {
+            if dist_sq == f64::MAX {
+                continue;
+            }
+            let dj = dist_sq.sqrt();
+            let w = (d2 / dj.max(1e-6)).powf(NEIGHBOR_BLEND);
+            let (v, r, a) = pair(&self.plates[j], dj);
+            value += w * v;
+            rift += w * r;
+            arc += w * a;
+            total += w;
         }
+        let total = total.max(1e-9);
+        let value = value / total;
 
         let detail = self.detail_noise.get([x, z]) * DETAIL_AMPLITUDE;
 
-        (value + detail).clamp(-1.0, 1.0)
+        PlateFeatures { continentalness: (value + detail).clamp(-1.0, 1.0), rift: rift / total, arc: arc / total }
     }
+}
+
+/// Continentalité et reliefs de frontière de plaques en un point.
+#[derive(Debug, Clone, Copy)]
+pub struct PlateFeatures {
+    pub continentalness: f64,
+    /// 0..1 : fossé d'effondrement (rift) entre deux plaques continentales
+    /// qui s'écartent.
+    pub rift: f64,
+    /// 0..1 : bande des arcs volcaniques, en retrait d'une zone de subduction.
+    pub arc: f64,
+}
+
+fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }

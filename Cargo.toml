@@ -1,0 +1,23 @@
+[package]
+name = "Game3d"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.19", features = ["jpeg", "pbr_clustered_decals", "pbr_light_textures"] }
+bevy_pbr = "0.19"
+bevy_rapier3d = "0.36"
+noise = "0.8"
+mca = "*"
+fastnbt = "*"
+anyhow = "1.0.96"
+flate2 = "1.1.2"
+async-channel = "1.6"
+futures = "0.3.31"
+bytemuck = "1.23.1"
+serde_json = "1.0.140"
+serde = { version = "1.0.219", features = ["derive"] }
+rand = "0.8"
+rand_chacha = "0.3"
+image = "*"
+bevy_mod_mipmap_generator = { git = "https://github.com/DGriffin91/bevy_mod_mipmap_generator", features = ["compress"] }

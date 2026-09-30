@@ -1,18 +1,13 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use bevy::app::{App, Plugin, Startup, Update};
-use bevy::log::info;
-use bevy::math::IVec2;
 use bevy::prelude::{Commands, Message, MessageReader, MessageWriter, Local, Query, Res, ResMut, Resource, Transform, With};
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use futures::FutureExt;
-use noise::Perlin;
-use crate::constants::{CHUNK_SIZE, WORLD_SIZE};
 use crate::player::Player;
-use crate::render::chunk_loadings_mesh_logic::ChunkToUpdateEvent;
-use crate::world::load_save_chunk::{chunk_in_view, chunk_lod_stride, load_chunk, player_chunk_of, refresh_queue_if_needed, QueueRefreshState, QueuedChunk, WorldData};
-use crate::generation::biome::{Biome, BiomeType, get_biome_data};
-use crate::generation::generate_biome_map::{BiomeMap};
+use crate::world::load_save_chunk::ChunkToUpdateEvent;
+use crate::world::load_save_chunk::{chunk_in_view, chunk_lod_stride, player_chunk_of, refresh_queue_if_needed, QueueRefreshState, QueuedChunk, WorldData};
+use crate::generation::generate_biome_map::BiomeMap;
 use crate::generation::generate_chunk::generate_chunk;
 use crate::generation::generate_height_map::HeightMap;
 use crate::world::chunk::Chunk;
@@ -73,8 +68,7 @@ impl Plugin for ChunkGenerationPlugin {
 
 /// Initialisation de la map de biomes (à faire une fois au démarrage)
 fn setup_maps(mut commands: Commands) {
-    let map = BiomeMap::new(0);
-    commands.insert_resource(BiomeMapArc(Arc::new(map)));
+    commands.insert_resource(BiomeMapArc(BiomeMap::global()));
     commands.insert_resource(HeightMap::new());
 }
 
@@ -129,8 +123,7 @@ fn generate_chunks_system(
         let lod_stride = player_chunk.map_or(1, |pc| chunk_lod_stride(x, z, pc));
 
         let task = task_pool.spawn(async move {
-            let perlin = Perlin::new(0);
-            let chunk = generate_chunk(x, z, &perlin, &biome_map, &height_map, lod_stride).await;
+            let chunk = generate_chunk(x, z, &biome_map, &height_map, lod_stride).await;
             (x, z, chunk, lod_stride)
         });
 
