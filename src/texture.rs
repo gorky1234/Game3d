@@ -6,7 +6,7 @@ use serde::Deserialize;
 use bevy::asset::{Assets, AssetServer, Handle};
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::{default, Res, ResMut, Resource};
-use bevy_mod_mipmap_generator::{generate_mips_texture, CompressionSpeed, MipmapGeneratorSettings};
+use crate::texture_bake::{general_path, terrain_path, TerrainAtlas, TERRAIN_JSON};
 use bevy::image::{ImageSampler, ImageSamplerDescriptor};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
@@ -14,6 +14,10 @@ use bevy::image::ImageLoaderSettings;
 use bevy::asset::RenderAssetUsages;
 use bevy::shader::ShaderRef;
 use crate::world::block::BlockType;
+use crate::render::smooth_terrain::{ATTRIBUTE_TERRAIN_LAYERS, ATTRIBUTE_TERRAIN_SALT};
+use bevy::pbr::{MaterialExtensionKey, MaterialExtensionPipeline};
+use bevy::render::mesh::MeshVertexBufferLayoutRef;
+use bevy::render::render_resource::{RenderPipelineDescriptor, SpecializedMeshPipelineError};
 
 
 //lire le json
@@ -69,6 +73,12 @@ fn filename_to_block_type(name: &str) -> Option<BlockType> {
         "flower_red.png" => Some(BlockType::FlowerRed),
         "flower_yellow.png" => Some(BlockType::FlowerYellow),
         "red_sand.png" => Some(BlockType::RedSand),
+        "salt.png" => Some(BlockType::Salt),
+        // Flore au sol des biomes (voir tools/gen_ground_flora.py).
+        "moss.png" => Some(BlockType::Moss),
+        "lichen.png" => Some(BlockType::Lichen),
+        "flower_blue.png" => Some(BlockType::FlowerBlue),
+        "flower_purple.png" => Some(BlockType::FlowerPurple),
         _ => None,
     }
 }
@@ -204,8 +214,9 @@ pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 #[derive(Clone, Copy, Default, Debug, Reflect, ShaderType)]
 pub struct TerrainUniform {
     /// Tuile (coin UV, taille UV) du dessus puis du côté de chaque couche :
-    /// herbe, terre, roche, sable, neige, terre rouge, litière.
-    pub tiles: [Vec4; 14],
+    /// herbe, terre, roche, sable, neige, terre rouge, litière, podzol,
+    /// vase, gravier, grès, sel (voir `layer_of`, smooth_terrain.rs).
+    pub tiles: [Vec4; 24],
     /// x : blocs couverts par une répétition de tuile, y : humidité (0..1,
     /// pluie : sol mouillé et flaques).
     pub params: Vec4,
@@ -230,8 +241,40 @@ pub struct TerrainExtension {
 }
 
 impl MaterialExtension for TerrainExtension {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/terrain.wgsl".into()
+    }
+
     fn fragment_shader() -> ShaderRef {
         "shaders/terrain.wgsl".into()
+    }
+
+    /// Poids des couches 7 à 11 : attributs propres au terrain lisse (voir
+    /// `ATTRIBUTE_TERRAIN_LAYERS`), ajoutés au tampon de sommets de toutes
+    /// les passes (ignorés par celles de profondeur et d'ombre) et lus par
+    /// le vertex shader de terrain.wgsl aux emplacements 10 et 11.
+    fn specialize(
+        _pipeline: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        if layout.0.contains(ATTRIBUTE_TERRAIN_LAYERS) && layout.0.contains(ATTRIBUTE_TERRAIN_SALT) {
+            let extra = layout.0.get_layout(&[
+                ATTRIBUTE_TERRAIN_LAYERS.at_shader_location(10),
+                ATTRIBUTE_TERRAIN_SALT.at_shader_location(11),
+            ])?;
+            if let Some(buffer) = descriptor.vertex.buffers.first_mut() {
+                buffer.attributes.extend(extra.attributes);
+                // Maillage vide (section sans surface) : sans les attributs,
+                // le shader ne les lit pas.
+                descriptor.vertex.shader_defs.push("TERRAIN_LAYERS".into());
+                if let Some(fragment) = descriptor.fragment.as_mut() {
+                    fragment.shader_defs.push("TERRAIN_LAYERS".into());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -283,10 +326,6 @@ impl MaterialExtension for WaterExtension {
     }
 }
 
-/// Cache des textures compressées (voir `atlas_mipmap_settings`), à effacer sans
-/// risque : il est reconstruit au lancement suivant.
-const TEXTURE_CACHE_DIR: &str = "texture_cache";
-
 pub struct TexturePlugin;
 impl Plugin for TexturePlugin {
     fn build(&self, app: &mut App) {
@@ -295,135 +334,6 @@ impl Plugin for TexturePlugin {
         app.add_plugins(MaterialPlugin::<TerrainMaterial>::default());
         app.add_plugins(MaterialPlugin::<ShadowProxyMaterial>::default());
         app.add_systems(Startup, setup_texture_atlas);
-        app.add_systems(Update, prepare_atlases);
-    }
-}
-
-/// Les trois atlas (couleur, normales, rugosité), voir `prepare_atlases`.
-#[derive(Resource)]
-struct AtlasImages(Vec<Handle<Image>>);
-
-/// Réglages de génération des mipmaps et de la compression des atlas.
-fn atlas_mipmap_settings() -> MipmapGeneratorSettings {
-    MipmapGeneratorSettings {
-        // BC7 : 1 octet par pixel au lieu de 4, soit ~4x moins de mémoire
-        // vidéo pour les atlas en tuiles de 1024 px. Compressés une fois
-        // puis mis en cache sur le disque (clé : contenu de l'image et
-        // réglages) : les lancements suivants ne font que relire le cache.
-        compression: Some(CompressionSpeed::Fast),
-        compressed_image_data_cache_path: Some(TEXTURE_CACHE_DIR.into()),
-        // Chaîne de mipmaps arrêtée avant que la taille d'un niveau ne soit
-        // plus multiple de 4 (blocs BC7) : atlas aux côtés multiples de 512
-        // (tools/pad_atlas.py), niveaux jusqu'à 1/128.
-        minimum_mip_resolution: 32,
-        ..default()
-    }
-}
-
-/// Délai au-delà duquel un atlas encore en cours de compression est affiché
-/// non compressé (voir `prepare_atlases`).
-const UNCOMPRESSED_FALLBACK_SECS: f32 = 4.0;
-
-/// Mipmaps (et compression) des atlas, chacun dans son propre thread dès
-/// que son image est chargée. Remplace le système de
-/// bevy_mod_mipmap_generator, qui ne traite une image qu'au chargement du
-/// MATÉRIAU : une image chargée après lui n'était jamais traitée -- l'atlas
-/// de normales restait sans mipmaps (scintillement du relief au loin). Hors
-/// de l'AsyncComputeTaskPool aussi : en concurrence avec la génération des
-/// chunks, la compression de l'atlas de couleur prenait plus d'une minute.
-///
-/// Les atlas sont chargés sans être envoyés au GPU : l'envoi de la version
-/// non compressée (~800 Mo) restait ensuite réservé par l'allocateur de
-/// mémoire vidéo, même une fois remplacée. Si le traitement dure (premier
-/// lancement, cache vide : ~70 s), la version non compressée est tout de
-/// même envoyée au bout de UNCOMPRESSED_FALLBACK_SECS pour afficher le jeu.
-///
-/// Une fois une image prête, sa copie en mémoire vive est libérée (seule
-/// celle du GPU sert ensuite), et les matériaux sont touchés pour que Bevy
-/// refasse leurs groupes de liaison avec la nouvelle texture.
-#[allow(clippy::too_many_arguments)]
-fn prepare_atlases(
-    atlas: Option<Res<AtlasImages>>,
-    mut images: ResMut<Assets<Image>>,
-    mut jobs: Local<Vec<Option<std::thread::JoinHandle<Image>>>>,
-    mut done: Local<Vec<bool>>,
-    mut started: Local<Vec<f32>>,
-    time: Res<Time>,
-    mut standard: ResMut<Assets<StandardMaterial>>,
-    mut plants: ResMut<Assets<PlantMaterial>>,
-    mut terrain: ResMut<Assets<TerrainMaterial>>,
-    mut water: ResMut<Assets<WaterMaterial>>,
-) {
-    let Some(atlas) = atlas else { return };
-    if done.len() != atlas.0.len() {
-        jobs.resize_with(atlas.0.len(), || None);
-        done.resize(atlas.0.len(), false);
-        started.resize(atlas.0.len(), 0.0);
-    }
-    let mut changed = false;
-    for (i, handle) in atlas.0.iter().enumerate() {
-        if done[i] {
-            continue;
-        }
-        if jobs[i].is_none() {
-            let Some(mut image) = images.get_mut(handle) else { continue };
-            // Filtrage anisotrope (sols vus en rasant), comme le faisait
-            // bevy_mod_mipmap_generator.
-            image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-                anisotropy_clamp: 8,
-                ..ImageSamplerDescriptor::linear()
-            });
-            let mut copy = image.clone();
-            started[i] = time.elapsed_secs();
-            jobs[i] = Some(std::thread::spawn(move || {
-                let mut cached = 0;
-                if let Err(e) = generate_mips_texture(&mut copy, &atlas_mipmap_settings(), &mut cached) {
-                    warn!("Mipmaps de l'atlas impossibles : {e}");
-                }
-                copy
-            }));
-            continue;
-        }
-        if !jobs[i].as_ref().is_some_and(|job| job.is_finished()) {
-            if time.elapsed_secs() - started[i] > UNCOMPRESSED_FALLBACK_SECS
-                && images.get(handle).is_some_and(|image| !image.asset_usage.contains(RenderAssetUsages::RENDER_WORLD))
-            {
-                info!("Atlas {:?} : compression en cours, version non compressée affichée en attendant", handle.path());
-                if let Some(mut image) = images.get_mut(handle) {
-                    image.asset_usage = RenderAssetUsages::all();
-                }
-                changed = true;
-            }
-            continue;
-        }
-        let Ok(mut result) = jobs[i].take().unwrap().join() else {
-            warn!("Thread de mipmaps de l'atlas {:?} interrompu", handle.path());
-            done[i] = true;
-            continue;
-        };
-        result.asset_usage = RenderAssetUsages::RENDER_WORLD;
-        if let Some(mut image) = images.get_mut(handle) {
-            *image = result;
-        }
-        done[i] = true;
-        changed = true;
-        info!(
-            "Atlas {:?} prêt après {:.1} s : {:?}, {} niveaux",
-            handle.path(),
-            time.elapsed_secs(),
-            images.get(handle).map(|i| i.texture_descriptor.format),
-            images.get(handle).map_or(0, |i| i.texture_descriptor.mip_level_count),
-        );
-    }
-    if changed {
-        let ids: Vec<_> = standard.ids().collect();
-        for id in ids { let _ = standard.get_mut(id); }
-        let ids: Vec<_> = plants.ids().collect();
-        for id in ids { let _ = plants.get_mut(id); }
-        let ids: Vec<_> = terrain.ids().collect();
-        for id in ids { let _ = terrain.get_mut(id); }
-        let ids: Vec<_> = water.ids().collect();
-        for id in ids { let _ = water.get_mut(id); }
     }
 }
 
@@ -436,19 +346,28 @@ pub fn setup_texture_atlas(
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut shadow_proxy_materials: ResMut<Assets<ShadowProxyMaterial>>,
 ) {
-    // Chargés sans être envoyés au GPU (MAIN_WORLD) : ils le sont une fois
-    // compressés, voir `prepare_atlases`.
-    let cpu_only = |settings: &mut ImageLoaderSettings| settings.asset_usage = RenderAssetUsages::MAIN_WORLD;
-    let texture_handle: Handle<Image> = asset_server.load_builder().with_settings(cpu_only).load("atlas_texture.png");
-    // Normales et rugosité : données, pas des couleurs — chargées sans
-    // conversion sRGB (par défaut, Bevy les linéarisait : normales faussées).
-    let linear = |settings: &mut ImageLoaderSettings| {
-        settings.is_srgb = false;
-        settings.asset_usage = RenderAssetUsages::MAIN_WORLD;
+    // Atlas cuits (BC7 et mipmaps, voir texture_bake.rs) : envoyés tels
+    // quels au GPU, sans copie gardée en mémoire vive. Filtrage anisotrope
+    // (sols vus en rasant). Normales et rugosité : données, pas des couleurs
+    // (sans conversion sRGB, qui fausserait les normales).
+    let load = |path: String, srgb: bool| -> Handle<Image> {
+        asset_server.load_builder().with_settings(move |settings: &mut ImageLoaderSettings| {
+            settings.is_srgb = srgb;
+            settings.asset_usage = RenderAssetUsages::RENDER_WORLD;
+            settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                anisotropy_clamp: 8,
+                ..ImageSamplerDescriptor::linear()
+            });
+        }).load(path)
     };
-    let normal_map_handle: Handle<Image> = asset_server.load_builder().with_settings(linear).load("atlas_texture_normal.png");
-    let metallic_roughness_handle: Handle<Image> = asset_server.load_builder().with_settings(linear).load("atlas_texture_metallic_roughness.png");
-    commands.insert_resource(AtlasImages(vec![texture_handle.clone(), normal_map_handle.clone(), metallic_roughness_handle.clone()]));
+    let texture_handle = load(general_path("color"), true);
+    let normal_map_handle = load(general_path("normal"), false);
+    let metallic_roughness_handle = load(general_path("mr"), false);
+    let terrain_color = load(terrain_path("color"), true);
+    let terrain_normal = load(terrain_path("normal"), false);
+    let terrain_mr = load(terrain_path("mr"), false);
+    let terrain_atlas: TerrainAtlas = serde_json::from_str(&fs::read_to_string(TERRAIN_JSON).expect("atlas terrain non cuit"))
+        .expect("terrain_atlas.json mal formé");
 
     // Eau : surface lisse (reflets nets du soleil sur les vagues de
     // water.wgsl), sans texture de l'atlas (la tuile d'eau, claire et de
@@ -548,7 +467,6 @@ pub fn setup_texture_atlas(
     let mut dry_grass_uv = None;
     let mut yarrow_uv = None;
     let (mut reed_uv, mut lily_uv, mut kelp_uv, mut coral_uv) = (None, None, None, None);
-    let mut rock_macro_uv = None;
     let (mut jungle_leaf_uv, mut palm_frond_uv, mut broadleaf_uv, mut liana_uv, mut heliconia_uv) = (None, None, None, None, None);
 
     for (filename, frame_data) in atlas_data.frames.iter() {
@@ -580,7 +498,6 @@ pub fn setup_texture_atlas(
             "lily_pad.png" => lily_uv = Some(rect),
             "kelp.png" => kelp_uv = Some(rect),
             "coral.png" => coral_uv = Some(rect),
-            "rock_macro.png" => rock_macro_uv = Some(rect),
             "jungle_leaf.png" => jungle_leaf_uv = Some(rect),
             "palm_frond.png" => palm_frond_uv = Some(rect),
             "broadleaf.png" => broadleaf_uv = Some(rect),
@@ -595,22 +512,22 @@ pub fn setup_texture_atlas(
     crown_uvs.sort_by(|a, b| a.0.cmp(&b.0));
     let crown_uvs: Vec<_> = crown_uvs.into_iter().map(|(_, rect)| rect).collect();
 
-    // Tuiles du terrain lisse : (dessus, côté) de chaque couche. Sur les
-    // pentes raides, l'herbe laisse voir la terre, la neige la roche.
+    // Tuiles du terrain lisse (dans l'atlas terrain, en pleine résolution) :
+    // (dessus, côté) de chaque couche. Sur les pentes raides, l'herbe
+    // laisse voir la terre, la neige la roche.
     let tile = |name: &str| -> Vec4 {
-        let (base, size) = if let Some(block) = filename_to_block_type(name) {
-            uv_map[&block]
-        } else {
-            let block = filename_to_side_block_type(name).expect("tuile de terrain inconnue");
-            side_uv_map[&block]
-        };
-        Vec4::new(base[0], base[1], size[0], size[1])
+        let [x, y] = terrain_atlas.tiles[name];
+        let [w, h] = terrain_atlas.size.map(|v| v as f32);
+        let t = terrain_atlas.tile as f32;
+        Vec4::new(x as f32 / w, y as f32 / h, t / w, t / h)
     };
     let layers = [
         ("grass.png", "dirt.png"), ("dirt.png", "dirt.png"), ("rock.png", "rock.png"), ("sand.png", "sand.png"),
         ("snow.png", "rock.png"), ("red_sand.png", "red_rock.png"), ("litter.png", "dirt.png"),
+        ("podzol.png", "dirt.png"), ("mud.png", "mud.png"), ("gravel.png", "gravel.png"),
+        ("sandstone.png", "sandstone.png"), ("salt.png", "salt.png"),
     ];
-    let mut tiles = [Vec4::ZERO; 14];
+    let mut tiles = [Vec4::ZERO; 24];
     for (i, (top, side)) in layers.iter().enumerate() {
         tiles[2 * i] = tile(top);
         tiles[2 * i + 1] = tile(side);
@@ -626,11 +543,11 @@ pub fn setup_texture_atlas(
             terrain: TerrainUniform {
                 tiles,
                 params: Vec4::new(4.0, 0.0, 0.0, 0.0),
-                rock_macro: rock_macro_uv.map_or(Vec4::ZERO, |(base, size): ([f32; 2], [f32; 2])| Vec4::new(base[0], base[1], size[0], size[1])),
+                rock_macro: if terrain_atlas.tiles.contains_key("rock_macro.png") { tile("rock_macro.png") } else { Vec4::ZERO },
             },
-            color: texture_handle.clone(),
-            normal: normal_map_handle.clone(),
-            roughness: metallic_roughness_handle.clone(),
+            color: terrain_color,
+            normal: terrain_normal,
+            roughness: terrain_mr,
         },
     });
 

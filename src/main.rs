@@ -34,6 +34,7 @@ mod world {
 }
 
 mod texture;
+mod texture_bake;
 mod debug_capture;
 mod graphics_quality;
 mod film;
@@ -232,6 +233,17 @@ fn main() {
     if std::env::args().any(|arg| arg == "--find-plain-spawn") {
         find_plain_spawn();
         return;
+    }
+
+    // Atlas de textures cuits (BC7, mipmaps : voir texture_bake.rs) : à
+    // la demande, ou quand un atlas source a changé depuis.
+    if std::env::args().any(|arg| arg == "--bake-textures") {
+        texture_bake::bake();
+        return;
+    }
+    if !texture_bake::up_to_date() {
+        println!("Atlas sources modifiés : cuisson des textures (une fois)...");
+        texture_bake::bake();
     }
 
     App::new()

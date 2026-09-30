@@ -20,4 +20,6 @@ serde = { version = "1.0.219", features = ["derive"] }
 rand = "0.8"
 rand_chacha = "0.3"
 image = "*"
-bevy_mod_mipmap_generator = { git = "https://github.com/DGriffin91/bevy_mod_mipmap_generator", features = ["compress"] }
+# Cuisson des atlas (voir src/texture_bake.rs) : compression BC7, KTX2.
+intel_tex_2 = "0.4"
+ktx2 = "0.5"

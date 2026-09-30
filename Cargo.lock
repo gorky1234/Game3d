@@ -9,7 +9,6 @@ dependencies = [
  "anyhow",
  "async-channel 1.9.0",
  "bevy",
- "bevy_mod_mipmap_generator",
  "bevy_pbr",
  "bevy_rapier3d",
  "bytemuck",
@@ -17,6 +16,8 @@ dependencies = [
  "flate2",
  "futures",
  "image",
+ "intel_tex_2",
+ "ktx2",
  "mca",
  "noise",
  "rand 0.8.5",
@@ -1271,21 +1272,6 @@ name = "bevy_mikktspace"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bff34eb29ff4b8a8688bc7299f14fb6b597461ca80fec03ed7d22939ab33e48f"
-
-[[package]]
-name = "bevy_mod_mipmap_generator"
-version = "0.1.0"
-source = "git+https://github.com/DGriffin91/bevy_mod_mipmap_generator#5f9c33a058fac212d568ac97b26ea1aa67489687"
-dependencies = [
- "anyhow",
- "bevy",
- "fast_image_resize",
- "futures-lite",
- "image",
- "intel_tex_2",
- "tracing",
- "zstd",
-]
 
 [[package]]
 name = "bevy_pbr"
@@ -2675,20 +2661,6 @@ dependencies = [
  "rayon-core",
  "smallvec",
  "zune-inflate",
-]
-
-[[package]]
-name = "fast_image_resize"
-version = "5.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbc7fe45cf92b43817ff62a3723e862b85bd1d06288f63007f7645d1d2f7a060"
-dependencies = [
- "bytemuck",
- "cfg-if",
- "document-features",
- "image",
- "num-traits",
- "thiserror 2.0.12",
 ]
 
 [[package]]
@@ -7405,34 +7377,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
-]
-
-[[package]]
-name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
-dependencies = [
- "zstd-sys",
-]
-
-[[package]]
-name = "zstd-sys"
-version = "2.1.0+zstd.1.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
-dependencies = [
- "cc",
- "pkg-config",
 ]
 
 [[package]]

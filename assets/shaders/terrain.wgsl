@@ -1,8 +1,9 @@
 // Terrain lisse (voir smooth_terrain.rs) : projection triplanaire des tuiles
 // de l'atlas — pas d'UV sur une surface continue. Chaque sommet porte le
-// poids de 6 matériaux (herbe, terre, roche, sable, neige, terre rouge des
-// badlands), interpolés sur les
-// triangles pour des transitions douces. Un matériau a une tuile « dessus »
+// poids de 12 matériaux (herbe, terre, roche, sable, neige, terre rouge des
+// badlands, litière, podzol, vase, gravier, grès, sel), interpolés sur les
+// triangles, puis mélangés selon le relief de leurs textures (voir
+// `height_blend`). Un matériau a une tuile « dessus »
 // (faces tournées vers le ciel) et une tuile « côté » (talus, falaises) :
 // l'herbe laisse ainsi apparaître la terre sur les pentes raides. L'éclairage
 // reste celui du StandardMaterial.
@@ -11,12 +12,98 @@
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing},
     forward_io::{VertexOutput, FragmentOutput},
     mesh_view_bindings::view,
+    mesh_functions,
+    view_transformations::position_world_to_clip,
+}
+
+// Sommet du terrain : attributs standard de Bevy, plus les poids des
+// couches 7 à 11 (voir `ATTRIBUTE_TERRAIN_LAYERS`, smooth_terrain.rs).
+struct TerrainVertex {
+    @builtin(instance_index) instance_index: u32,
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+#ifdef VERTEX_UVS_A
+    @location(2) uv: vec2<f32>,
+#endif
+#ifdef VERTEX_UVS_B
+    @location(3) uv_b: vec2<f32>,
+#endif
+#ifdef VERTEX_TANGENTS
+    @location(4) tangent: vec4<f32>,
+#endif
+#ifdef VERTEX_COLORS
+    @location(5) color: vec4<f32>,
+#endif
+#ifdef TERRAIN_LAYERS
+    @location(10) layers: vec4<f32>,
+    @location(11) salt: f32,
+#endif
+};
+
+// `VertexOutput` de Bevy (mêmes emplacements) et les poids en plus.
+struct TerrainVertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_position: vec4<f32>,
+    @location(1) world_normal: vec3<f32>,
+#ifdef VERTEX_UVS_A
+    @location(2) uv: vec2<f32>,
+#endif
+#ifdef VERTEX_UVS_B
+    @location(3) uv_b: vec2<f32>,
+#endif
+#ifdef VERTEX_TANGENTS
+    @location(4) world_tangent: vec4<f32>,
+#endif
+#ifdef VERTEX_COLORS
+    @location(5) color: vec4<f32>,
+#endif
+#ifdef VERTEX_OUTPUT_INSTANCE_INDEX
+    @location(6) @interpolate(flat) instance_index: u32,
+#endif
+#ifdef VISIBILITY_RANGE_DITHER
+    @location(7) @interpolate(flat) visibility_range_dither: i32,
+#endif
+    @location(8) layers: vec4<f32>,
+    @location(9) salt: f32,
+};
+
+// Repris de bevy_pbr::mesh (sans morph ni skinning, inutiles ici).
+@vertex
+fn vertex(vertex: TerrainVertex) -> TerrainVertexOutput {
+    var out: TerrainVertexOutput;
+    let world_from_local = mesh_functions::get_world_from_local(vertex.instance_index);
+    out.world_normal = mesh_functions::mesh_normal_local_to_world(vertex.normal, vertex.instance_index);
+    out.world_position = mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(vertex.position, 1.0));
+    out.position = position_world_to_clip(out.world_position.xyz);
+#ifdef VERTEX_UVS_A
+    out.uv = vertex.uv;
+#endif
+#ifdef VERTEX_UVS_B
+    out.uv_b = vertex.uv_b;
+#endif
+#ifdef VERTEX_TANGENTS
+    out.world_tangent = mesh_functions::mesh_tangent_local_to_world(world_from_local, vertex.tangent, vertex.instance_index);
+#endif
+#ifdef VERTEX_COLORS
+    out.color = vertex.color;
+#endif
+#ifdef VERTEX_OUTPUT_INSTANCE_INDEX
+    out.instance_index = vertex.instance_index;
+#endif
+#ifdef VISIBILITY_RANGE_DITHER
+    out.visibility_range_dither = mesh_functions::get_visibility_range_dither_level(vertex.instance_index, world_from_local[3]);
+#endif
+#ifdef TERRAIN_LAYERS
+    out.layers = vertex.layers;
+    out.salt = vertex.salt;
+#endif
+    return out;
 }
 
 struct Terrain {
     // Tuile (xy : coin UV, zw : taille UV) du dessus puis du côté de chacune
-    // des 6 couches : tiles[2 * couche] = dessus, tiles[2 * couche + 1] = côté.
-    tiles: array<vec4<f32>, 14>,
+    // des 12 couches : tiles[2 * couche] = dessus, tiles[2 * couche + 1] = côté.
+    tiles: array<vec4<f32>, 24>,
     // x : blocs couverts par une répétition de tuile, y : humidité (pluie).
     params: vec4<f32>,
     // Paroi photo projetée en grand sur la roche (coin UV, taille UV ;
@@ -36,6 +123,7 @@ struct Sampled {
     color: vec3<f32>,
     normal: vec3<f32>,   // espace tangent de la projection
     roughness: f32,
+    height: f32,         // relief de la texture (0..1, voir `height_blend`)
 };
 
 // Échantillonne une tuile de l'atlas aux coordonnées `uv` (en répétitions de
@@ -52,9 +140,68 @@ fn sample_tile(tile: vec4<f32>, uv: vec2<f32>, du: vec2<f32>, dv: vec2<f32>) -> 
     var out: Sampled;
     out.color = textureSampleLevel(color_texture, color_sampler, atlas_uv, lod).rgb;
     out.normal = textureSampleLevel(normal_texture, normal_sampler, atlas_uv, lod).xyz * 2.0 - 1.0;
-    out.roughness = textureSampleLevel(roughness_texture, roughness_sampler, atlas_uv, lod).g;
+    let mr = textureSampleLevel(roughness_texture, roughness_sampler, atlas_uv, lod);
+    out.roughness = mr.g;
+    // Hauteur dans le canal R (voir tools/gen_terrain_layers.py).
+    out.height = mr.r;
     return out;
 }
+
+fn mix_sampled(a: Sampled, b: Sampled, t: f32) -> Sampled {
+    var out: Sampled;
+    out.color = mix(a.color, b.color, t);
+    out.normal = mix(a.normal, b.normal, t);
+    out.roughness = mix(a.roughness, b.roughness, t);
+    out.height = mix(a.height, b.height, t);
+    return out;
+}
+
+// Anti-répétition (Inigo Quilez, « texture repetition », 3e méthode) : un
+// bruit lent choisit, par zones de quelques blocs, un décalage de la tuile
+// parmi une suite ; entre deux zones, les deux décalages sont fondus (en
+// suivant les contrastes de la texture, pas un fondu flou). Le motif d'une
+// tuile de 4 blocs ne se répète plus en damier sur les grandes étendues.
+struct Variation {
+    offset_a: vec2<f32>,
+    offset_b: vec2<f32>,
+    // Position entre les deux décalages (0 : a seul, 1 : b seul).
+    f: f32,
+};
+
+fn variation(uv: vec2<f32>) -> Variation {
+    let k = value_noise(uv, 1.9, 46u) * 0.75 + value_noise(uv, 0.7, 47u) * 0.25;
+    let index = k * 8.0;
+    let i = floor(index);
+    var v: Variation;
+    v.offset_a = fract(sin(vec2(3.0, 7.0) * i) * 43.17);
+    v.offset_b = fract(sin(vec2(3.0, 7.0) * (i + 1.0)) * 43.17);
+    v.f = index - i;
+    return v;
+}
+
+fn sample_varied(tile: vec4<f32>, uv: vec2<f32>, du: vec2<f32>, dv: vec2<f32>, v: Variation) -> Sampled {
+    // Loin de la transition, un seul échantillon (voir le fondu plus bas :
+    // la différence de couleur ne décale le seuil que de ±0,03).
+    if v.f < 0.16 {
+        return sample_tile(tile, uv + v.offset_a, du, dv);
+    }
+    if v.f > 0.84 {
+        return sample_tile(tile, uv + v.offset_b, du, dv);
+    }
+    let a = sample_tile(tile, uv + v.offset_a, du, dv);
+    let b = sample_tile(tile, uv + v.offset_b, du, dv);
+    let t = smoothstep(0.2, 0.8, v.f - 0.1 * dot(a.color - b.color, vec3(1.0)));
+    return mix_sampled(a, b, t);
+}
+
+// Mélange selon le relief (« height blending ») : entre deux couches, celle
+// dont la texture est la plus haute à cet endroit l'emporte (le sable
+// remplit les creux entre les pavés, l'herbe pousse entre les cailloux)
+// au lieu d'un fondu où les deux se superposent en transparence.
+// `HEIGHT_INFLUENCE` : poids du relief face aux poids des sommets ;
+// `HEIGHT_BLEND_DEPTH` : largeur du fondu restant (en poids).
+const HEIGHT_INFLUENCE: f32 = 0.6;
+const HEIGHT_BLEND_DEPTH: f32 = 0.15;
 
 // Paroi photo : une répétition sur ~28 blocs (la tuile de base couvre
 // `terrain.params.x` = 4 blocs).
@@ -67,6 +214,7 @@ fn mix_macro(base: Sampled, macro_s: Sampled, weight: f32) -> Sampled {
     out.color = mix(base.color, macro_s.color, weight);
     out.normal = vec3(base.normal.xy * (1.0 - 0.5 * weight) + macro_s.normal.xy * weight, base.normal.z * macro_s.normal.z);
     out.roughness = mix(base.roughness, macro_s.roughness, weight);
+    out.height = base.height;
     return out;
 }
 
@@ -186,8 +334,124 @@ fn rock_relief(p: vec3<f32>, footprint: f32) -> vec3<f32> {
     return gradient;
 }
 
+// Teinte (linéaire) de la couche de podzol, voir `sample_layer`.
+const PODZOL_TINT: vec3<f32> = vec3(0.35, 0.56, 0.62);
+
+// Ce que `sample_layer` doit savoir du pixel.
+struct LayerEnv {
+    n: vec3<f32>,
+    blend: vec3<f32>,
+    p: vec3<f32>,
+    px: vec3<f32>,
+    py: vec3<f32>,
+    var_x: Variation,
+    var_y: Variation,
+    var_z: Variation,
+    stone_tint: vec3<f32>,
+    has_macro: bool,
+    macro_weight: f32,
+};
+
+// Couche `layer` en projection triplanaire : couleur, normale (monde),
+// rugosité et relief, mélangés entre les trois projections.
+fn sample_layer(layer: i32, e: LayerEnv) -> Sampled {
+    let top = terrain.tiles[2 * layer];
+    let side = terrain.tiles[2 * layer + 1];
+    let n = e.n;
+    let blend = e.blend;
+    let p = e.p;
+    let px = e.px;
+    let py = e.py;
+    // Photo de roche sombre et bleutée (albédo ~0,08) : dans l'ombre, avec
+    // le virage bleu de la passe pellicule, rochers et falaises viraient
+    // au bleu. Éclaircie et réchauffée (gris-beige).
+    // (x2 éclaircissait trop : parois beige pâle délavées, « dessin
+    // animé ».)
+    var tint = select(vec3(1.0), vec3(1.55, 1.35, 1.1) * e.stone_tint, layer == 2);
+    // Podzol (taïga, tourbière) : la photo (aiguilles sèches au soleil) est
+    // orange vif ; sol boréal plus sombre et mousseux (brun-vert).
+    if layer == 7 {
+        tint = PODZOL_TINT;
+    }
+    // Roche mate : lue lisse dans la carte de rugosité, elle reflétait le
+    // ciel (rochers et falaises bleutés à l'ombre).
+    let min_rough = select(0.0, 0.85, layer == 2);
+    let macro_rock = layer == 2 && e.has_macro;
+    var out: Sampled;
+    out.color = vec3(0.0);
+    out.normal = vec3(0.0);
+    out.roughness = 0.0;
+    out.height = 0.0;
+    // Projection verticale (sol) : tuile du dessus sur les faces tournées
+    // vers le ciel, du côté en dessous (plafonds de surplombs).
+    if blend.y > 0.02 {
+        var s = sample_varied(select(side, top, n.y > 0.0), p.xz, px.xz, py.xz, e.var_y);
+        if macro_rock {
+            s = mix_macro(s, sample_tile(terrain.rock_macro, p.xz * MACRO_SCALE, px.xz * MACRO_SCALE, py.xz * MACRO_SCALE), e.macro_weight);
+        }
+        // Cartes de normales au format OpenGL (vert = vers le haut de
+        // l'image, donc vers les v décroissants) : ici v = z, le vert
+        // penche la normale vers -z. (Signe inversé avant : bosses du
+        // sol éclairées du mauvais côté le long de z. Les projections
+        // latérales ont v = -y, où le vert va bien vers +y.)
+        let tn = vec3(vec2(s.normal.x, -s.normal.y) + n.xz, abs(s.normal.z) * n.y);
+        out.color += s.color * tint * blend.y;
+        out.normal += tn.xzy * blend.y;
+        out.roughness += max(s.roughness, min_rough) * blend.y;
+        out.height += s.height * blend.y;
+    }
+    if blend.x > 0.02 {
+        var s = sample_varied(side, vec2(p.z, -p.y), vec2(px.z, -px.y), vec2(py.z, -py.y), e.var_x);
+        if macro_rock {
+            s = mix_macro(s, sample_tile(terrain.rock_macro, vec2(p.z, -p.y) * MACRO_SCALE, vec2(px.z, -px.y) * MACRO_SCALE, vec2(py.z, -py.y) * MACRO_SCALE), e.macro_weight);
+        }
+        let tn = vec3(s.normal.xy + n.zy, abs(s.normal.z) * n.x);
+        out.color += s.color * tint * blend.x;
+        out.normal += tn.zyx * blend.x;
+        out.roughness += max(s.roughness, min_rough) * blend.x;
+        out.height += s.height * blend.x;
+    }
+    if blend.z > 0.02 {
+        var s = sample_varied(side, vec2(p.x, -p.y), vec2(px.x, -px.y), vec2(py.x, -py.y), e.var_z);
+        if macro_rock {
+            s = mix_macro(s, sample_tile(terrain.rock_macro, vec2(p.x, -p.y) * MACRO_SCALE, vec2(px.x, -px.y) * MACRO_SCALE, vec2(py.x, -py.y) * MACRO_SCALE), e.macro_weight);
+        }
+        let tn = vec3(s.normal.xy + n.xy, abs(s.normal.z) * n.z);
+        out.color += s.color * tint * blend.z;
+        out.normal += tn.xyz * blend.z;
+        out.roughness += max(s.roughness, min_rough) * blend.z;
+        out.height += s.height * blend.z;
+    }
+    // Poids des projections (sous 0,02, ignorées) : renormalisés.
+    let used = select(0.0, blend.y, blend.y > 0.02) + select(0.0, blend.x, blend.x > 0.02) + select(0.0, blend.z, blend.z > 0.02);
+    out.height /= max(used, 1e-4);
+    return out;
+}
+
 @fragment
-fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
+fn fragment(terrain_in: TerrainVertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
+    var in: VertexOutput;
+    in.position = terrain_in.position;
+    in.world_position = terrain_in.world_position;
+    in.world_normal = terrain_in.world_normal;
+#ifdef VERTEX_UVS_A
+    in.uv = terrain_in.uv;
+#endif
+#ifdef VERTEX_UVS_B
+    in.uv_b = terrain_in.uv_b;
+#endif
+#ifdef VERTEX_TANGENTS
+    in.world_tangent = terrain_in.world_tangent;
+#endif
+#ifdef VERTEX_COLORS
+    in.color = terrain_in.color;
+#endif
+#ifdef VERTEX_OUTPUT_INSTANCE_INDEX
+    in.instance_index = terrain_in.instance_index;
+#endif
+#ifdef VISIBILITY_RANGE_DITHER
+    in.visibility_range_dither = terrain_in.visibility_range_dither;
+#endif
     var pbr_input = pbr_input_from_standard_material(in, is_front);
 
     let n = normalize(in.world_normal);
@@ -205,7 +469,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var blend = pow(abs(n), vec3(4.0));
     blend /= blend.x + blend.y + blend.z;
 
-    var w: array<f32, 7>;
+    var w: array<f32, 12>;
+    // Podzol, vase, gravier, grès, sel.
+    w[7] = terrain_in.layers.x; w[8] = terrain_in.layers.y; w[9] = terrain_in.layers.z; w[10] = terrain_in.layers.w;
+    w[11] = terrain_in.salt;
     var ao = 1.0;
     var bank_wet = 0.0;
 #ifdef VERTEX_COLORS
@@ -274,66 +541,65 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let has_macro = terrain.rock_macro.z > 0.0;
     let macro_weight = mix(0.45, 0.85, smoothstep(15.0, 90.0, distance(view.world_position, in.world_position.xyz)));
 
-    var color = vec3(0.0);
-    var normal_sum = vec3(0.0);
-    var roughness = 0.0;
+    // Décalages anti-répétition des trois projections (voir `variation`).
+    let var_y = variation(p.xz);
+    let var_x = variation(vec2(p.z, -p.y));
+    let var_z = variation(vec2(p.x, -p.y));
+
+    // 1. Les trois couches les plus présentes (au-delà, leur part est
+    // négligeable ; les échantillonner toutes coûtait trop cher).
     var total = 0.0;
-    for (var layer = 0; layer < 7; layer++) {
-        let weight = w[layer];
-        if weight < 0.01 {
-            continue;
-        }
-        let top = terrain.tiles[2 * layer];
-        let side = terrain.tiles[2 * layer + 1];
-        // Photo de roche sombre et bleutée (albédo ~0,08) : dans l'ombre, avec
-        // le virage bleu de la passe pellicule, rochers et falaises viraient
-        // au bleu. Éclaircie et réchauffée (gris-beige).
-        // (x2 éclaircissait trop : parois beige pâle délavées, « dessin
-        // animé ».)
-        let tint = select(vec3(1.0), vec3(1.55, 1.35, 1.1) * stone_tint, layer == 2);
-        // Roche mate : lue lisse dans la carte de rugosité, elle reflétait le
-        // ciel (rochers et falaises bleutés à l'ombre).
-        let min_rough = select(0.0, 0.85, layer == 2);
-        // Projection verticale (sol) : tuile du dessus sur les faces tournées
-        // vers le ciel, du côté en dessous (plafonds de surplombs).
-        if blend.y > 0.02 {
-            var s = sample_tile(select(side, top, n.y > 0.0), p.xz, px.xz, py.xz);
-            if layer == 2 && has_macro {
-                s = mix_macro(s, sample_tile(terrain.rock_macro, p.xz * MACRO_SCALE, px.xz * MACRO_SCALE, py.xz * MACRO_SCALE), macro_weight);
-            }
-            // Cartes de normales au format OpenGL (vert = vers le haut de
-            // l'image, donc vers les v décroissants) : ici v = z, le vert
-            // penche la normale vers -z. (Signe inversé avant : bosses du
-            // sol éclairées du mauvais côté le long de z. Les projections
-            // latérales ont v = -y, où le vert va bien vers +y.)
-            let tn = vec3(vec2(s.normal.x, -s.normal.y) + n.xz, abs(s.normal.z) * n.y);
-            color += s.color * tint * blend.y * weight;
-            normal_sum += tn.xzy * blend.y * weight;
-            roughness += max(s.roughness, min_rough) * blend.y * weight;
-        }
-        if blend.x > 0.02 {
-            var s = sample_tile(side, vec2(p.z, -p.y), vec2(px.z, -px.y), vec2(py.z, -py.y));
-            if layer == 2 && has_macro {
-                s = mix_macro(s, sample_tile(terrain.rock_macro, vec2(p.z, -p.y) * MACRO_SCALE, vec2(px.z, -px.y) * MACRO_SCALE, vec2(py.z, -py.y) * MACRO_SCALE), macro_weight);
-            }
-            let tn = vec3(s.normal.xy + n.zy, abs(s.normal.z) * n.x);
-            color += s.color * tint * blend.x * weight;
-            normal_sum += tn.zyx * blend.x * weight;
-            roughness += max(s.roughness, min_rough) * blend.x * weight;
-        }
-        if blend.z > 0.02 {
-            var s = sample_tile(side, vec2(p.x, -p.y), vec2(px.x, -px.y), vec2(py.x, -py.y));
-            if layer == 2 && has_macro {
-                s = mix_macro(s, sample_tile(terrain.rock_macro, vec2(p.x, -p.y) * MACRO_SCALE, vec2(px.x, -px.y) * MACRO_SCALE, vec2(py.x, -py.y) * MACRO_SCALE), macro_weight);
-            }
-            let tn = vec3(s.normal.xy + n.xy, abs(s.normal.z) * n.z);
-            color += s.color * tint * blend.z * weight;
-            normal_sum += tn.xyz * blend.z * weight;
-            roughness += max(s.roughness, min_rough) * blend.z * weight;
-        }
-        total += weight;
+    for (var layer = 0; layer < 12; layer++) {
+        total += w[layer];
     }
     total = max(total, 1e-4);
+    var i0 = 0;
+    var i1 = -1;
+    var i2 = -1;
+    var w0 = -1.0;
+    var w1 = 0.01;
+    var w2 = 0.01;
+    for (var layer = 0; layer < 12; layer++) {
+        let x = w[layer] / total;
+        if x > w0 {
+            i2 = i1; w2 = w1; i1 = i0; w1 = w0; i0 = layer; w0 = x;
+        } else if x > w1 {
+            i2 = i1; w2 = w1; i1 = layer; w1 = x;
+        } else if x > w2 {
+            i2 = layer; w2 = x;
+        }
+    }
+    if i1 < 0 || w1 <= 0.01 { i1 = -1; w1 = 0.0; }
+    if i2 < 0 || w2 <= 0.01 { i2 = -1; w2 = 0.0; }
+    let env = LayerEnv(n, blend, p, px, py, var_x, var_y, var_z, stone_tint, has_macro, macro_weight);
+    let s0 = sample_layer(i0, env);
+    var s1 = s0;
+    var s2 = s0;
+    if i1 >= 0 { s1 = sample_layer(i1, env); }
+    if i2 >= 0 { s2 = sample_layer(i2, env); }
+
+    // 2. Mélange selon le relief (voir `HEIGHT_INFLUENCE`) : les poids
+    // deviennent ceux des couches qui dépassent (normalisés : c'est eux que
+    // lisent ensuite la teinte de l'herbe, de la roche, de la neige...).
+    let h0 = w0 + s0.height * HEIGHT_INFLUENCE;
+    let h1 = select(-9.0, w1 + s1.height * HEIGHT_INFLUENCE, i1 >= 0);
+    let h2 = select(-9.0, w2 + s2.height * HEIGHT_INFLUENCE, i2 >= 0);
+    let floor_score = max(h0, max(h1, h2)) - HEIGHT_BLEND_DEPTH;
+    var b0 = max(h0 - floor_score, 0.0);
+    var b1 = max(h1 - floor_score, 0.0);
+    var b2 = max(h2 - floor_score, 0.0);
+    let kept = max(b0 + b1 + b2, 1e-4);
+    b0 /= kept; b1 /= kept; b2 /= kept;
+    for (var layer = 0; layer < 12; layer++) {
+        w[layer] = 0.0;
+    }
+    w[i0] = b0;
+    if i1 >= 0 { w[i1] += b1; }
+    if i2 >= 0 { w[i2] += b2; }
+    var color = s0.color * b0 + s1.color * b1 + s2.color * b2;
+    var normal_sum = s0.normal * b0 + s1.normal * b1 + s2.normal * b2;
+    var roughness = s0.roughness * b0 + s1.roughness * b1 + s2.roughness * b2;
+    total = 1.0;
     // Minerai : mouchetures colorées dans la roche (couleur selon la roche
     // hôte et la profondeur, comme à la génération : or dans le granite
     // profond, cuivre dans le basalte, charbon dans les couches hautes, fer

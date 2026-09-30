@@ -1,8 +1,8 @@
 /target
 # Sources brutes (130 Mo) des cartes NASA : voir tools/gen_night_sky.py
 /tools/nasa/
-# Cache des textures compressées en BC7 (voir src/texture.rs)
-/texture_cache/
+# Atlas cuits en BC7 (voir src/texture_bake.rs), refaits depuis les atlas sources
+/assets/baked/
 # Réglages de l'IDE
 /.idea/
 # Textures sources téléchargées (Poly Haven), voir tools/gen_*.py

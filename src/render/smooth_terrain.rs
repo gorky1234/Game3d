@@ -6,7 +6,7 @@
 //! densité, extraite par « surface nets » (un sommet par cellule traversée
 //! par la surface, placé à la moyenne des points de passage sur ses arêtes,
 //! relié à ses voisins par des quads). Chaque sommet porte les poids des
-//! matériaux (herbe, terre, roche, sable, neige) pour des transitions douces
+//! matériaux (herbe, terre, roche, sable, neige...) pour des transitions douces
 //! dans terrain.wgsl, et son occlusion ambiante.
 //!
 //! Les points de la grille sont aux centres des blocs. Une section possède
@@ -15,7 +15,7 @@
 //! l'accès aux 8 chunks voisins, diagonales comprises).
 use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
-use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::mesh::{Indices, MeshVertexAttribute, PrimitiveTopology, VertexFormat};
 use crate::world::block::BlockType;
 use crate::world::neighborhood::Neighborhood;
 
@@ -61,21 +61,36 @@ fn stone_mix(nb: &Neighborhood, x: i32, y: i32, z: i32, step: i32, outcrop: bool
     acc
 }
 
+/// Nombre de couches de matériau du terrain lisse (voir `layer_of`).
+const LAYERS: usize = 12;
+
+/// Poids des couches 7 à 10 (podzol, vase, gravier, grès) et 11 (sel) :
+/// les attributs standard de Bevy sont tous pris (voir `terrain_mesh`),
+/// terrain.wgsl les lit aux emplacements 10 et 11 (voir
+/// `TerrainExtension::specialize`, texture.rs).
+pub const ATTRIBUTE_TERRAIN_LAYERS: MeshVertexAttribute =
+    MeshVertexAttribute::new("TerrainLayers", 988_540_917, VertexFormat::Float32x4);
+pub const ATTRIBUTE_TERRAIN_SALT: MeshVertexAttribute =
+    MeshVertexAttribute::new("TerrainSalt", 988_540_918, VertexFormat::Float32);
+
 /// Couche de matériau (voir terrain.wgsl) : 0 herbe, 1 terre, 2 roche,
-/// 3 sable, 4 neige, 5 terre rouge (badlands).
+/// 3 sable, 4 neige, 5 terre rouge (badlands), 6 litière, 7 podzol,
+/// 8 vase, 9 gravier, 10 grès, 11 sel.
 fn layer_of(block: BlockType) -> usize {
     match block {
-        // Podzol (sol de forêt) : herbeux, sinon les forêts avaient un sol de
-        // terre nue grise.
-        BlockType::Grass | BlockType::Podzol => 0,
-        BlockType::Dirt | BlockType::Mud => 1,
-        BlockType::Rock | BlockType::Gravel | BlockType::Brick | BlockType::Granite | BlockType::Limestone
+        BlockType::Grass => 0,
+        BlockType::Dirt => 1,
+        BlockType::Rock | BlockType::Brick | BlockType::Granite | BlockType::Limestone
             | BlockType::Basalt | BlockType::CoalOre | BlockType::IronOre | BlockType::GoldOre | BlockType::CopperOre => 2,
-        BlockType::Sand | BlockType::Sandstone => 3,
-        // Croûte de sel : blanche comme la neige.
-        BlockType::Snow | BlockType::Salt => 4,
+        BlockType::Sand => 3,
+        BlockType::Snow => 4,
         BlockType::RedSand => 5,
         BlockType::LeafLitter => 6,
+        BlockType::Podzol => 7,
+        BlockType::Mud => 8,
+        BlockType::Gravel => 9,
+        BlockType::Sandstone => 10,
+        BlockType::Salt => 11,
         _ => 1,
     }
 }
@@ -422,6 +437,8 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
     let mut weights: Vec<[f32; 4]> = Vec::with_capacity(positions.len());
     let mut extra: Vec<[f32; 2]> = Vec::with_capacity(positions.len());
     let mut red: Vec<[f32; 2]> = Vec::with_capacity(positions.len());
+    let mut more: Vec<[f32; 4]> = Vec::with_capacity(positions.len());
+    let mut salt: Vec<f32> = Vec::with_capacity(positions.len());
     // Roches du sous-sol (voir `stone_mix`), encodées dans les tangentes :
     // (granite, calcaire, 1, basalte). Bevy normalise leur xyz : le 1
     // permet de retrouver les poids par rapport (x / z, y / z).
@@ -433,7 +450,7 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
         // surface peu rempli (voir `solid`), et le bloc du dessous (gravier
         // sous le sable des plages...) l'emportait à égalité de hauteur --
         // traînées grises le long des pentes.
-        let mut w = [0.0f32; 7];
+        let mut w = [0.0f32; LAYERS];
         let mut found = false;
         let mut best: Option<(i32, BlockType)> = None;
         if s > 1 {
@@ -469,12 +486,12 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
             w[best.map_or(1, |(_, b)| layer_of(b))] = 1.0;
         }
         // Affleurements : sur les pentes raides (au-delà de ~45°), l'herbe, la
-        // terre et la neige ne tiennent pas, la roche apparaît. Le sable
-        // (dunes) garde sa couleur.
+        // terre, la vase, la neige et le sel ne tiennent pas, la roche
+        // apparaît. Le sable (dunes) et les éboulis gardent leur couleur.
         let steep = ((0.74 - normals[vi].y) / 0.16).clamp(0.0, 1.0);
         let steep = steep * steep * (3.0 - 2.0 * steep);
         if steep > 0.0 {
-            for layer in [0, 1, 4] {
+            for layer in [0, 1, 4, 7, 8, 11] {
                 let moved = w[layer] * steep;
                 w[layer] -= moved;
                 w[2] += moved;
@@ -512,6 +529,8 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
         // rencontrent pas, un seul canal.
         red.push([if w[5] >= w[6] { w[5] } else { -w[6] }, ore]);
         stones.push([granite, limestone, 1.0, basalt]);
+        more.push([w[7], w[8], w[9], w[10]]);
+        salt.push(w[11]);
     }
 
     // 1er canal d'UV : inutile pour les coordonnées de texture (projection
@@ -527,6 +546,8 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
     // du StandardMaterial, la projection triplanaire est dans terrain.wgsl) ;
     // minerai dans le 2e composant du 1er canal d'UV.
     mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, stones);
+    mesh.insert_attribute(ATTRIBUTE_TERRAIN_LAYERS, more);
+    mesh.insert_attribute(ATTRIBUTE_TERRAIN_SALT, salt);
     mesh.insert_indices(Indices::U32(indices));
     mesh
 }

@@ -49,13 +49,11 @@ pub fn plant_mesh(
                     if !block.is_plant() {
                         continue;
                     }
-                    // Flore propre aux biomes : textures de l'herbe et des
-                    // espèces de prairie, teintées (voir plus bas).
+                    // Herbe sèche : texture de l'espèce de prairie ; mousse,
+                    // lichen, fleurs bleues et violettes : leurs propres
+                    // tuiles (voir tools/gen_ground_flora.py).
                     let own = match block {
                         BlockType::DryGrass => atlas.dry_grass_uv,
-                        BlockType::Moss => atlas.short_grass_uv,
-                        BlockType::Lichen => atlas.clover_uv,
-                        BlockType::FlowerBlue | BlockType::FlowerPurple => atlas.yarrow_uv,
                         _ => atlas.uv_map.get(&block).copied(),
                     };
                     let Some((base_uv, size_uv)) = own else { continue };
@@ -122,12 +120,8 @@ pub fn plant_mesh(
                             // Trèfle : reste vert, même en prairie sèche.
                             (BlockType::TallGrass, Species::Clover) => [0.75 * bright, 0.85 * bright, 0.72 * bright],
                             (BlockType::DryGrass, _) => [1.0 * bright, 0.9 * bright, 0.68 * bright],
-                            (BlockType::Moss, _) => [0.42 * bright, 0.6 * bright, 0.3 * bright],
-                            (BlockType::Lichen, _) => [0.82 * bright, 0.86 * bright, 0.72 * bright],
-                            // Fleurs blanches (achillée) teintées.
-                            (BlockType::FlowerBlue, _) => [0.5 * bright, 0.62 * bright, 1.25 * bright],
-                            (BlockType::FlowerPurple, _) => [0.95 * bright, 0.55 * bright, 1.15 * bright],
-                            // Fleurs (chardon, achillée) : couleurs propres.
+                            // Mousse, lichen, fleurs, chardon, achillée : couleurs
+                            // propres (seule la luminosité varie).
                             _ => [bright; 3],
                         };
                         // Pied sombre et à l'abri du ciel (alpha : occlusion, voir
@@ -137,6 +131,30 @@ pub fn plant_mesh(
                         let bottom = [tint[0] * 0.72, tint[1] * 0.72, tint[2] * 0.72, 0.65];
                         let top = [tint[0] * 1.08, tint[1] * 1.05, tint[2] * 0.92, 1.0];
 
+                        // Mousse et lichen : plaque posée à plat sur le sol (tuile
+                        // vue de dessus, voir tools/gen_ground_flora.py). En cartes
+                        // verticales, ces coussins bas se voyaient d'en haut comme
+                        // des étoiles vertes.
+                        if matches!(block, BlockType::Moss | BlockType::Lichen) {
+                            let (ux, uz) = (c * r * 1.2, s * r * 1.2);
+                            let y = y0 + 0.03;
+                            let base = positions.len() as u32;
+                            positions.extend_from_slice(&[
+                                [cx - ux + uz, y, cz - uz - ux],
+                                [cx + ux + uz, y, cz + uz - ux],
+                                [cx + ux - uz, y, cz + uz + ux],
+                                [cx - ux - uz, y, cz - uz + ux],
+                            ]);
+                            normals.extend_from_slice(&[[0.0, 1.0, 0.0]; 4]);
+                            let (u0, u1) = (base_uv[0], base_uv[0] + size_uv[0]);
+                            let (v0, v1) = (base_uv[1], base_uv[1] + size_uv[1]);
+                            uvs.extend_from_slice(&[[u0, v1], [u1, v1], [u1, v0], [u0, v0]]);
+                            colors.extend_from_slice(&[[tint[0] * 0.95, tint[1] * 0.95, tint[2] * 0.95, 0.9]; 4]);
+                            let phase = plant_hash(wx, wy, wz, 8 + salt) + GROUND_PLANT;
+                            sway.extend_from_slice(&[[0.0, phase]; 4]);
+                            indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+                            continue;
+                        }
                         // Près du joueur, trois quads à 60° (touffe pleine sous tous
                         // les angles) ; au loin, deux en croix.
                         let (s3, c3) = (angle + std::f32::consts::FRAC_PI_3 * 2.0).sin_cos();
@@ -167,7 +185,7 @@ pub fn plant_mesh(
                             colors.extend_from_slice(&[bottom, bottom, top, top]);
                             // Pied fixe, sommet libre.
                             let phase = plant_hash(wx, wy, wz, 8 + salt) + GROUND_PLANT;
-                            let bend = if matches!(block, BlockType::Moss | BlockType::Lichen) { 0.15 } else { species.sway() };
+                            let bend = species.sway();
                             sway.extend_from_slice(&[[0.0, phase], [0.0, phase], [bend, phase], [bend, phase]]);
                             indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
                         }
