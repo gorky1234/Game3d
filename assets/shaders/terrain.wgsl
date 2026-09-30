@@ -16,7 +16,7 @@
 struct Terrain {
     // Tuile (xy : coin UV, zw : taille UV) du dessus puis du côté de chacune
     // des 6 couches : tiles[2 * couche] = dessus, tiles[2 * couche + 1] = côté.
-    tiles: array<vec4<f32>, 12>,
+    tiles: array<vec4<f32>, 14>,
     // x : blocs couverts par une répétition de tuile, y : humidité (pluie).
     params: vec4<f32>,
     // Paroi photo projetée en grand sur la roche (coin UV, taille UV ;
@@ -205,7 +205,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var blend = pow(abs(n), vec3(4.0));
     blend /= blend.x + blend.y + blend.z;
 
-    var w: array<f32, 6>;
+    var w: array<f32, 7>;
     var ao = 1.0;
     var bank_wet = 0.0;
 #ifdef VERTEX_COLORS
@@ -215,7 +215,9 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #endif
 #ifdef VERTEX_UVS_A
     // Terre rouge : 1er canal d'UV (inutile pour une projection triplanaire).
-    w[5] = in.uv.x;
+    // Terre rouge, ou (en négatif) litière : voir `terrain_mesh`.
+    w[5] = max(in.uv.x, 0.0);
+    w[6] = max(-in.uv.x, 0.0);
 #endif
 #ifdef VERTEX_UVS_B
     // Neige, ou (en négatif) berge mouillée : voir `bank_wetness`
@@ -276,7 +278,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var normal_sum = vec3(0.0);
     var roughness = 0.0;
     var total = 0.0;
-    for (var layer = 0; layer < 6; layer++) {
+    for (var layer = 0; layer < 7; layer++) {
         let weight = w[layer];
         if weight < 0.01 {
             continue;

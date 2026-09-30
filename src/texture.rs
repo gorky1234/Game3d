@@ -58,6 +58,7 @@ fn filename_to_block_type(name: &str) -> Option<BlockType> {
         "snow.png" => Some(BlockType::Snow),
         "mud.png" => Some(BlockType::Mud),
         "podzol.png" => Some(BlockType::Podzol),
+        "litter.png" => Some(BlockType::LeafLitter),
         "sandstone.png" => Some(BlockType::Sandstone),
         "gravel.png" => Some(BlockType::Gravel),
         "log.png" => Some(BlockType::Log),
@@ -141,6 +142,13 @@ pub struct TextureAtlasMaterial {
     pub lily_uv: Option<([f32; 2], [f32; 2])>,
     pub kelp_uv: Option<([f32; 2], [f32; 2])>,
     pub coral_uv: Option<([f32; 2], [f32; 2])>,
+    /// Jungle (voir tools/gen_jungle.py et tree_mesh.rs) : touffe de
+    /// grandes feuilles, palme, feuille de bananier, liane, héliconia.
+    pub jungle_leaf_uv: Option<([f32; 2], [f32; 2])>,
+    pub palm_frond_uv: Option<([f32; 2], [f32; 2])>,
+    pub broadleaf_uv: Option<([f32; 2], [f32; 2])>,
+    pub liana_uv: Option<([f32; 2], [f32; 2])>,
+    pub heliconia_uv: Option<([f32; 2], [f32; 2])>,
 }
 
 
@@ -196,8 +204,8 @@ pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 #[derive(Clone, Copy, Default, Debug, Reflect, ShaderType)]
 pub struct TerrainUniform {
     /// Tuile (coin UV, taille UV) du dessus puis du côté de chaque couche :
-    /// herbe, terre, roche, sable, neige, terre rouge.
-    pub tiles: [Vec4; 12],
+    /// herbe, terre, roche, sable, neige, terre rouge, litière.
+    pub tiles: [Vec4; 14],
     /// x : blocs couverts par une répétition de tuile, y : humidité (0..1,
     /// pluie : sol mouillé et flaques).
     pub params: Vec4,
@@ -541,6 +549,7 @@ pub fn setup_texture_atlas(
     let mut yarrow_uv = None;
     let (mut reed_uv, mut lily_uv, mut kelp_uv, mut coral_uv) = (None, None, None, None);
     let mut rock_macro_uv = None;
+    let (mut jungle_leaf_uv, mut palm_frond_uv, mut broadleaf_uv, mut liana_uv, mut heliconia_uv) = (None, None, None, None, None);
 
     for (filename, frame_data) in atlas_data.frames.iter() {
         let frame = &frame_data.frame;
@@ -572,6 +581,11 @@ pub fn setup_texture_atlas(
             "kelp.png" => kelp_uv = Some(rect),
             "coral.png" => coral_uv = Some(rect),
             "rock_macro.png" => rock_macro_uv = Some(rect),
+            "jungle_leaf.png" => jungle_leaf_uv = Some(rect),
+            "palm_frond.png" => palm_frond_uv = Some(rect),
+            "broadleaf.png" => broadleaf_uv = Some(rect),
+            "liana.png" => liana_uv = Some(rect),
+            "heliconia.png" => heliconia_uv = Some(rect),
             _ => {}
         }
     }
@@ -594,9 +608,9 @@ pub fn setup_texture_atlas(
     };
     let layers = [
         ("grass.png", "dirt.png"), ("dirt.png", "dirt.png"), ("rock.png", "rock.png"), ("sand.png", "sand.png"),
-        ("snow.png", "rock.png"), ("red_sand.png", "red_rock.png"),
+        ("snow.png", "rock.png"), ("red_sand.png", "red_rock.png"), ("litter.png", "dirt.png"),
     ];
-    let mut tiles = [Vec4::ZERO; 12];
+    let mut tiles = [Vec4::ZERO; 14];
     for (i, (top, side)) in layers.iter().enumerate() {
         tiles[2 * i] = tile(top);
         tiles[2 * i + 1] = tile(side);
@@ -644,6 +658,11 @@ pub fn setup_texture_atlas(
         lily_uv,
         kelp_uv,
         coral_uv,
+        jungle_leaf_uv,
+        palm_frond_uv,
+        broadleaf_uv,
+        liana_uv,
+        heliconia_uv,
     });
 }
 

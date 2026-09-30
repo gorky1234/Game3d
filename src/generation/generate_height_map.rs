@@ -17,6 +17,10 @@ pub struct Column {
     pub water: usize,
     /// Fond de lit d'un cours d'eau (sable, gravier).
     pub river_bed: bool,
+    /// Lit à sec d'un oued (sable, gravier en surface).
+    pub dry_bed: bool,
+    /// Désert de sel (sel en surface).
+    pub salt: bool,
 }
 
 #[derive(Resource, Default, Clone)]
@@ -55,7 +59,7 @@ impl HeightMap{
 
     /// Comme `get_chunk_f`, avec le niveau de l'eau de chaque colonne.
     pub fn get_chunk_columns(&self, chunk_x: i64, chunk_z: i64, biomes_map: &BiomeMap, lod_stride: usize) -> Vec<Vec<Column>> {
-        let empty = Column { height: 0.0, water: SEA_LEVEL, river_bed: false };
+        let empty = Column { height: 0.0, water: SEA_LEVEL, river_bed: false, dry_bed: false, salt: false };
         let mut chunk_heightmap = vec![vec![empty; CHUNK_SIZE]; CHUNK_SIZE];
         let (min_x, min_z) = (chunk_x * CHUNK_SIZE as i64, chunk_z * CHUNK_SIZE as i64);
         let bounds = (min_x, min_z, min_x + CHUNK_SIZE as i64 - 1, min_z + CHUNK_SIZE as i64 - 1);
@@ -171,9 +175,17 @@ impl HeightMap{
                 basin_water = Some(w);
             }
         }
+        // Désert de sel : fond de cuvette aplani, croûte de sel au centre.
+        let mut salt = false;
+        if let Some((level, m)) = rivers.and_then(|r| r.playa_at(world_x, world_z)) {
+            let floor = level as f64 + 1.0;
+            let k = smoothstep(0.2, 0.6, m);
+            natural.height += (floor - natural.height) * k;
+            salt = m > 0.45;
+        }
         let water = basin_water.unwrap_or(if natural.lake { LAKE_LEVEL } else { SEA_LEVEL });
         let Some(river) = RiverNetwork::carve(world_x, world_z, natural.height, natural.lake, segments) else {
-            return Column { height: soft_ceiling(natural.height), water, river_bed: false };
+            return Column { height: soft_ceiling(natural.height), water, river_bed: false, dry_bed: false, salt };
         };
         // Dans un lac, sa surface fait loi : une rivière qui y entre plus haut
         // s'y jette (cascade sur la rive) au lieu de rester perchée dessus.
@@ -193,7 +205,7 @@ impl HeightMap{
         if natural.inland && !natural.lake && height.floor() >= water as f64 {
             height = height.max(LAKE_LEVEL as f64);
         }
-        Column { height: soft_ceiling(height.max(0.0)), water, river_bed: river.in_bed }
+        Column { height: soft_ceiling(height.max(0.0)), water, river_bed: river.in_bed, dry_bed: river.dry_bed && !salt, salt }
     }
 
     /// Relief naturel (sans les cours d'eau) : sert au calcul du réseau

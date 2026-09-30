@@ -187,6 +187,7 @@ fn surface_color(block: BlockType) -> Vec3 {
         BlockType::Sand | BlockType::Sandstone => Vec3::new(0.391, 0.29, 0.14),
         BlockType::Snow | BlockType::Salt => Vec3::new(0.555, 0.561, 0.565),
         BlockType::RedSand => Vec3::new(0.30, 0.09, 0.042),
+        BlockType::LeafLitter => Vec3::new(0.09, 0.06, 0.03),
         _ => Vec3::new(0.136, 0.097, 0.058),
     }
 }
@@ -198,6 +199,11 @@ const WATER_COLOR: Vec3 = Vec3::new(0.012, 0.035, 0.05);
 const SILT_COLOR: Vec3 = Vec3::new(0.07, 0.055, 0.03);
 const TANNIN_COLOR: Vec3 = Vec3::new(0.02, 0.012, 0.005);
 const GLACIAL_COLOR: Vec3 = Vec3::new(0.015, 0.07, 0.075);
+/// Débit minimal des ruisseaux dessinés au loin, et écart entre sommets
+/// au-delà duquel seules les rivières le sont.
+const FAR_STREAM_FLOW: f32 = 15.0;
+const FAR_STREAM_SPACING: f64 = 30.0;
+const ICE_COLOR: Vec3 = Vec3::new(0.45, 0.52, 0.58);
 
 fn water_color(tint: WaterTint) -> Vec3 {
     let w = |v: f32| (v / 0.6).clamp(0.0, 1.0);
@@ -247,18 +253,24 @@ fn far_terrain_mesh(center: Vec2, biomes: &Arc<BiomeMap>, heights: &HeightMap) -
         let spacing = (radii[ring] * RING_GROWTH).max(MIN_STEP) as f64;
         let segments = tiles.entry((x.div_euclid(TILE), z.div_euclid(TILE))).or_insert_with(|| {
             let (tx, tz) = (x.div_euclid(TILE) * TILE, z.div_euclid(TILE) * TILE);
-            biomes.rivers().map_or_else(Vec::new, |r| r.segments_near(tx, tz, tx + TILE - 1, tz + TILE - 1, RIVER_FLOW))
+            biomes.rivers().map_or_else(Vec::new, |r| r.segments_near(tx, tz, tx + TILE - 1, tz + TILE - 1, FAR_STREAM_FLOW))
         });
-        let bed = RiverNetwork::nearest_bed(x as f64, z as f64, segments);
+        // Ruisseaux (débit plus faible que les rivières) seulement sur les
+        // anneaux fins, en trait plus mince : plus loin, un sommet sur 30 m
+        // les aurait dessinés comme des rivières.
+        let stream_ring = spacing < FAR_STREAM_SPACING;
+        let bed = RiverNetwork::nearest_bed(x as f64, z as f64, segments, if stream_ring { FAR_STREAM_FLOW } else { RIVER_FLOW });
         let river = bed.filter(|&(edge, level, _)| {
-            edge < spacing * 0.5 && (h as f64) - (level.floor() + 1.0) < 6.0 + spacing * 0.1
+            edge < spacing * if stream_ring { 0.35 } else { 0.5 } && (h as f64) - (level.floor() + 1.0) < 6.0 + spacing * 0.1
         });
         let (y, color, water) = if h < sea - 1.0 || river.is_some() {
             // Terrain immergé (voir `column_block`) ou lit de rivière :
             // surface de l'eau, teintée selon la rivière (voir `WaterTint`).
             let tint = bed.filter(|b| b.0 < spacing).map_or(WaterTint::default(), |b| b.2);
             let y = if h < sea - 1.0 { sea } else { river.map_or(sea, |r| r.1.floor() as f32 + 1.0) };
-            (y, water_color(tint), true)
+            // Rivière gelée : glace claire.
+            let color = water_color(tint).lerp(ICE_COLOR, tint.frozen.clamp(0.0, 1.0));
+            (y, color, true)
         } else {
             let biome = biomes.get_biome(x, z);
             let block = surface_block(h as usize, biome, &get_biome_data(biome), x, z, &biomes.surface_info(x, z, biome));

@@ -44,7 +44,7 @@ use crate::constants::{SEA_LEVEL, WORLD_SIZE};
 use crate::generation::biome::BiomeType;
 use crate::generation::generate_biome_map::BiomeMap;
 use crate::generation::generate_height_map::{HeightMap, LAKE_LEVEL};
-use crate::generation::procedural::{gradient_noise, rand01};
+use crate::generation::procedural::{gradient_noise, hash, rand01};
 
 /// Taille (blocs) d'une case de la grille hydrographique : écart minimal
 /// entre deux cours d'eau parallèles.
@@ -165,6 +165,32 @@ const FALL_SHEET_MIN_DROP: f64 = 1.5;
 /// Débit à partir duquel l'embouchure est un delta à plusieurs bras.
 const DELTA_FLOW: f32 = FLEUVE_FLOW;
 
+/// Régions sèches. Ruissellement des orages (par case, en « cases bien
+/// arrosées ») : même sans pluie régulière, les crues creusent des lits
+/// (oueds). Perte d'eau par case traversée (évaporation, infiltration) à
+/// aridité maximale. En dessous de `WADI_WET` d'eau, le lit est à sec.
+const STORM_RUNOFF: f32 = 0.35;
+const DRY_LOSS: f32 = 0.07;
+const WADI_WET: f32 = 3.0;
+/// Canyons des badlands : enfoncement max du lit (blocs) sous le terrain,
+/// et raidissement des versants.
+const CANYON_DEPTH: f32 = 22.0;
+const CANYON_WALLS: f64 = 4.0;
+/// Rivières gelées : température (à l'altitude du cours d'eau) sous laquelle
+/// l'eau est prise en glace (largeur du fondu), et pente au-delà de laquelle
+/// elle reste libre (torrent).
+const FREEZE_TEMPERATURE: f32 = 0.2;
+const FREEZE_BLEND: f32 = 0.04;
+const FREEZE_MAX_SLOPE: f32 = 0.04;
+/// Rivières en tresses (sous les glaciers) : caractère glaciaire minimal,
+/// probabilité par nœud ; îles des grands cours d'eau ; gués.
+const BRAID_GLACIAL: f32 = 0.3;
+const BRAID_CHANCE: f64 = 0.75;
+const ISLAND_CHANCE: f64 = 0.14;
+const FORD_CHANCE: f64 = 0.1;
+/// Source sans résurgence : petite vasque (demi-largeur, profondeur).
+const SPRING_POOL: (f64, f64) = (2.6, 1.4);
+
 /// Courant de surface (rendu, voir `RiverNetwork::current`) : vitesse
 /// (blocs/s) d'un ruisseau de plaine, gain selon la pente, plafond.
 const CURRENT_BASE_SPEED: f64 = 0.7;
@@ -204,6 +230,10 @@ pub struct RiverSegment {
     still: (f64, f64),
     /// Caractère de l'eau (voir `WaterTint`).
     pub tint: WaterTint,
+    /// Lit à sec (oued) : creusé, sans eau.
+    pub dry: bool,
+    /// Canyon (0..1) : versants raides, pas de plaine alluviale.
+    pub walls: f64,
     /// Premier segment d'un cours d'eau : `a` est sa source.
     pub source: bool,
     pub flow: f32,
@@ -228,6 +258,8 @@ impl RiverSegment {
             steep: (a.steep, b.steep),
             still: (a.still, b.still),
             tint: WaterTint::default(),
+            dry: false,
+            walls: 0.0,
             source: false,
             flow,
             reach: hw + floodplain(hw) + VALLEY_EXTENT + MEANDER_MARGIN,
@@ -246,14 +278,16 @@ pub struct WaterTint {
     pub silt: f32,
     pub tannin: f32,
     pub glacial: f32,
+    /// Glace (0..1) : rivière gelée (propre au nœud, pas mélangé vers l'aval).
+    pub frozen: f32,
 }
 
 impl WaterTint {
     fn scale(self, k: f32) -> Self {
-        WaterTint { silt: self.silt * k, tannin: self.tannin * k, glacial: self.glacial * k }
+        WaterTint { silt: self.silt * k, tannin: self.tannin * k, glacial: self.glacial * k, frozen: self.frozen * k }
     }
     fn add(self, o: Self) -> Self {
-        WaterTint { silt: self.silt + o.silt, tannin: self.tannin + o.tannin, glacial: self.glacial + o.glacial }
+        WaterTint { silt: self.silt + o.silt, tannin: self.tannin + o.tannin, glacial: self.glacial + o.glacial, frozen: self.frozen + o.frozen }
     }
 }
 
@@ -273,7 +307,7 @@ fn local_tint(biome: BiomeType, temperature: f32, mountain: f32) -> WaterTint {
     };
     // Farine glaciaire : montagnes froides (glaciers, névés).
     let cold = ((0.38 - temperature) / 0.2).clamp(0.0, 1.0);
-    WaterTint { silt, tannin, glacial: (mountain * 1.5).min(1.0) * cold }
+    WaterTint { silt, tannin, glacial: (mountain * 1.5).min(1.0) * cold, frozen: 0.0 }
 }
 
 /// Cascade (chute concentrée d'un cours d'eau, voir `WATERFALL_MIN_DROP`) :
@@ -302,6 +336,8 @@ pub struct RiverColumn {
     pub water: usize,
     /// Colonne dans le lit d'un cours d'eau (bloc de fond : sable/gravier).
     pub in_bed: bool,
+    /// Lit à sec (oued) : sable ou gravier en surface.
+    pub dry_bed: bool,
 }
 
 pub struct RiverNetwork {
@@ -330,6 +366,16 @@ pub struct RiverNetwork {
     erosion: Vec<f32>,
     /// Caractère de l'eau du tronçon partant de ce nœud.
     tint: Vec<WaterTint>,
+    /// Lit à sec (oued).
+    dry: Vec<bool>,
+    /// Canyon (0..1, badlands).
+    walls: Vec<f32>,
+    /// Dessin du lit : 0 simple, 1 en tresses, 2 autour d'une île ; gué.
+    braid: Vec<u8>,
+    ford: Vec<bool>,
+    /// Désert de sel (lac asséché des régions arides) : niveau du fond, NaN
+    /// ailleurs.
+    playa: Vec<f32>,
 }
 
 /// Point d'un tracé et grandeurs du cours d'eau en ce point.
@@ -754,6 +800,37 @@ impl RiverNetwork {
             }
         });
 
+        // 1 bis. Climat des nœuds : aridité (régions sèches), part de badlands
+        // (canyons).
+        let mut aridity = vec![0f32; total];
+        let mut badlands = vec![0f32; total];
+        std::thread::scope(|scope| {
+            for (t, (arid, bad)) in aridity.chunks_mut(rows_per_thread * n).zip(badlands.chunks_mut(rows_per_thread * n)).enumerate() {
+                let ocean = &ocean;
+                scope.spawn(move || {
+                    for (k, (a, b)) in arid.iter_mut().zip(bad.iter_mut()).enumerate() {
+                        let i = t * rows_per_thread * n + k;
+                        if ocean[i] {
+                            continue;
+                        }
+                        let (x, z) = Self::node(i % n, i / n);
+                        let (x, z) = (x as i64, z as i64);
+                        // Aridité : part des biomes secs (déserts, badlands, un
+                        // peu la savane), pas l'humidité brute (les plaines
+                        // froides et sèches ne sont pas des déserts).
+                        let weight = |wanted: BiomeType| -> f32 {
+                            map.relief_weights(x, z).iter().filter(|(biome, _)| *biome == wanted).map(|&(_, w)| w as f32).sum()
+                        };
+                        *b = weight(BiomeType::Badlands);
+                        *a = (weight(BiomeType::Desert) + *b + 0.4 * weight(BiomeType::Savanna)).clamp(0.0, 1.0);
+                    }
+                });
+            }
+        });
+        // Ruissellement des orages en région sèche : des lits se creusent
+        // (oueds) même là où il ne pleut presque jamais.
+        let rain: Vec<f32> = (0..total).map(|i| rain[i] + STORM_RUNOFF * aridity[i]).collect();
+
         // 2. Écoulement sur le relief brut, érosion du relief par les cours
         // d'eau qu'il produit, puis écoulement définitif sur le relief érodé.
         let (down, order, _) = route(n, &ground, &ocean);
@@ -761,8 +838,18 @@ impl RiverNetwork {
         let erosion = erode(n, &mut ground, &ocean, &inland, &down, &order, &flow);
         let (down, order, fill) = route(n, &ground, &ocean);
 
-        // 3. Débit : pluie cumulée vers l'aval.
+        // 3. Débit : pluie cumulée vers l'aval (taille du lit). Eau
+        // réellement présente : la pluie régulière seule (sans les orages),
+        // diminuée à chaque case sèche traversée.
         let flow = accumulate(&rain, &down, &order, &ocean);
+        let mut wet: Vec<f32> = (0..total).map(|i| rain[i] - STORM_RUNOFF * aridity[i]).collect();
+        for &i in order.iter().rev() {
+            let i = i as usize;
+            let d = down[i];
+            if d != NONE && !ocean[d as usize] {
+                wet[d as usize] += wet[i] * (1.0 - DRY_LOSS * aridity[i]);
+            }
+        }
 
         // 3 bis. Sources trop proches de la mer. Distance à la mer en suivant
         // l'écoulement (`order` : aval d'abord ; bord du monde = loin), puis,
@@ -855,8 +942,16 @@ impl RiverNetwork {
             }
         }
 
-        // 3 quater. Lacs de cuvette.
-        let lake = find_lakes(n, &ground, &fill, &ocean, &river, &is_fjord);
+        // 3 quater. Lacs de cuvette. En région aride, le lac s'est évaporé :
+        // désert de sel (playa) au fond de la cuvette, où finissent les oueds.
+        let mut lake = find_lakes(n, &ground, &fill, &ocean, &river, &is_fjord);
+        let mut playa = vec![f32::NAN; total];
+        for i in 0..total {
+            if !lake[i].is_nan() && aridity[i] > 0.5 {
+                playa[i] = lake[i];
+                lake[i] = f32::NAN;
+            }
+        }
 
         // 4. Niveau de l'eau, de l'amont vers l'aval : jamais plus haut que le
         // niveau en amont ni que le sol du nœud (moins l'incision).
@@ -885,6 +980,14 @@ impl RiverNetwork {
             if is_fjord[i] {
                 let t = 1.0 - to_sea[i] / FJORD_LENGTH;
                 l = l.min(sea - (FJORD_DEPTH.0 + (FJORD_DEPTH.1 - FJORD_DEPTH.0) * t));
+            }
+            // Badlands : le cours d'eau s'enfonce en canyon sous le plateau.
+            if badlands[i] > 0.05 && !(d != NONE && ocean[d as usize]) {
+                l = l.min((ground[i] - INCISION - CANYON_DEPTH * badlands[i].min(1.0)).max(sea + 1.0));
+            }
+            // Au fond d'un désert de sel : son niveau.
+            if !playa[i].is_nan() {
+                l = playa[i].min(upstream_min[i]);
             }
             // Dans un lac de cuvette : sa surface (jamais au-dessus de l'amont).
             if !lake[i].is_nan() {
@@ -946,6 +1049,32 @@ impl RiverNetwork {
                 && neighbors(n, i).chain([i]).all(|j| !ocean[j] && ground[j] - level[i] < OXBOW_MAX_RELIEF)
         }).collect();
 
+        // Lits à sec (oueds) : trop peu d'eau arrive (régions sèches), ou
+        // au fond d'un désert de sel.
+        let dry: Vec<bool> = (0..total).map(|i| river[i] && !ocean[i] && (wet[i] < WADI_WET || !playa[i].is_nan())).collect();
+        // Canyons.
+        let walls: Vec<f32> = (0..total).map(|i| if river[i] { badlands[i].clamp(0.0, 1.0) } else { 0.0 }).collect();
+        // Glace : cours d'eau froid (à son altitude), pas un torrent.
+        let slope_of = |i: usize| {
+            let d = down[i];
+            if d == NONE || ocean[d as usize] {
+                return 0.0;
+            }
+            let (a, b) = (pos(i), pos(d as usize));
+            (level[i] - level[d as usize]).max(0.0) / (dist(a, b) as f32).max(1.0)
+        };
+        let frozen: Vec<f32> = (0..total).map(|i| {
+            if !river[i] || ocean[i] || dry[i] || fjord[i] > 0.0 || slope_of(i) > FREEZE_MAX_SLOPE {
+                return 0.0;
+            }
+            let (x, z) = pos(i);
+            let t = map.temperature_at_altitude(x as i64, z as i64, level[i] as f64) as f32;
+            ((FREEZE_TEMPERATURE + FREEZE_BLEND - t) / (2.0 * FREEZE_BLEND)).clamp(0.0, 1.0)
+        }).collect();
+
+        // Pas de bras mort d'eau dormante dans un oued ni sous la glace.
+        let oxbow: Vec<bool> = oxbow.into_iter().enumerate().map(|(i, o)| o && !dry[i] && frozen[i] < 0.5).collect();
+
         // Caractère de l'eau : apports locaux (pondérés par la pluie de chaque
         // case) cumulés vers l'aval comme le débit, puis rapportés au débit.
         let local: Vec<WaterTint> = {
@@ -984,8 +1113,33 @@ impl RiverNetwork {
             // Le limon se voit surtout sur les grands cours d'eau lents ; un
             // ruisseau de plaine reste assez clair.
             let big = ((flow[i] - RIVER_FLOW) / (FLEUVE_FLOW - RIVER_FLOW)).clamp(0.0, 1.0);
-            WaterTint { silt: (t.silt * (0.35 + 0.65 * big)).min(1.0), tannin: t.tannin.min(1.0), glacial: t.glacial.min(1.0) }
+            WaterTint { silt: (t.silt * (0.35 + 0.65 * big)).min(1.0), tannin: t.tannin.min(1.0), glacial: t.glacial.min(1.0), frozen: frozen[i] }
         }).collect();
+
+        // Dessin du lit : tresses sous les glaciers (eau chargée de
+        // galets, pente modérée), îles des grands cours d'eau, gués.
+        let plain = |i: usize| !ocean[i] && river[i] && !dry[i] && lake[i].is_nan() && fjord[i] == 0.0 && !oxbow[i]
+            && frozen[i] < 0.5 && down[i] != NONE && !ocean[down[i] as usize];
+        let braid: Vec<u8> = (0..total).map(|i| {
+            if !plain(i) || main_up[i] == NONE {
+                return 0;
+            }
+            let slope = slope_of(i);
+            if tint[i].glacial > BRAID_GLACIAL && flow[i] >= RIVER_FLOW && slope < 0.03 && rand01(i as i64, 5, 9108) < BRAID_CHANCE {
+                1
+            } else if flow[i] >= FLEUVE_FLOW * 0.5 && slope < 0.01 && rand01(i as i64, 6, 9109) < ISLAND_CHANCE {
+                2
+            } else {
+                0
+            }
+        }).collect();
+        let ford: Vec<bool> = (0..total).map(|i| {
+            plain(i) && braid[i] == 0 && flow[i] >= RIVER_FLOW && flow[i] < FLEUVE_FLOW && rand01(i as i64, 7, 9110) < FORD_CHANCE
+        }).collect();
+        println!("Oueds : {} tronçons à sec, {} cases de désert de sel ; {} gelés ; {} en tresses, {} îles, {} gués",
+            dry.iter().zip(&river).filter(|&(&d, &r)| d && r).count(), playa.iter().filter(|p| !p.is_nan()).count(),
+            frozen.iter().filter(|&&f| f > 0.5).count(), braid.iter().filter(|&&b| b == 1).count(),
+            braid.iter().filter(|&&b| b == 2).count(), ford.iter().filter(|&&f| f).count());
 
         let rivers = river.iter().zip(&ocean).filter(|&(&r, &o)| r && !o).count();
         let lakes = lake.iter().filter(|l| !l.is_nan()).count();
@@ -994,7 +1148,7 @@ impl RiverNetwork {
             -erosion.iter().cloned().fold(0.0, f32::min));
         println!("Réseau hydrographique : {n}x{n} cases de {RIVER_CELL} blocs, {rivers} tronçons de cours d'eau");
 
-        RiverNetwork { n, down, flow, level, ocean, river, main_up, phase, fjord, lake, oxbow, erosion, tint }
+        RiverNetwork { n, down, flow, level, ocean, river, main_up, phase, fjord, lake, oxbow, erosion, tint, dry, walls, braid, ford, playa }
     }
 
     fn pos(&self, i: usize) -> (f64, f64) {
@@ -1034,13 +1188,17 @@ impl RiverNetwork {
         let start = if up != NONE {
             self.edge_point(up as usize)
         } else {
-            // Source : le ruisseau naît fin et peu profond.
+            // Source : le ruisseau naît fin et peu profond, sauf les sources
+            // qui ne sortent pas d'une résurgence (voir `is_spring`) : petite
+            // vasque d'eau claire d'où part le ruisseau.
             let lambda = meander_wavelength(end.half_width);
             let (dx, dz) = (end.pos.0 - control.0, end.pos.1 - control.1);
+            let resurgence = hash(control.0 as i64, control.1 as i64, 950) % 3 != 0;
+            let (half_width, depth) = if resurgence || self.dry[i] { (0.6, 0.8) } else { SPRING_POOL };
             RiverPoint {
                 pos: control,
-                half_width: 0.6,
-                depth: 0.8,
+                half_width,
+                depth,
                 level: self.level[i] as f64,
                 phase: end.phase + std::f64::consts::TAU * (dx * dx + dz * dz).sqrt() / lambda,
                 steep: end.steep,
@@ -1078,6 +1236,8 @@ impl RiverNetwork {
         self.node_segments_untinted(i, out);
         for segment in &mut out[first..] {
             segment.tint = self.tint[i];
+            segment.dry = self.dry[i];
+            segment.walls = self.walls[i] as f64;
         }
     }
 
@@ -1114,15 +1274,27 @@ impl RiverNetwork {
             }
             p
         };
-        let mut prev = point(ts[0]);
+        // Gué : haut-fond de galets au milieu de la courbe.
+        let ford = self.ford[i] && fall.is_none();
+        let point = |t: f64| {
+            let mut p = point(t);
+            if ford {
+                p.depth *= 1.0 - 0.8 * (-((t - 0.5) / 0.07).powi(2)).exp();
+            }
+            p
+        };
+        let points: Vec<RiverPoint> = ts.iter().map(|&t| point(t)).collect();
         let is_source = self.main_up[i] == NONE;
-        for (k, &t) in ts[1..].iter().enumerate() {
-            let p = point(t);
-            let mut segment = RiverSegment::new(&prev, &p, flow);
-            segment.source = is_source && k == 0;
-            out.push(segment);
-            prev = p;
+        if self.braid[i] != 0 && fall.is_none() && !delta {
+            self.braided_segments(i, &ts, &points, flow, out);
+        } else {
+            for (k, pair) in points.windows(2).enumerate() {
+                let mut segment = RiverSegment::new(&pair[0], &pair[1], flow);
+                segment.source = is_source && k == 0;
+                out.push(segment);
+            }
         }
+        let prev = *points.last().unwrap();
         if self.oxbow[i] {
             self.oxbow_segments(&curve, flow, out);
         }
@@ -1164,6 +1336,44 @@ impl RiverNetwork {
                 out.push(RiverSegment::new(&bottom, &join, flow));
             } else {
                 out.push(RiverSegment::new(&prev, &join, flow));
+            }
+        }
+    }
+
+    /// Lit en plusieurs bras le long de la courbe `points` (paramètres `ts`)
+    /// du nœud i : tresses (trois bras étroits qui se croisent, séparés par
+    /// des bancs de galets) ou deux bras autour d'une île. Les bras se
+    /// rejoignent aux deux bouts de la courbe (raccord aux nœuds voisins).
+    fn braided_segments(&self, i: usize, ts: &[f64], points: &[RiverPoint], flow: f32, out: &mut Vec<RiverSegment>) {
+        let island = self.braid[i] == 2;
+        let arms: &[f64] = if island { &[-1.0, 1.0] } else { &[-1.0, 0.0, 1.0] };
+        let seed = rand01(i as i64, 8, 9111) * std::f64::consts::TAU;
+        let normal = |k: usize| {
+            let (a, b) = (points[k.saturating_sub(1)].pos, points[(k + 1).min(points.len() - 1)].pos);
+            let (dx, dz) = (b.0 - a.0, b.1 - a.1);
+            let len = dx.hypot(dz).max(1e-6);
+            (-dz / len, dx / len)
+        };
+        for &arm in arms {
+            let mut prev: Option<RiverPoint> = None;
+            for (k, (&t, p)) in ts.iter().zip(points).enumerate() {
+                // 0 aux bouts, 1 au milieu : les bras s'écartent puis se rejoignent.
+                let spread = (std::f64::consts::PI * t).sin();
+                let offset = if island {
+                    arm * p.half_width * 1.7 * spread
+                } else {
+                    p.half_width * 1.3 * spread * (std::f64::consts::TAU * 1.5 * t + seed + arm * 2.1).sin()
+                };
+                let (nx, nz) = normal(k);
+                let mut q = *p;
+                q.pos = (p.pos.0 + nx * offset, p.pos.1 + nz * offset);
+                let narrow = if island { 0.6 } else { 0.42 };
+                q.half_width = p.half_width * (1.0 - (1.0 - narrow) * spread);
+                q.depth = p.depth * (1.0 - 0.4 * spread);
+                if let Some(a) = prev {
+                    out.push(RiverSegment::new(&a, &q, flow));
+                }
+                prev = Some(q);
             }
         }
     }
@@ -1340,7 +1550,7 @@ impl RiverNetwork {
             }
         };
         // Tronçon le plus "englobant" : distance au bord du lit minimale.
-        let mut best: Option<(f64, f64, f64, f64, f64)> = None; // (dist, half_width, depth, level, edge)
+        let mut best: Option<(f64, f64, f64, f64, f64, bool)> = None; // (dist, half_width, depth, level, edge, à sec)
         for s in segments {
             let (abx, abz) = (s.b.0 - s.a.0, s.b.1 - s.a.1);
             let len2 = (abx * abx + abz * abz).max(1e-9);
@@ -1353,15 +1563,18 @@ impl RiverNetwork {
                 continue;
             }
             let level = s.level.0 + (s.level.1 - s.level.0) * t;
-            let water_top = level.floor() + 0.5;
+            // Oued : les versants partent du lit sec (voir plus bas), pas du
+            // niveau de l'eau un bloc plus bas (berges sous le lit).
+            let water_top = level.floor() + if s.dry { 1.3 } else { 0.5 };
 
             // Versants : plaine alluviale presque plate, puis vallée qui se
             // raidit avec la distance.
             let e = edge.max(0.0);
             // Fjord : parois raides, pas de plaine alluviale.
             let steep = s.steep.0 + (s.steep.1 - s.steep.0) * t;
-            let plain = floodplain(hw) * (1.0 - steep);
-            upper = upper.min(water_top + valley_rise(e, plain) * (1.0 + 2.0 * steep));
+            // Canyon (badlands) : parois presque verticales, pas de plaine.
+            let plain = floodplain(hw) * (1.0 - steep) * (1.0 - s.walls);
+            upper = upper.min(water_top + valley_rise(e, plain) * (1.0 + 2.0 * steep + CANYON_WALLS * s.walls));
             // Berges tenues au niveau de l'eau, puis retour au terrain
             // (au-dessus de la mer seulement : pas de digue dans l'océan).
             // Niveau arrondi au-dessus : l'eau descend par marches d'un bloc
@@ -1371,16 +1584,30 @@ impl RiverNetwork {
             // `Chunk::surface_fill`), sans marche visible sur la rive.
             // Abaissée comme la surface rendue avant une marche (jamais sous
             // le bloc d'eau : pas de fuite).
-            if level.ceil() > sea && !lake {
+            if level.ceil() > sea && !lake && !s.dry {
                 lower = lower.max(levee(level.ceil() - drop_at(level.ceil()), e));
             }
 
             if best.is_none_or(|b| edge < b.4) {
                 let depth = s.depth.0 + (s.depth.1 - s.depth.0) * t;
-                best = Some((dist, hw, depth, level, edge));
+                best = Some((dist, hw, depth, level, edge, s.dry));
             }
         }
-        let (dist, hw, depth, level, edge) = best?;
+        let (dist, hw, depth, level, edge, dry) = best?;
+        if dry {
+            // Oued : lit de sable plat, en léger berceau, jamais sous le
+            // dessus de l'eau d'un tronçon voisin encore en eau (pas de
+            // fuite là où la rivière s'assèche).
+            let floor = level.floor() + 1.0;
+            let mut h = if upper.is_finite() { smooth_min(height, upper, CARVE_SMOOTHING) } else { height };
+            h = h.max(lower);
+            let in_bed = edge < 0.0;
+            if in_bed {
+                let u = (dist / hw).clamp(0.0, 1.0);
+                h = h.min(floor + 0.6 * u * u);
+            }
+            return Some(RiverColumn { height: h.max(lower), water: SEA_LEVEL, in_bed: false, dry_bed: in_bed });
+        }
 
         let water = level.floor();
         // Bord du lit sous la surface rendue (abaissée avant une marche).
@@ -1411,6 +1638,7 @@ impl RiverNetwork {
             height: h,
             water: if near { (water as usize).max(SEA_LEVEL) } else { SEA_LEVEL },
             in_bed,
+            dry_bed: false,
         })
     }
 
@@ -1474,6 +1702,16 @@ impl RiverNetwork {
     /// (position déformée : rives irrégulières) ; la colonne est dans le lac
     /// au-delà de `LAKE_CORE`.
     pub fn lake_at(&self, x: i64, z: i64) -> Option<(usize, f64)> {
+        self.basin_at(&self.lake, x, z)
+    }
+
+    /// Désert de sel (lac asséché des régions arides) en (x, z) : (niveau du
+    /// fond, appartenance 0..1), même forme que les lacs (`lake_at`).
+    pub fn playa_at(&self, x: i64, z: i64) -> Option<(usize, f64)> {
+        self.basin_at(&self.playa, x, z)
+    }
+
+    fn basin_at(&self, cells: &[f32], x: i64, z: i64) -> Option<(usize, f64)> {
         let cell = |v: i64| (v - origin()).div_euclid(RIVER_CELL);
         let (cx, cz) = (cell(x), cell(z));
         let last = self.n as i64 - 1;
@@ -1481,7 +1719,7 @@ impl RiverNetwork {
         let mut found = false;
         'search: for iz in (cz - reach).max(0)..=(cz + reach).min(last) {
             for ix in (cx - reach).max(0)..=(cx + reach).min(last) {
-                if !self.lake[iz as usize * self.n + ix as usize].is_nan() {
+                if !cells[iz as usize * self.n + ix as usize].is_nan() {
                     found = true;
                     break 'search;
                 }
@@ -1500,7 +1738,7 @@ impl RiverNetwork {
         for iz in (cz - reach).max(0)..=(cz + reach).min(last) {
             for ix in (cx - reach).max(0)..=(cx + reach).min(last) {
                 let i = iz as usize * self.n + ix as usize;
-                let level = self.lake[i];
+                let level = cells[i];
                 if level.is_nan() {
                     continue;
                 }
@@ -1538,6 +1776,9 @@ impl RiverNetwork {
         let mut best: Option<(f64, (f64, f64), f64, f64)> = None;
         let mut turbulence: f64 = 0.0;
         for s in segments {
+            if s.dry || s.tint.frozen > 0.5 {
+                continue; // lit à sec ou gelé : ni eau vive, ni bruit
+            }
             let (abx, abz) = (s.b.0 - s.a.0, s.b.1 - s.a.1);
             let len2 = (abx * abx + abz * abz).max(1e-9);
             let len = len2.sqrt();
@@ -1649,6 +1890,9 @@ impl RiverNetwork {
     pub fn waterfalls_in(segments: &[RiverSegment]) -> Vec<Waterfall> {
         let mut falls: Vec<Waterfall> = Vec::new();
         for s in segments {
+            if s.dry || s.tint.frozen > 0.5 {
+                continue; // lit à sec ou gelé : ni eau vive, ni bruit
+            }
             let (abx, abz) = (s.b.0 - s.a.0, s.b.1 - s.a.1);
             let len = (abx * abx + abz * abz).sqrt();
             let drop = s.level.0 - s.level.1;
@@ -1683,10 +1927,13 @@ impl RiverNetwork {
 
     /// Lit le plus proche de (x, z) parmi `segments` : (distance au bord du
     /// lit, négative dedans ; niveau de l'eau ; caractère de l'eau).
-    pub fn nearest_bed(x: f64, z: f64, segments: &[RiverSegment]) -> Option<(f64, f64, WaterTint)> {
+    pub fn nearest_bed(x: f64, z: f64, segments: &[RiverSegment], min_flow: f32) -> Option<(f64, f64, WaterTint)> {
         let (qx, qz) = warp(x, z);
         let mut best: Option<(f64, f64, WaterTint)> = None;
         for s in segments {
+            if s.dry || s.flow < min_flow {
+                continue; // lit à sec : pas d'eau
+            }
             let (abx, abz) = (s.b.0 - s.a.0, s.b.1 - s.a.1);
             let len2 = (abx * abx + abz * abz).max(1e-9);
             let t = (((qx - s.a.0) * abx + (qz - s.a.1) * abz) / len2).clamp(0.0, 1.0);
@@ -1728,6 +1975,9 @@ impl RiverNetwork {
         let (qx, qz) = warp(x, z);
         let mut river: f64 = 0.0;
         for s in &segments {
+            if s.dry || s.tint.frozen > 0.5 {
+                continue; // lit à sec ou gelé : ni eau vive, ni bruit
+            }
             if (s.still.0 + s.still.1) > 1.0 {
                 continue; // eau dormante : silencieuse
             }

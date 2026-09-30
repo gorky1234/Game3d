@@ -59,7 +59,7 @@ const SSR_STEPS: i32 = 28;
 // Épaisseur d'eau (blocs, le long du regard) sous laquelle la surface
 // s'efface complètement, et au-delà de laquelle elle est entière.
 // Épaisseur d'eau (blocs) au-delà de laquelle il n'y a plus de caustiques.
-const CAUSTIC_DEPTH: f32 = 2.5;
+const CAUSTIC_DEPTH: f32 = 4.0;
 const SHORE_FADE: vec2<f32> = vec2<f32>(0.1, 1.2);
 
 // Contribution (gradient de hauteur) d'une onde sinusoïdale.
@@ -129,19 +129,38 @@ fn rain_ripples(p: vec2<f32>, t: f32, rain: f32) -> vec2<f32> {
     return g * 0.35;
 }
 
-// Reflets de lumière au fond de l'eau peu profonde (caustiques) : réseau de
-// lignes brillantes, là où deux motifs de bruit qui dérivent se croisent à
-// mi-valeur. `q` : point du fond ; `drift` : entraînement par le courant.
-fn caustics(q: vec2<f32>, t: f32, drift: vec2<f32>) -> f32 {
-    // Deux réseaux à des échelles proches (maille de ~0,5 bloc), le plus
-    // fort des deux : un filet dense de cellules, pas quelques longues
-    // lignes.
-    let a = int_value_noise(q * 2.4 + vec2(t * 0.35, t * 0.2) - drift);
-    let b = int_value_noise(q * 3.1 + vec2(-t * 0.28, t * 0.37) - drift * 1.3 + 5.7);
-    let c = int_value_noise(q * 2.7 + vec2(t * 0.22, -t * 0.31) - drift * 1.1 + 11.3);
-    let l1 = 1.0 - abs(a + b - 1.0) * 2.0;
-    let l2 = 1.0 - abs(b + c - 1.0) * 2.0;
-    return pow(clamp(max(l1, l2), 0.0, 1.0), 5.0);
+// Reflets de lumière au fond de l'eau peu profonde (caustiques) : filet de
+// cellules brillantes. Bords des cellules de Voronoï (écart entre les deux
+// points les plus proches) dont les points oscillent : les mailles se
+// déforment en permanence, comme sous des vagues. Deux réseaux décalés
+// superposés (mailles de ~0,7 et ~0,45 bloc). `drift` : courant.
+fn caustic_layer(q: vec2<f32>, t: f32) -> f32 {
+    let cell = floor(q);
+    var d1 = 9.0;
+    var d2 = 9.0;
+    for (var dx = -1; dx <= 1; dx++) {
+        for (var dz = -1; dz <= 1; dz++) {
+            let c = cell + vec2(f32(dx), f32(dz));
+            let h = vec2(hash2(c), hash2(c + 7.3));
+            let point = c + 0.5 + 0.4 * sin(t * (0.8 + 0.6 * h) + h * 6.2832);
+            let d = length(q - point);
+            if d < d1 {
+                d2 = d1;
+                d1 = d;
+            } else if d < d2 {
+                d2 = d;
+            }
+        }
+    }
+    return 1.0 - smoothstep(0.0, 0.12, d2 - d1);
+}
+
+fn caustics(p: vec2<f32>, t: f32, drift: vec2<f32>) -> f32 {
+    // Mailles courbes (déformées par un bruit lent), pas des polygones.
+    let q = p + vec2(int_value_noise(p * 0.8 + t * 0.1), int_value_noise(p * 0.8 + 5.1 - t * 0.1)) * 0.7;
+    let a = caustic_layer(q * 1.4 - drift, t);
+    let b = caustic_layer(q * 2.2 - drift * 1.3 + 3.7, t * 1.3);
+    return a * 0.7 + a * b * 0.6 + b * 0.25;
 }
 
 // Débris qui flottent au fil du courant (feuilles, brindilles, écume) :
@@ -384,9 +403,17 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     flow = in.color.xy;
     turbulence = clamp(in.color.z, 0.0, 1.0);
 #endif
+    // Rivière gelée (1er canal d'UV, voir `mark_water_tint`) : ni courant,
+    // ni vagues, ni écume ; surface de glace (plus bas).
+    var frozen = 0.0;
+#ifdef VERTEX_UVS_A
+    frozen = clamp(in.uv.x, 0.0, 1.0);
+#endif
+    flow *= 1.0 - frozen;
+    turbulence *= 1.0 - frozen;
     // Pluie : rivières en crue, plus rapides (ronds à la surface, eau plus
     // trouble : plus bas).
-    let rain = clamp(water.weather.x, 0.0, 1.0);
+    let rain = clamp(water.weather.x, 0.0, 1.0) * (1.0 - frozen);
     flow *= 1.0 + 0.6 * rain;
     let speed = length(flow);
     let flow_dir = select(vec2(1.0, 0.0), flow / max(speed, 1e-4), speed > 1e-3);
@@ -414,6 +441,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef VERTEX_COLORS
         g += swell(p, t, swell_amplitude(in.color.a)).yz;
 #endif
+        g *= 1.0 - frozen;
         if rain > 0.02 {
             g += rain_ripples(p, t, rain) * (1.0 / (1.0 + dist / 20.0));
         }
@@ -451,7 +479,18 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // couvrait de grandes étendues d'une nappe d'écume grise.
     let near_shore = 1.0 - smoothstep(0.05, 0.7, depth);
     var leaf = 0.0;
-    var foam = clamp(near_shore * (n * 1.5 - 0.5 + 0.7 * rolling), 0.0, 1.0) * 0.85;
+    // Vagues d'écume : eau libre seulement (mer, grands lacs). Sur les
+    // berges d'une rivière, la mince pellicule d'eau sur la berge arrondie
+    // en faisait une bande blanchâtre le long du bord.
+    var openness = 1.0;
+#ifdef VERTEX_COLORS
+    openness = in.color.a;
+#endif
+    // Eau « enclose » : rivière (courant), mare ou petit lac (peu d'eau
+    // alentour). Pas la mer.
+    let enclosed = max(max(river, frozen), 1.0 - smoothstep(0.75, 0.95, openness));
+    let shore_foam = mix(1.0, 0.15, enclosed);
+    var foam = clamp(near_shore * (n * 1.5 - 0.5 + 0.7 * rolling), 0.0, 1.0) * 0.85 * shore_foam;
 
     // Rivière : traînées d'écume emportées par le courant (plus nombreuses en
     // eau vive), bouillonnement autour des cascades et des rapides.
@@ -549,13 +588,13 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     if thickness < CAUSTIC_DEPTH && in.world_normal.y > 0.5 {
         let clarity = (1.0 - silt) * (1.0 - 0.7 * tannin) * (1.0 - flood);
         let near = 1.0 - smoothstep(20.0, 45.0, length(P - view.world_position));
-        let shallow = smoothstep(0.08, 0.3, thickness) * (1.0 - smoothstep(CAUSTIC_DEPTH * 0.4, CAUSTIC_DEPTH, thickness));
+        let shallow = smoothstep(0.08, 0.3, thickness) * (1.0 - smoothstep(CAUSTIC_DEPTH * 0.25, CAUSTIC_DEPTH, thickness));
         let strength = clarity * near * shallow;
         if strength > 0.01 {
             // Point du fond : sous la surface, le long du regard.
             let ground = P + normalize(P - view.world_position) * thickness;
             let c = caustics(ground.xz * 1.1, t, flow * t * 0.15);
-            lit_below *= 1.0 + c * 1.8 * strength;
+            lit_below *= 1.0 + c * 2.6 * strength;
         }
     }
     var body_input = pbr_input;
@@ -648,6 +687,23 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // Feuilles : pas de reflet de l'eau (matière mate posée dessus).
     out.color = vec4(volume * mix(1.0 - fresnel, 1.0, leaf) + reflection * (1.0 - leaf), 1.0);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    // Glace : blanc bleuté, fissures sombres, plaques de neige poudreuse,
+    // un peu translucide (le fond transparaît là où la glace est nue).
+    if frozen > 0.01 {
+        let crack_a = abs(int_value_noise(p * 0.45) - 0.5);
+        let crack_b = abs(int_value_noise(p * 1.3 + 17.0) - 0.5);
+        let cracks = max(1.0 - smoothstep(0.0, 0.025, crack_a), (1.0 - smoothstep(0.0, 0.02, crack_b)) * 0.6);
+        let snow = smoothstep(0.45, 0.75, int_value_noise(p * 0.18 + 3.0) * 0.7 + int_value_noise(p * 0.9) * 0.3);
+        var ice_input = pbr_input;
+        ice_input.N = normalize(vec3(0.0, 1.0, 0.0) + vec3(int_value_noise(p * 2.0) - 0.5, 0.0, int_value_noise(p * 2.0 + 9.0) - 0.5) * 0.06);
+        ice_input.material.base_color = vec4(mix(mix(vec3(0.55, 0.68, 0.76), vec3(0.3, 0.4, 0.48), cracks), vec3(0.92, 0.94, 0.96), snow), 1.0);
+        ice_input.material.perceptual_roughness = mix(0.2, 0.8, snow);
+        ice_input.material.reflectance = vec3(0.4);
+        let ice = apply_pbr_lighting(ice_input).rgb;
+        let ice_color = mix(ice, below * 0.6, 0.18 * (1.0 - snow) * (1.0 - cracks));
+        let ice_fogged = main_pass_post_lighting_processing(ice_input, vec4(ice_color, 1.0)).rgb;
+        out.color = vec4(mix(out.color.rgb, ice_fogged, frozen), out.color.a);
+    }
     // Rivage : là où la couche d'eau devient infime, la surface s'efface
     // dans l'image du fond. La surface est découpée selon les blocs et
     // déborde un peu sur le terrain lisse (arrondi) des berges ; vue de
@@ -658,10 +714,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef DEPTH_PREPASS
     // Eau enclose seulement (rivières, mares, lacs : ouverture faible, voir
     // `mark_water_openness`) : en mer, l'écume des vagues sur la plage reste.
-    var enclosed = 1.0;
-#ifdef VERTEX_COLORS
-    enclosed = 1.0 - smoothstep(0.5, 0.8, in.color.a);
-#endif
     if in.world_normal.y > 0.5 && is_front && enclosed > 0.0 {
         let edge = mix(1.0, smoothstep(SHORE_FADE.x, SHORE_FADE.y, thickness), enclosed);
         // Image du fond sans réfraction : décalée, elle dessinait un morceau

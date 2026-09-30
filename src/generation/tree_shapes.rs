@@ -64,6 +64,18 @@ pub enum TreeKind {
     Giant,
     /// Grande fougère (sous-bois de jungle).
     BigFern,
+    /// Jungle : géant émergent (fût lisse très haut, contreforts, houppier
+    /// plat en parasol au-dessus de la canopée), arbre de la canopée, petit
+    /// arbre du sous-étage, palmier de sous-bois.
+    Emergent,
+    JungleCanopy,
+    Understory,
+    JunglePalm,
+    /// Sous-bois de jungle (rendu surtout en grandes feuilles) : bananier
+    /// sauvage, héliconia (hampes rouges), philodendron (feuilles au sol).
+    Banana,
+    Heliconia,
+    Philodendron,
     /// Rendu seulement, sans blocs : touffe de roseaux (berges, eau peu
     /// profonde) ; nénuphars à la surface d'une eau calme de `depth` blocs ;
     /// varech (mer tempérée) de `depth` blocs d'eau ; corail et herbier marin.
@@ -88,6 +100,30 @@ pub struct Segment {
 pub struct LeafBlob {
     pub center: Vec3,
     pub radius: Vec3,
+}
+
+/// Texture d'une carte (voir `Card`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CardKind {
+    PalmFrond,
+    Broadleaf,
+    Liana,
+    Heliconia,
+}
+
+/// Grande feuille, palme, liane ou fleur rendue en bande texturée (voir
+/// tree_mesh.rs) : part de `base` dans la direction `dir` sur `length`,
+/// largeur `width` (dans la direction `side`), le bout retombe de
+/// `droop` x la longueur.
+#[derive(Clone, Copy, Debug)]
+pub struct Card {
+    pub kind: CardKind,
+    pub base: Vec3,
+    pub dir: Vec3,
+    pub side: Vec3,
+    pub length: f32,
+    pub width: f32,
+    pub droop: f32,
 }
 
 /// Étage de branches de sapin : hauteur et rayon.
@@ -125,6 +161,69 @@ pub struct TreeSkeleton {
     pub kelp: f32,
     pub coral: f32,
     pub seagrass: f32,
+    /// Grandes feuilles, palmes, lianes, fleurs (voir `Card`).
+    pub cards: Vec<Card>,
+    /// Feuillage tropical (grandes feuilles vernies, vert sombre).
+    pub tropical: bool,
+}
+
+/// Carte partant de `base` dans la direction horizontale d'angle `azimuth`,
+/// relevée de `elevation` (radians).
+fn card(kind: CardKind, base: Vec3, azimuth: f32, elevation: f32, length: f32, width: f32, droop: f32) -> Card {
+    let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
+    let dir = (out * elevation.cos() + Vec3::Y * elevation.sin()).normalize();
+    Card { kind, base, dir, side: Vec3::new(-azimuth.sin(), 0.0, azimuth.cos()), length, width, droop }
+}
+
+/// Couronne de `count` cartes autour de `base` (palmier, bananier...).
+fn rosette(sk: &mut TreeSkeleton, tx: i64, tz: i64, salt: u64, kind: CardKind, base: Vec3, count: i32, elevation: (f32, f32), length: (f32, f32), width: f32, droop: f32) {
+    let start = rand_f(tx, tz, salt) * TAU;
+    for i in 0..count {
+        let s = salt + 10 + i as u64 * 3;
+        let a = start + i as f32 / count as f32 * TAU + (rand_f(tx, tz, s) - 0.5) * 0.6;
+        let e = elevation.0 + (elevation.1 - elevation.0) * rand_f(tx, tz, s + 1);
+        let l = length.0 + (length.1 - length.0) * rand_f(tx, tz, s + 2);
+        sk.cards.push(card(kind, base, a, e, l, width * (0.85 + 0.3 * rand_f(tx, tz, s + 2)), droop));
+    }
+}
+
+/// Lianes qui pendent des branches hautes (jusqu'à `count`), presque
+/// jusqu'au sol, et une qui grimpe le long du tronc.
+fn lianas(sk: &mut TreeSkeleton, tx: i64, tz: i64, salt: u64, count: i32, trunk_top: f32) {
+    let anchors: Vec<Vec3> = sk.wood.iter()
+        .filter(|w| w.b.y > trunk_top * 0.6 && Vec3::new(w.b.x, 0.0, w.b.z).length() > 1.5)
+        .map(|w| w.b)
+        .collect();
+    for i in 0..count.min(anchors.len() as i32) {
+        let s = salt + i as u64 * 5;
+        let top = anchors[(rand_f(tx, tz, s) * anchors.len() as f32) as usize % anchors.len()];
+        let length = top.y * (0.55 + 0.4 * rand_f(tx, tz, s + 1));
+        let a = rand_f(tx, tz, s + 2) * TAU;
+        sk.cards.push(Card { kind: CardKind::Liana, base: top, dir: -Vec3::Y, side: Vec3::new(a.cos(), 0.0, a.sin()), length, width: 1.2, droop: 0.0 });
+    }
+    // Liane plaquée contre le tronc (face vers l'extérieur).
+    if rand01(tx, tz, salt + 99) < 0.8 {
+        let a = rand_f(tx, tz, salt + 98) * TAU;
+        let out = Vec3::new(a.cos(), 0.0, a.sin());
+        let r = sk.wood.first().map_or(0.5, |w| w.r0);
+        sk.cards.push(Card { kind: CardKind::Liana, base: out * (r + 0.08) + Vec3::Y * trunk_top * 0.7, dir: -Vec3::Y, side: Vec3::new(-a.sin(), 0.0, a.cos()), length: trunk_top * 0.7, width: 1.0, droop: 0.0 });
+    }
+}
+
+/// Contreforts des géants tropicaux : 4 à 6 grandes racines en lame qui
+/// partent haut sur le fût et s'étalent loin au sol.
+fn buttresses(sk: &mut TreeSkeleton, tx: i64, tz: i64, r0: f32, h: f32) {
+    let n = rand_range(tx, tz, 720, 4, 6);
+    let start = rand_f(tx, tz, 721) * TAU;
+    for i in 0..n {
+        let a = start + i as f32 / n as f32 * TAU + (rand_f(tx, tz, 722 + i as u64) - 0.5) * 0.5;
+        let dir = Vec3::new(a.cos(), 0.0, a.sin());
+        let up = h * (0.08 + 0.05 * rand_f(tx, tz, 730 + i as u64));
+        let reach = r0 * (2.8 + rand_f(tx, tz, 740 + i as u64) * 1.4);
+        let mid = dir * reach * 0.45 + Vec3::Y * up * 0.35;
+        sk.wood.push(Segment { a: dir * r0 * 0.5 + Vec3::Y * up, b: mid, r0: r0 * 0.42, r1: r0 * 0.3 });
+        sk.wood.push(Segment { a: mid, b: dir * reach - Vec3::Y * 0.4, r0: r0 * 0.3, r1: r0 * 0.08 });
+    }
 }
 
 /// Contreforts au pied du tronc (rayon `r0`) : 3 ou 4 racines courtes qui
@@ -378,6 +477,73 @@ impl TreeInstance {
             }
             TreeKind::Fern => {
                 sk.fern = 0.7 + rand_f(tx, tz, 110) * 0.6;
+            }
+            TreeKind::Emergent => {
+                // Fût lisse et droit qui perce la canopée, branches seulement
+                // tout en haut, presque horizontales : houppier en parasol.
+                let h = rand_range(tx, tz, 800, 28, 38) as f32;
+                let r0 = 0.9 + rand_f(tx, tz, 801) * 0.35;
+                let top = trunk(&mut sk, tx, tz, 802, h, r0, 0.4);
+                buttresses(&mut sk, tx, tz, r0, h);
+                let n = rand_range(tx, tz, 803, 5, 6);
+                let first = sk.blobs.len();
+                crown(&mut sk, tx, tz, 804, top, n, 1.2, 5.0, 0.4, 2, true);
+                for blob in &mut sk.blobs[first..] {
+                    blob.radius.y *= 0.5;
+                    blob.radius.x *= 1.15;
+                    blob.radius.z *= 1.15;
+                }
+                lianas(&mut sk, tx, tz, 805, rand_range(tx, tz, 806, 4, 7), h);
+                sk.tropical = true;
+            }
+            TreeKind::JungleCanopy => {
+                // Tronc droit, houppier large et un peu aplati (la canopée
+                // continue), quelques lianes.
+                let h = rand_range(tx, tz, 820, 14, 22) as f32 * (0.8 + 0.2 * rand_f(tx, tz, 821));
+                let r0 = 0.35 + h * 0.02;
+                let top = trunk(&mut sk, tx, tz, 822, h, r0, r0 * 0.55);
+                roots(&mut sk, tx, tz, r0);
+                let first = sk.blobs.len();
+                crown(&mut sk, tx, tz, 823, top, rand_range(tx, tz, 824, 3, 4), 0.85, 3.0 + h * 0.2, r0 * 0.5, 2, true);
+                for blob in &mut sk.blobs[first..] {
+                    blob.radius.y *= 0.7;
+                }
+                lianas(&mut sk, tx, tz, 825, rand_range(tx, tz, 826, 1, 3), h);
+                sk.tropical = true;
+            }
+            TreeKind::Understory => {
+                // Petit arbre de l'ombre : tronc fin, peu de branches, grandes
+                // feuilles.
+                let h = rand_range(tx, tz, 840, 4, 8) as f32;
+                let top = trunk(&mut sk, tx, tz, 841, h, 0.16, 0.08);
+                crown(&mut sk, tx, tz, 842, top, rand_range(tx, tz, 843, 2, 3), 0.75, 1.8 + h * 0.25, 0.07, 1, true);
+                sk.tropical = true;
+            }
+            TreeKind::JunglePalm => {
+                // Stipe fin et un peu courbe, couronne de palmes arquées.
+                let h = 2.5 + rand_f(tx, tz, 860) * 4.5;
+                let a = rand_f(tx, tz, 861) * TAU;
+                let lean = Vec3::new(a.cos(), 0.0, a.sin()) * (0.05 + 0.1 * rand_f(tx, tz, 862));
+                let mid = Vec3::new(0.0, h * 0.5, 0.0) + lean * h * 0.2;
+                let top = Vec3::new(0.0, h, 0.0) + lean * h;
+                sk.wood.push(Segment { a: Vec3::new(0.0, -0.4, 0.0), b: mid, r0: 0.16, r1: 0.13 });
+                sk.wood.push(Segment { a: mid, b: top, r0: 0.13, r1: 0.1 });
+                rosette(&mut sk, tx, tz, 863, CardKind::PalmFrond, top, rand_range(tx, tz, 864, 8, 12), (0.15, 1.0), (2.2, 3.4), 1.3, 0.45);
+            }
+            TreeKind::Banana => {
+                // Pseudo-tronc court, grandes feuilles arquées déchirées.
+                let h = 1.2 + rand_f(tx, tz, 880) * 1.4;
+                sk.wood.push(Segment { a: Vec3::new(0.0, -0.3, 0.0), b: Vec3::new(0.0, h, 0.0), r0: 0.2, r1: 0.14 });
+                rosette(&mut sk, tx, tz, 881, CardKind::Broadleaf, Vec3::new(0.0, h, 0.0), rand_range(tx, tz, 882, 6, 9), (0.5, 1.2), (1.9, 2.8), 0.95, 0.35);
+            }
+            TreeKind::Heliconia => {
+                // Touffe de feuilles dressées et 2 à 4 hampes florales.
+                rosette(&mut sk, tx, tz, 900, CardKind::Broadleaf, Vec3::ZERO, rand_range(tx, tz, 901, 4, 6), (1.0, 1.35), (1.2, 1.8), 0.55, 0.15);
+                rosette(&mut sk, tx, tz, 910, CardKind::Heliconia, Vec3::ZERO, rand_range(tx, tz, 911, 2, 4), (1.2, 1.45), (1.0, 1.5), 0.75, 0.05);
+            }
+            TreeKind::Philodendron => {
+                // Grandes feuilles basses qui s'étalent au ras du sol.
+                rosette(&mut sk, tx, tz, 920, CardKind::Broadleaf, Vec3::ZERO, rand_range(tx, tz, 921, 5, 8), (0.35, 0.8), (0.9, 1.5), 0.75, 0.3);
             }
             TreeKind::BigFern => {
                 sk.fern = 1.6 + rand_f(tx, tz, 111) * 0.9;

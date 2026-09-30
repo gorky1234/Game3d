@@ -229,14 +229,17 @@ fn plant_for(biome: BiomeType, tx: i64, tz: i64) -> Option<TreeKind> {
         BiomeType::Savanna => {
             if pick < 0.7 { TreeKind::BigOak } else if pick < 0.8 { TreeKind::Dead } else { TreeKind::Oak { trunk_min: 5, trunk_max: 8 } }
         }
-        // Jungle : géants émergents au-dessus d'une canopée haute.
+        // Jungle : géants émergents épars au-dessus d'une canopée continue,
+        // petits arbres et palmiers du sous-étage.
         BiomeType::Jungle => {
-            if pick < 0.3 {
-                TreeKind::Oak { trunk_min: 17, trunk_max: 24 }
-            } else if pick < 0.6 {
-                TreeKind::BigOak
+            if pick < 0.1 {
+                TreeKind::Emergent
+            } else if pick < 0.55 {
+                TreeKind::JungleCanopy
+            } else if pick < 0.8 {
+                TreeKind::Understory
             } else {
-                TreeKind::Oak { trunk_min: 10, trunk_max: 15 }
+                TreeKind::JunglePalm
             }
         }
         BiomeType::Badlands => if pick < 0.5 { TreeKind::Dead } else { TreeKind::Cactus },
@@ -261,7 +264,7 @@ fn undergrowth_density(biome: BiomeType) -> (f64, f64, f64) {
         BiomeType::Beach => (0.0, 0.012, 0.0015),
         BiomeType::Desert => (0.0, 0.025, 0.0),
         BiomeType::Taiga => (0.2, 0.05, 0.03),
-        BiomeType::Jungle => (0.6, 0.02, 0.04),
+        BiomeType::Jungle => (0.85, 0.02, 0.05),
         BiomeType::Savanna => (0.0, 0.03, 0.002),
         BiomeType::Badlands => (0.0, 0.06, 0.0),
         _ => (0.0, 0.0, 0.0),
@@ -326,7 +329,9 @@ fn ground_flora(biome: BiomeType, variant: Variant, surface: BlockType, temperat
             // Oasis.
             _ => (ground_cover_density(surface), BlockType::TallGrass),
         },
-        BiomeType::Jungle => (if surface == BlockType::Grass { 0.9 } else { 0.4 }, BlockType::TallGrass),
+        // Jungle : herbe dans les clairières ; sous la canopée (litière),
+        // quelques coussins de mousse seulement.
+        BiomeType::Jungle => if surface == BlockType::Grass { (0.9, BlockType::TallGrass) } else { (0.12, BlockType::Moss) },
         _ => {
             let density = ground_cover_density(surface);
             // Alpages : fleurs bleues et violettes (gentianes, campanules).
@@ -564,7 +569,15 @@ pub fn place_vegetation(
                 Some(riparian_plant(sea_temperature, pick))
             } else if is_tree {
                 let (variant, weight) = biomes_map.variant(tx, tz, biome);
-                let variant_tree = if rand01(tx, tz, 62) < weight { variant_plant(variant, pick) } else { None };
+                // Forêt géante de la jungle : géants tropicaux (émergents et
+                // canopée), pas les séquoias des forêts tempérées.
+                let variant_tree = if rand01(tx, tz, 62) >= weight {
+                    None
+                } else if biome == BiomeType::Jungle && variant == Variant::GiantForest {
+                    Some(if pick < 0.35 { TreeKind::Emergent } else if pick < 0.85 { TreeKind::JungleCanopy } else { TreeKind::Understory })
+                } else {
+                    variant_plant(variant, pick)
+                };
                 let oasis = matches!(biome, BiomeType::Desert | BiomeType::Badlands) && biomes_map.oasis(tx, tz).1 > 0.3;
                 if oasis {
                     Some(if pick < 0.75 { TreeKind::Palm } else { TreeKind::Bush })
@@ -616,8 +629,26 @@ pub fn place_vegetation(
             } else if roll < rock + log {
                 TreeKind::FallenLog
             } else if roll < rock + log + fern {
-                // Jungle : grandes fougères arborescentes.
-                if rand01(cell_x, cell_z, 505) < 0.5 && biomes_map.get_biome(tx, tz) == BiomeType::Jungle { TreeKind::BigFern } else { TreeKind::Fern }
+                // Jungle : sous-bois de grandes feuilles (fougères géantes,
+                // philodendrons, bananiers, héliconias, jeunes palmiers).
+                if biomes_map.get_biome(tx, tz) == BiomeType::Jungle {
+                    let pick = rand01(cell_x, cell_z, 505);
+                    if pick < 0.22 {
+                        TreeKind::BigFern
+                    } else if pick < 0.47 {
+                        TreeKind::Philodendron
+                    } else if pick < 0.62 {
+                        TreeKind::Banana
+                    } else if pick < 0.84 {
+                        TreeKind::Heliconia
+                    } else if pick < 0.92 {
+                        TreeKind::JunglePalm
+                    } else {
+                        TreeKind::Fern
+                    }
+                } else {
+                    TreeKind::Fern
+                }
             } else {
                 continue;
             };

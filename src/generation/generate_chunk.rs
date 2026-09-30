@@ -77,7 +77,14 @@ pub async fn generate_chunk(x: i32, z: i32, biomes_map: &BiomeMap, height_map: &
             let height = heightmap[local_x][local_z];
             let column = columns[local_x][local_z];
             let info = biomes_map.surface_info(world_x, world_z, biome);
-            let surface = surface_block(height, biome, &biome_data, world_x, world_z, &info);
+            let surface = if column.salt && height >= column.water {
+                BlockType::Salt
+            } else if column.dry_bed && height >= column.water {
+                // Oued : sable ou galets.
+                river_bed_block(biome, world_x, world_z)
+            } else {
+                surface_block(height, biome, &biome_data, world_x, world_z, &info)
+            };
             let province = Province::of(biome, info.volcanic);
 
             // Toit de roche au-dessus des grottes : sous la surface de la
@@ -286,7 +293,9 @@ pub fn surface_block(height: usize, biome: BiomeType, biome_data: &Biome, world_
         BiomeType::Mountain => if t < SCREE_TEMPERATURE { BlockType::Gravel } else { BlockType::Grass },
         BiomeType::Savanna => if patch() > 0.68 { BlockType::Dirt } else { BlockType::Grass },
         BiomeType::Taiga => if patch() > 0.62 { BlockType::Grass } else { BlockType::Podzol },
-        BiomeType::Jungle => if patch() > 0.7 { BlockType::Podzol } else { BlockType::Grass },
+        // Jungle : litière de feuilles mortes sous la canopée, herbe dans
+        // quelques clairières.
+        BiomeType::Jungle => if patch() > 0.74 { BlockType::Grass } else { BlockType::LeafLitter },
 
         _ => biome_data.surface_block,
     }

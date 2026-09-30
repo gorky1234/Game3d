@@ -10,7 +10,7 @@ use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use crate::constants::CHUNK_SIZE;
 use crate::generation::procedural;
-use crate::generation::tree_shapes::{Segment, TreeInstance, TreeKind};
+use crate::generation::tree_shapes::{Card, CardKind, Segment, TreeInstance, TreeKind};
 use crate::world::neighborhood::Neighborhood;
 use crate::texture::TextureAtlasMaterial;
 use crate::world::block::BlockType;
@@ -349,6 +349,54 @@ fn fern(b: &mut Builder, origin: Vec3, size: f32, rect: Rect, seed: (i64, i64)) 
     }
 }
 
+/// Carte (voir `Card`) : bande courbée en 4 tronçons, base en bas de la
+/// tuile, bout qui retombe. Liane : tuile répétée le long de la bande
+/// (raccordable verticalement), deux bandes croisées.
+fn card_strip(b: &mut Builder, origin: Vec3, card: &Card, rect: Rect, tint: Vec3, seed: (i64, i64, u32)) {
+    let (u0, u1) = (rect.0[0], rect.0[0] + rect.1[0]);
+    let (v_top, v_bottom) = (rect.0[1], rect.0[1] + rect.1[1]);
+    let phase = hash(seed.0, seed.1, seed.2) + crate::render::plant_mesh::GROUND_PLANT;
+    let liana = card.kind == CardKind::Liana;
+    let at = |t: f32| origin + card.base + card.dir * card.length * t - Vec3::Y * card.droop * card.length * t * t;
+    // Lianes : une tuile tous les 1,6 x largeur ; autres cartes : une seule
+    // tuile sur toute la longueur.
+    let repeats = if liana { (card.length / (card.width * 1.6)).ceil().max(1.0) as usize } else { 1 };
+    let sides: &[Vec3] = if liana { &[card.side, card.side.cross(Vec3::Y).normalize_or(Vec3::X)] } else { &[card.side] };
+    for &side in sides {
+        for r in 0..repeats {
+            const STEPS: usize = 4;
+            let base = b.positions.len() as u32;
+            for k in 0..=STEPS {
+                let t = (r as f32 + k as f32 / STEPS as f32) / repeats as f32;
+                let p = at(t);
+                let tangent = (at((t + 0.02).min(1.0)) - at((t - 0.02).max(0.0))).normalize_or(card.dir);
+                let mut normal = side.cross(tangent).normalize_or(Vec3::Y);
+                if normal.y < 0.0 {
+                    normal = -normal;
+                }
+                let normal = (normal + Vec3::Y * 0.4).normalize();
+                let local = k as f32 / STEPS as f32;
+                let v = v_bottom + (v_top - v_bottom) * local;
+                // Pied à l'ombre (occlusion dans l'alpha), bout plus clair.
+                let shade = if liana { 0.85 } else { 0.7 + 0.3 * t };
+                let c = (tint * shade).extend(if liana { 0.6 } else { 0.45 + 0.55 * t }).to_array();
+                let sway = if liana { [0.15 * t, phase] } else { [0.25 * t * t, phase] };
+                for (s, u) in [(-1.0, u0), (1.0, u1)] {
+                    b.positions.push((p + side * card.width * 0.5 * s).to_array());
+                    b.normals.push(normal.to_array());
+                    b.uvs.push([u, v]);
+                    b.colors.push(c);
+                    b.sway.push(sway);
+                }
+            }
+            for k in 0..STEPS as u32 {
+                let i = base + k * 2;
+                b.indices.extend_from_slice(&[i, i + 1, i + 3, i + 3, i + 2, i]);
+            }
+        }
+    }
+}
+
 /// Touffe de `count` panneaux verticaux croisés (roseaux, varech, corail,
 /// herbier), de hauteur `height` et largeur `width`, pied en `origin`.
 /// `sway` : souplesse du sommet au vent.
@@ -512,10 +560,32 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
             }
         }
 
+        // Cartes (palmes, grandes feuilles, lianes, fleurs) : de près, et les
+        // palmes aussi à moyenne distance (silhouette des palmiers).
+        for (i, c) in sk.cards.iter().enumerate() {
+            let rect = match c.kind {
+                CardKind::PalmFrond => atlas.palm_frond_uv,
+                CardKind::Broadleaf => atlas.broadleaf_uv,
+                CardKind::Liana => atlas.liana_uv,
+                CardKind::Heliconia => atlas.heliconia_uv,
+            };
+            let near_only = c.kind != CardKind::PalmFrond;
+            let (Some(rect), true) = (rect, step == 1 || (!near_only && step <= 2)) else { continue };
+            let light = 0.8 + 0.3 * hash(tree.x, tree.z, 40 + i as u32);
+            let tint = match c.kind {
+                CardKind::Heliconia => Vec3::splat(1.1),
+                _ => Vec3::new(0.85, 1.0, 0.82) * light,
+            };
+            card_strip(&mut foliage, origin, c, rect, tint, (tree.x, tree.z, 60 + i as u32));
+        }
+
         let pine = tree.kind == TreeKind::Spruce;
         let tint = if sk.willow {
             // Saule : vert tendre tirant sur le jaune.
             Vec3::new(1.0, 1.1, 0.72) * (0.8 + 0.25 * hash(tree.x, tree.z, 4))
+        } else if sk.tropical {
+            // Feuillage tropical : vert profond (la texture est déjà sombre).
+            Vec3::new(0.95, 1.1, 0.95).lerp(Vec3::new(1.05, 1.1, 0.85), hash(tree.x, tree.z, 3)) * (0.85 + 0.3 * hash(tree.x, tree.z, 4))
         } else if sk.dry {
             // Buisson sec : olive terne à brun paille.
             Vec3::new(0.95, 0.78, 0.5).lerp(Vec3::new(1.1, 0.8, 0.5), hash(tree.x, tree.z, 3)) * (0.75 + 0.2 * hash(tree.x, tree.z, 4))
@@ -603,6 +673,7 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
             foliage.quad([m - x - z, m + x - z, m + x + z, m - x + z], Vec3::Y, rect, [top; 4], [[0.05, phase]; 4]);
         }
 
+        let leaf_rect = if sk.tropical { atlas.jungle_leaf_uv.or(leaf_rect) } else { leaf_rect };
         if let (Some(rect), None) = (leaf_rect, impostor) {
             for blob in &sk.blobs {
                 let r = blob.radius;

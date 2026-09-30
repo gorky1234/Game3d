@@ -40,6 +40,8 @@ pub enum BlockType {
     IronOre,
     GoldOre,
     CopperOre,
+    /// Litière de feuilles mortes (sol des forêts tropicales).
+    LeafLitter,
 }
 
 impl BlockType {
@@ -76,6 +78,7 @@ impl BlockType {
         BlockType::IronOre,
         BlockType::GoldOre,
         BlockType::CopperOre,
+        BlockType::LeafLitter,
     ];
 
     /// Plantes rendues en croix (deux quads diagonaux, texture avec
@@ -99,6 +102,7 @@ impl BlockType {
                 | BlockType::Mud | BlockType::Podzol | BlockType::Sandstone | BlockType::Gravel | BlockType::Brick
                 | BlockType::RedSand | BlockType::Salt | BlockType::Granite | BlockType::Limestone
                 | BlockType::Basalt | BlockType::CoalOre | BlockType::IronOre | BlockType::GoldOre | BlockType::CopperOre
+                | BlockType::LeafLitter
         )
     }
 
@@ -124,6 +128,7 @@ impl BlockType {
             "minecraft:snow" => BlockType::Snow,
             "minecraft:mud" => BlockType::Mud,
             "minecraft:podzol" => BlockType::Podzol,
+            "minecraft:leaflitter" => BlockType::LeafLitter,
             "minecraft:sandstone" => BlockType::Sandstone,
             "minecraft:gravel" => BlockType::Gravel,
             "minecraft:log" => BlockType::Log,

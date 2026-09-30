@@ -115,6 +115,9 @@ const SKIRT_WIDTH: i32 = 3;
 /// Profondeur (blocs) sous la bordure où chercher une eau plus basse (pas
 /// de bordure au-dessus).
 const SKIRT_WATER_BELOW: i32 = 8;
+/// Remplissage (0..1) du bloc de surface au-dessus du plan d'eau en dessous
+/// duquel la berge est considérée au ras de l'eau (bordure posée).
+const SKIRT_MAX_FILL: f32 = 0.6;
 const SKIRT_DROP: f32 = 0.5;
 
 /// Bordure du plan d'eau sur la rive : la surface de l'eau est prolongée de
@@ -191,8 +194,22 @@ fn add_water_skirt(mesh: &mut Mesh, nb: &Neighborhood, base_y: i32, atlas: &Text
             // Terrain plein au-dessus du plan d'eau (berge haute) : bordure
             // de toute façon cachée ; eau plus bas dans la colonne (marche
             // d'une rivière) : la bordure flotterait au-dessus.
+            // Un bloc de terrain au-dessus du plan d'eau ne cache la bordure
+            // que s'il est bien rempli : les berges sont tenues pile au
+            // niveau de l'eau (bloc de surface à remplissage nul, voir
+            // `carve`), et le terrain lissé s'y arrondit sous la surface ;
+            // sans bordure, on voyait la pente de la berge sous le niveau de
+            // l'eau, entre le bord de l'eau et la rive.
             let above = nb.block(x, y + 1, z);
-            if above.is_terrain() || nb.block(x, y, z) == BlockType::Water || nb.block(x, y - 1, z) == BlockType::Water {
+            let thin_top = !nb.block(x, y + 2, z).is_terrain() && nb.surface_fill(x, z) < SKIRT_MAX_FILL;
+            let high_bank = above.is_terrain() && !thin_top;
+            // Berge au ras de l'eau : seulement le premier rang de blocs
+            // (l'arrondi du bord), sinon la bordure recouvrait les plages
+            // basses sur plusieurs blocs, bord droit compris.
+            let touches_water = above.is_terrain()
+                && (-1..=1).any(|dx| (-1..=1).any(|dz| level_at(x + dx, z + dz) == Some(y)));
+            let high_bank = high_bank || (above.is_terrain() && !touches_water);
+            if high_bank || nb.block(x, y, z) == BlockType::Water || nb.block(x, y - 1, z) == BlockType::Water {
                 continue;
             }
             // Pas au-dessus d'une eau plus basse (bassin d'une cascade,
@@ -419,8 +436,7 @@ fn fall_sheets(segments: &[RiverSegment]) -> Vec<FallSheet> {
 
 /// Ajoute la nappe `fall` au maillage d'eau de la section d'origine `origin`.
 fn add_fall_sheet(mesh: &mut Mesh, fall: &FallSheet, origin: (i32, i32, i32), atlas: &TextureAtlasMaterial) {
-    let (base_uv, size_uv) = atlas.uv_map.get(&BlockType::Water).copied().unwrap_or(([0.0, 0.0], [1.0, 1.0]));
-    let uv = [base_uv[0] + size_uv[0] * 0.5, base_uv[1] + size_uv[1] * 0.5];
+    let _ = atlas;
     // Échantillons le long du courant : partie plate, chute (resserrée près
     // du rebord, où la courbure est la plus forte), plongée.
     let mut alongs = vec![-SHEET_LEAD, -SHEET_LEAD * 0.5, 0.0];
@@ -473,7 +489,7 @@ fn add_fall_sheet(mesh: &mut Mesh, fall: &FallSheet, origin: (i32, i32, i32), at
     use bevy::mesh::VertexAttributeValues as V;
     if let Some(V::Float32x3(p)) = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION) { p.extend(positions); }
     if let Some(V::Float32x3(n)) = mesh.attribute_mut(Mesh::ATTRIBUTE_NORMAL) { n.extend(normals); }
-    if let Some(V::Float32x2(u)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) { u.extend(std::iter::repeat_n(uv, count)); }
+    if let Some(V::Float32x2(u)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) { u.extend(std::iter::repeat_n([fall.tint.frozen, 0.0], count)); }
     if let Some(V::Float32x2(u)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_1) { u.extend(std::iter::repeat_n(tint_uv(fall.tint), count)); }
     if let Some(V::Float32x4(c)) = mesh.attribute_mut(Mesh::ATTRIBUTE_COLOR) { c.extend(colors); }
     if let Some(V::Float32x4(t)) = mesh.attribute_mut(Mesh::ATTRIBUTE_TANGENT) { t.extend(std::iter::repeat_n([fall.across.x, 0.0, fall.across.y, 1.0], count)); }
@@ -494,14 +510,15 @@ fn tint_uv(tint: WaterTint) -> [f32; 2] {
 /// nulle en mer et dans les lacs.
 fn mark_water_tint(mesh: &mut Mesh, origin: (i32, i32, i32), segments: &[RiverSegment]) {
     let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) else { return };
-    let tints: Vec<[f32; 2]> = if segments.is_empty() {
-        vec![[0.0, 0.0]; positions.len()]
+    let tints: Vec<WaterTint> = if segments.is_empty() {
+        vec![WaterTint::default(); positions.len()]
     } else {
-        positions.iter().map(|p| {
-            tint_uv(RiverNetwork::water_tint(origin.0 as f64 + p[0] as f64, origin.2 as f64 + p[2] as f64, segments))
-        }).collect()
+        positions.iter().map(|p| RiverNetwork::water_tint(origin.0 as f64 + p[0] as f64, origin.2 as f64 + p[2] as f64, segments)).collect()
     };
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, tints);
+    // 1er canal d'UV (inutile pour l'eau : pas de texture) : glace (voir
+    // water.wgsl), à écrire pour tous les sommets.
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, tints.iter().map(|t| [t.frozen, 0.0]).collect::<Vec<_>>());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, tints.iter().map(|&t| tint_uv(t)).collect::<Vec<_>>());
 }
 
 /// Courant de l'eau à chaque sommet, dans le RVB de sa couleur (lu par

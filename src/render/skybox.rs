@@ -127,6 +127,7 @@ pub struct SkyboxPlugin;
 impl Plugin for SkyboxPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SkyState>()
+            .init_resource::<JungleAir>()
             .init_resource::<CloudDrift>()
             .insert_resource(CycleTimer(Timer::from_seconds(SUN_UPDATE_INTERVAL_SECS, TimerMode::Repeating)))
             // La lumière du ciel vient de la carte d'environnement ; cette
@@ -139,7 +140,7 @@ impl Plugin for SkyboxPlugin {
             })
             .add_plugins(MaterialPlugin::<CloudMaterial>::default())
             .add_systems(Startup, (setup_skybox, setup_atmosphere, setup_horizon_ring, setup_clouds))
-            .add_systems(Update, (attach_sky_environment, daylight_cycle, follow_horizon_ring, update_clouds, follow_fog_volume));
+            .add_systems(Update, (attach_sky_environment, update_jungle_air, daylight_cycle, follow_horizon_ring, update_clouds, follow_fog_volume));
     }
 }
 
@@ -226,6 +227,47 @@ pub fn fog_falloff(amount: f32) -> FogFalloff {
 
 #[derive(Component)]
 struct FogVolumeMarker;
+
+/// Air de la jungle autour du joueur (0..1, part du biome jungle, lissée
+/// dans le temps) : sous la canopée, brume humide plus dense et verdâtre
+/// (faisceaux de soleil entre les feuillages, voir `daylight_cycle`).
+#[derive(Resource, Default)]
+pub struct JungleAir {
+    pub amount: f32,
+    target: f32,
+    since_update: f32,
+}
+
+/// Renforcement de la brume volumétrique (faisceaux) et de la brume de
+/// distance en pleine jungle ; plafond de la brume volumétrique.
+const JUNGLE_VOLUME_BOOST: f32 = 2.2;
+const JUNGLE_FOG_BOOST: f32 = 2.5;
+const JUNGLE_VOLUME_MAX_DENSITY: f32 = 0.011;
+/// Temps (s) pour passer de la lisière à la pleine jungle.
+const JUNGLE_AIR_FADE: f32 = 4.0;
+
+fn update_jungle_air(
+    time: Res<Time>,
+    biome_map: Option<Res<crate::generation::chunk_generation_logic::BiomeMapArc>>,
+    players: Query<&Transform, With<Player>>,
+    mut air: ResMut<JungleAir>,
+) {
+    let dt = time.delta_secs();
+    air.since_update += dt;
+    if air.since_update >= 0.5 {
+        air.since_update = 0.0;
+        if let (Ok(player), Some(map)) = (players.single(), biome_map) {
+            let (x, z) = (player.translation.x as i64, player.translation.z as i64);
+            air.target = map.0.relief_weights(x, z).iter()
+                .filter(|(biome, _)| *biome == crate::generation::biome::BiomeType::Jungle)
+                .map(|&(_, w)| w as f32)
+                .sum::<f32>()
+                .clamp(0.0, 1.0);
+        }
+    }
+    let k = (dt / JUNGLE_AIR_FADE).min(1.0);
+    air.amount += (air.target - air.amount) * k;
+}
 
 fn follow_fog_volume(
     players: Query<&Transform, (With<Player>, Without<FogVolumeMarker>)>,
@@ -568,9 +610,11 @@ fn daylight_cycle(
     mut timer: ResMut<CycleTimer>,
     mut sky: ResMut<SkyState>,
     weather: Res<Weather>,
+    jungle: Res<JungleAir>,
     time: Res<Time>,
 ) {
     let weather = weather.current;
+    let jungle = jungle.amount;
     timer.0.tick(time.delta());
     // Toujours à la toute première image (le timer n'a pas encore fini) pour
     // ne pas démarrer avec un soleil par défaut.
@@ -644,6 +688,8 @@ fn daylight_cycle(
         // Seulement après le coucher du soleil : l'heure dorée garde ses couleurs.
         let t = (daylight / 0.2).clamp(0.0, 1.0);
         grading.global.post_saturation = 0.3 + 0.7 * t * t * (3.0 - 2.0 * t);
+        // Jungle : lumière filtrée par les feuilles, légèrement verte.
+        grading.global.tint = -0.04 * jungle;
     }
 
     for mut environment in &mut environments {
@@ -657,8 +703,11 @@ fn daylight_cycle(
         // Par temps gris, brume grise plutôt que bleutée.
         let grey = Color::srgb(0.58, 0.6, 0.62).to_linear() * (0.05 + 0.95 * daylight);
         fog.color = Color::from(horizon_color(daylight).to_linear().mix(&grey, weather.cloud_grey));
+        // Jungle : air humide, brume verdâtre plus proche.
+        let fog_color = fog.color.to_linear().mix(&(Color::srgb(0.55, 0.66, 0.5).to_linear() * (0.05 + 0.95 * daylight)), 0.45 * jungle);
+        fog.color = Color::from(fog_color);
         // Brume plus proche quand elle est épaisse (brouillard, pluie, matin).
-        fog.falloff = fog_falloff(fog_amount);
+        fog.falloff = fog_falloff(fog_amount * (1.0 + (JUNGLE_FOG_BOOST - 1.0) * jungle));
         // Halo du soleil dans la brume : plus marqué et plus orangé quand il
         // est bas, absent la nuit.
         let low = 1.0 - elevation.clamp(0.0, 0.6) / 0.6;
@@ -672,8 +721,13 @@ fn daylight_cycle(
         // la boîte, une brume volumétrique trop dense n'est plus éclairée et
         // vire au gris sombre. L'épaisseur du brouillard vient surtout de la
         // brume de distance.
-        volume.density_factor = (FOG_VOLUME_DENSITY * (1.0 + 0.8 * low) * daylight.max(0.15) * fog_amount).min(FOG_VOLUME_MAX_DENSITY);
-        volume.fog_color = Color::srgb(1.0, 0.92 - 0.1 * low, 0.82 - 0.2 * low);
+        // Jungle : brume humide plus dense sous la canopée, où les ombres des
+        // feuillages découpent des faisceaux de soleil.
+        let boost = 1.0 + (JUNGLE_VOLUME_BOOST - 1.0) * jungle;
+        let max = FOG_VOLUME_MAX_DENSITY + (JUNGLE_VOLUME_MAX_DENSITY - FOG_VOLUME_MAX_DENSITY) * jungle;
+        volume.density_factor = (FOG_VOLUME_DENSITY * (1.0 + 0.8 * low) * daylight.max(0.15) * fog_amount * boost).min(max);
+        let warm = Color::srgb(1.0, 0.92 - 0.1 * low, 0.82 - 0.2 * low).to_linear();
+        volume.fog_color = Color::from(warm.mix(&Color::srgb(0.85, 1.0, 0.8).to_linear(), 0.35 * jungle));
     }
 }
 

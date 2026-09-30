@@ -75,6 +75,7 @@ fn layer_of(block: BlockType) -> usize {
         // Croûte de sel : blanche comme la neige.
         BlockType::Snow | BlockType::Salt => 4,
         BlockType::RedSand => 5,
+        BlockType::LeafLitter => 6,
         _ => 1,
     }
 }
@@ -432,7 +433,7 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
         // surface peu rempli (voir `solid`), et le bloc du dessous (gravier
         // sous le sable des plages...) l'emportait à égalité de hauteur --
         // traînées grises le long des pentes.
-        let mut w = [0.0f32; 6];
+        let mut w = [0.0f32; 7];
         let mut found = false;
         let mut best: Option<(i32, BlockType)> = None;
         if s > 1 {
@@ -507,7 +508,9 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
         // les sépare par le signe.
         let bank = if s == 1 { bank_wetness(nb, Vec3::from(positions[vi]) + Vec3::new(0.0, base_y as f32, 0.0)) } else { 0.0 };
         extra.push([if bank > w[4] { -bank } else { w[4] }, ao]);
-        red.push([w[5], ore]);
+        // Terre rouge (badlands), ou en négatif litière (jungle) : ne se
+        // rencontrent pas, un seul canal.
+        red.push([if w[5] >= w[6] { w[5] } else { -w[6] }, ore]);
         stones.push([granite, limestone, 1.0, basalt]);
     }
 

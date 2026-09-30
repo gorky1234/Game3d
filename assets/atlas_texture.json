@@ -335,13 +335,61 @@
         "w": 1024,
         "h": 1024
       }
+    },
+    "jungle_leaf.png": {
+      "frame": {
+        "x": 7648,
+        "y": 32,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "palm_frond.png": {
+      "frame": {
+        "x": 7648,
+        "y": 1120,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "broadleaf.png": {
+      "frame": {
+        "x": 7648,
+        "y": 2208,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "liana.png": {
+      "frame": {
+        "x": 7648,
+        "y": 3296,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "litter.png": {
+      "frame": {
+        "x": 7648,
+        "y": 4384,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "heliconia.png": {
+      "frame": {
+        "x": 7648,
+        "y": 5472,
+        "w": 1024,
+        "h": 1024
+      }
     }
   },
   "meta": {
     "app": "build_hd_atlas.py (ambientCG CC0 1K + tuiles proc\u00e9durales)",
     "image": "atlas_texture.png",
     "size": {
-      "w": 7680,
+      "w": 8704,
       "h": 6656
     }
   }
