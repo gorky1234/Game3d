@@ -22,7 +22,7 @@ use bevy::shader::ShaderRef;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use futures::FutureExt;
 use crate::constants::{CHUNK_SIZE, VIEW_DISTANCE};
-use crate::generation::biome::{get_biome_data, BiomeType};
+use crate::generation::biome::BiomeType;
 use crate::generation::chunk_generation_logic::BiomeMapArc;
 use crate::generation::generate_biome_map::BiomeMap;
 use crate::generation::generate_chunk::surface_block;
@@ -273,7 +273,7 @@ fn far_terrain_mesh(center: Vec2, biomes: &Arc<BiomeMap>, heights: &HeightMap) -
             (y, color, true)
         } else {
             let biome = biomes.get_biome(x, z);
-            let block = surface_block(h as usize, biome, &get_biome_data(biome), x, z, &biomes.surface_info(x, z, biome));
+            let block = surface_block(h as usize, biome, x, z, &biomes.surface_info(x, z, biome));
             // Taches claires et sombres (comme la variation du terrain
             // lisse) : sans elles, de grandes étendues d'une seule teinte.
             let shade = 0.8 + 0.4 * value_noise(x, z, 160, 71) as f32;

@@ -277,6 +277,14 @@ impl MoistureGrid {
     }
 }
 
+/// Distance (blocs) à la mer en deçà de laquelle un marais chaud est une
+/// mangrove.
+const MANGROVE_REACH: f64 = 350.0;
+
+/// Déformation (blocs) des limites de biome pour le sol et la flore (voir
+/// `BiomeMap::surface_biome`).
+const SURFACE_WARP: f64 = 28.0;
+
 #[derive(Resource)]
 pub struct BiomeMap {
     tectonic: TectonicPlateMap,
@@ -355,7 +363,22 @@ impl BiomeMap {
 
     /// Variante du biome `biome` en (x, z) et son poids.
     pub fn variant(&self, x_block: i64, z_block: i64, biome: BiomeType) -> (Variant, f64) {
-        self.landforms.variant(x_block as f64, z_block as f64, biome)
+        let v = self.landforms.variant(x_block as f64, z_block as f64, biome);
+        // Mangrove : marais chaud près de la côte (mer à moins de
+        // `MANGROVE_REACH` blocs), sauf marais mort.
+        if biome == BiomeType::Swamp && v.0 != Variant::DeadMarsh {
+            let heat = smoothstep(0.62, 0.72, self.temperature_at(x_block, z_block));
+            if heat > 0.0 {
+                let near_sea = (0..8).any(|k| {
+                    let a = k as f64 * std::f64::consts::FRAC_PI_4;
+                    self.is_ocean(x_block + (a.cos() * MANGROVE_REACH) as i64, z_block + (a.sin() * MANGROVE_REACH) as i64)
+                });
+                if near_sea {
+                    return (Variant::Mangrove, heat);
+                }
+            }
+        }
+        v
     }
 
     /// Poids des variantes qui modifient le relief : (désert de sel, tourbière).
@@ -502,6 +525,28 @@ impl BiomeMap {
     ///    Mountain / "intérieur".
     /// 2. Si "intérieur", zone de température (froide / fraîche / tempérée / chaude) puis
     ///    humidité à l'intérieur de la zone -- voir `inland_shares`.
+    /// Biome du sol et de la flore en (x, z) : celui d'un point voisin
+    /// déplacé par un bruit (±`SURFACE_WARP` blocs) et un léger tramage
+    /// par colonne. Les limites entre biomes deviennent une bande
+    /// irrégulière où sols et plantes s'interpénètrent, au lieu d'une ligne
+    /// nette. Côtes exclues (la mer ne déborde pas sur la terre).
+    pub fn surface_biome(&self, x: i64, z: i64) -> BiomeType {
+        let here = self.get_biome(x, z);
+        if matches!(here, BiomeType::Ocean | BiomeType::Abyss | BiomeType::Beach) {
+            return here;
+        }
+        let (fx, fz) = (x as f64, z as f64);
+        let nx = crate::generation::procedural::gradient_noise(fx / 60.0 + 13.1, fz / 60.0 - 7.7).0
+            + 0.4 * crate::generation::procedural::gradient_noise(fx / 17.0 - 3.3, fz / 17.0 + 21.9).0;
+        let nz = crate::generation::procedural::gradient_noise(fx / 60.0 - 31.7, fz / 60.0 + 5.3).0
+            + 0.4 * crate::generation::procedural::gradient_noise(fx / 17.0 + 11.9, fz / 17.0 - 17.1).0;
+        let jitter = |salt: u64| (crate::generation::procedural::rand01(x, z, salt) - 0.5) * 6.0;
+        let wx = x + (nx * SURFACE_WARP + jitter(9301)) as i64;
+        let wz = z + (nz * SURFACE_WARP + jitter(9302)) as i64;
+        let there = self.get_biome(wx, wz);
+        if matches!(there, BiomeType::Ocean | BiomeType::Abyss | BiomeType::Beach) { here } else { there }
+    }
+
     pub fn get_biome(&self, x_block: i64, z_block: i64) -> BiomeType {
         let climate = self.climate_at(x_block, z_block);
         let c = climate.continentalness;
@@ -588,14 +633,14 @@ impl BiomeMap {
         let climate = self.climate_at(x_block, z_block);
         let shares = Self::inland_shares(&climate);
         let inland: f64 = INLAND_BIOMES.iter().zip(shares.iter())
-            .map(|(&biome, &share)| get_biome_data(biome).base_height * share)
+            .map(|(&biome, &share)| get_biome_data(biome, Variant::None).base_height * share)
             .sum();
 
         let sea = SEA_LEVEL as f64;
-        let abyss = get_biome_data(BiomeType::Abyss);
-        let ocean = get_biome_data(BiomeType::Ocean);
-        let beach = get_biome_data(BiomeType::Beach);
-        let mountain = get_biome_data(BiomeType::Mountain);
+        let abyss = get_biome_data(BiomeType::Abyss, Variant::None);
+        let ocean = get_biome_data(BiomeType::Ocean, Variant::None);
+        let beach = get_biome_data(BiomeType::Beach, Variant::None);
+        let mountain = get_biome_data(BiomeType::Mountain, Variant::None);
 
         // Côtes à falaises : le sol reste haut jusqu'au rivage puis plonge
         // dans la mer (sur ~10 blocs), au lieu de descendre en pente douce

@@ -2,7 +2,7 @@
 //! sous-bois, herbe haute, plantes aquatiques et marines) ; la forme des
 //! plantes est dans tree_shapes.rs.
 use crate::constants::{CHUNK_SIZE, SEA_LEVEL, WORLD_HEIGHT};
-use crate::generation::biome::BiomeType;
+use crate::generation::biome::{get_biome_data, Alpine, Biome, BiomeType, Density, Exclusive, Grove, Plant};
 use crate::generation::generate_biome_map::BiomeMap;
 use crate::generation::generate_height_map::HeightMap;
 use crate::generation::procedural::{hash, rand01, smoothstep, value_noise};
@@ -28,26 +28,12 @@ const CONIFER_TEMPERATURE: f64 = 0.5;
 const RIPARIAN_WIDTH: f64 = 22.0;
 const RIPARIAN_DENSITY: f64 = 0.32;
 
-/// Multiplicateur de densité d'arbres d'une variante de biome.
-fn variant_density(variant: Variant) -> f64 {
-    match variant {
-        // Géants espacés (leurs houppiers se touchent quand même).
-        Variant::GiantForest => 0.75,
-        Variant::DeadForest => 0.55,
-        Variant::Bog => 0.25,
-        Variant::FlowerMeadow => 0.5,
-        Variant::FlowerField => 0.15,
-        Variant::SaltFlat => 0.0,
-        _ => 1.0,
-    }
-}
-
-/// Facteur de densité de la variante de biome en (x, z) (0 sur un désert de
-/// sel), pour les buissons là où il n'y a pas d'arbres (déserts).
-fn variant_thinning(biomes_map: &BiomeMap, x: i64, z: i64) -> f64 {
+/// Multiplicateur (fondu selon le poids de la variante) de la variante de
+/// biome en (x, z), choisi dans ses données par `factor`.
+fn variant_factor(biomes_map: &BiomeMap, x: i64, z: i64, factor: fn(&Biome) -> f64) -> f64 {
     let biome = biomes_map.get_biome(x, z);
     let (variant, weight) = biomes_map.variant(x, z, biome);
-    1.0 + (variant_density(variant) - 1.0) * weight
+    1.0 + (factor(&get_biome_data(biome, variant)) - 1.0) * weight
 }
 
 /// Courant (blocs/s) sous lequel l'eau est calme pour les plantes
@@ -60,23 +46,6 @@ fn riparian(edge: f64) -> f64 {
     if edge < 0.5 { 0.0 } else { 1.0 - smoothstep(3.0, RIPARIAN_WIDTH, edge) }
 }
 
-/// Probabilité qu'une case porte un arbre (ou un cactus), par biome.
-fn tree_density(biome: BiomeType) -> f64 {
-    match biome {
-        BiomeType::Forest => 0.29,
-        BiomeType::Swamp => 0.18,
-        BiomeType::Plain => 0.03,
-        BiomeType::Tundra => 0.05,
-        BiomeType::Mountain => 0.05,
-        BiomeType::Desert => 0.012,
-        BiomeType::Taiga => 0.30,
-        BiomeType::Jungle => 0.40,
-        BiomeType::Savanna => 0.035,
-        BiomeType::Badlands => 0.006,
-        BiomeType::Beach | BiomeType::Ocean | BiomeType::Abyss => 0.0,
-    }
-}
-
 /// Bruit de regroupement des arbres (0..1) : grandes taches (~110 blocs)
 /// découpées par une octave plus fine (~35 blocs), pour des lisières
 /// irrégulières.
@@ -84,21 +53,11 @@ fn grove_noise(x: i64, z: i64) -> f64 {
     value_noise(x, z, 110, 41) * 0.7 + value_noise(x, z, 35, 42) * 0.3
 }
 
-/// Multiplicateur de densité d'arbres selon le bruit de regroupement : une
-/// densité uniforme dispersait les arbres à intervalles réguliers partout
-/// (aspect de verger). Prairie : bosquets serrés séparés de grandes étendues
-/// ouvertes, avec quelques arbres isolés ; forêt : clairières.
-fn grove_factor(biome: BiomeType, grove: f64) -> f64 {
-    match biome {
-        BiomeType::Plain => 0.25 + 5.0 * smoothstep(0.55, 0.72, grove),
-        // Savane : arbres isolés un peu partout, quelques bouquets.
-        BiomeType::Savanna => 0.6 + 2.5 * smoothstep(0.6, 0.75, grove),
-        BiomeType::Forest | BiomeType::Swamp | BiomeType::Taiga => 0.15 + 1.25 * smoothstep(0.28, 0.45, grove),
-        // Jungle : couvert continu, quasiment sans clairière.
-        BiomeType::Jungle => 0.7 + 0.5 * smoothstep(0.3, 0.5, grove),
-        BiomeType::Tundra | BiomeType::Mountain => 0.2 + 2.5 * smoothstep(0.45, 0.65, grove),
-        _ => 1.0,
-    }
+/// Multiplicateur de densité d'arbres selon le bruit de regroupement (voir
+/// `Biome::grove`) : une densité uniforme dispersait les arbres à
+/// intervalles réguliers partout (aspect de verger).
+fn grove_factor(grove: &Grove, noise: f64) -> f64 {
+    grove.base + grove.gain * smoothstep(grove.low, grove.high, noise)
 }
 
 /// Couverture d'arbres attendue en (x, z) : probabilité qu'une case de la
@@ -108,11 +67,13 @@ fn grove_factor(biome: BiomeType, grove: f64) -> f64 {
 pub fn tree_cover(biomes_map: &BiomeMap, x: i64, z: i64) -> f64 {
     let grove = grove_noise(x, z);
     let cover: f64 = biomes_map.relief_weights(x, z).iter()
-        .map(|&(biome, w)| w * tree_density(biome) * grove_factor(biome, grove))
+        .map(|&(biome, w)| {
+            let data = get_biome_data(biome, Variant::None);
+            w * data.tree_density * grove_factor(&data.grove, grove)
+        })
         .sum();
     let biome = biomes_map.get_biome(x, z);
-    let (variant, weight) = biomes_map.variant(x, z, biome);
-    let mut cover = cover * (1.0 + (variant_density(variant) - 1.0) * weight);
+    let mut cover = cover * variant_factor(biomes_map, x, z, |d| d.tree_factor);
     match biome {
         // Palmeraie autour de l'oasis.
         BiomeType::Desert | BiomeType::Badlands => cover += 0.4 * biomes_map.oasis(x, z).1,
@@ -126,42 +87,6 @@ pub fn tree_cover(biomes_map: &BiomeMap, x: i64, z: i64) -> f64 {
         _ => {}
     }
     cover
-}
-
-/// Probabilité qu'une case sans arbre porte un buisson, par biome.
-fn bush_density(biome: BiomeType) -> f64 {
-    match biome {
-        // Buissons secs (créosote, armoise) : l'essentiel de la végétation
-        // d'un désert, bien plus que les cactus.
-        BiomeType::Desert => 0.09,
-        BiomeType::Plain => 0.08,
-        BiomeType::Forest => 0.25,
-        BiomeType::Swamp => 0.10,
-        BiomeType::Savanna => 0.10,
-        BiomeType::Jungle => 0.40,
-        BiomeType::Taiga => 0.08,
-        BiomeType::Badlands => 0.05,
-        _ => 0.0,
-    }
-}
-
-/// Buissons secs (plutôt que verts) dans ces biomes.
-fn dry_bushes(biome: BiomeType) -> bool {
-    matches!(biome, BiomeType::Desert | BiomeType::Badlands | BiomeType::Savanna)
-}
-
-/// Arbre d'une variante de biome (`None` : celui du biome).
-fn variant_plant(variant: Variant, pick: f64) -> Option<TreeKind> {
-    Some(match variant {
-        Variant::BirchForest => if pick < 0.85 { TreeKind::Birch } else { TreeKind::Oak { trunk_min: 9, trunk_max: 13 } },
-        Variant::ConiferForest => if pick < 0.8 { TreeKind::Spruce } else { TreeKind::Birch },
-        Variant::GiantForest => {
-            if pick < 0.32 { TreeKind::Giant } else if pick < 0.75 { TreeKind::Oak { trunk_min: 16, trunk_max: 22 } } else { TreeKind::BigOak }
-        }
-        Variant::DeadForest => if pick < 0.75 { TreeKind::Dead } else { TreeKind::Spruce },
-        Variant::Bog => if pick < 0.45 { TreeKind::Dead } else { TreeKind::Spruce },
-        _ => return None,
-    })
 }
 
 /// Arbre des berges selon la température.
@@ -178,97 +103,25 @@ fn riparian_plant(temperature: f64, pick: f64) -> TreeKind {
     }
 }
 
-fn plant_for(biome: BiomeType, tx: i64, tz: i64) -> Option<TreeKind> {
-    let pick = rand01(tx, tz, 60);
-    Some(match biome {
-        BiomeType::Forest => {
-            // Essences regroupées en bosquets (bruit à ~70 blocs) plutôt que
-            // mélangées au hasard : boulaies, pinèdes, chênaies.
-            let grove = value_noise(tx, tz, 70, 61);
-            if pick < 0.04 {
-                TreeKind::Dead
-            } else if grove < 0.3 {
-                if pick < 0.75 { TreeKind::Birch } else { TreeKind::Oak { trunk_min: 9, trunk_max: 13 } }
-            } else if grove > 0.72 {
-                if pick < 0.75 { TreeKind::Spruce } else { TreeKind::Birch }
-            } else if pick < 0.12 {
-                TreeKind::BigOak
-            } else if pick < 0.45 {
-                // Grands feuillus : long fût nu sous la canopée.
-                TreeKind::Oak { trunk_min: 13, trunk_max: 18 }
-            } else if pick < 0.6 {
-                TreeKind::Birch
-            } else {
-                TreeKind::Oak { trunk_min: 8, trunk_max: 12 }
-            }
-        }
-        // Arbres isolés de prairie : grands chênes étalés surtout.
-        BiomeType::Plain => {
-            if pick < 0.45 {
-                TreeKind::BigOak
-            } else if pick < 0.55 {
-                TreeKind::Birch
-            } else if pick < 0.6 {
-                TreeKind::Dead
-            } else {
-                TreeKind::Oak { trunk_min: 6, trunk_max: 9 }
-            }
-        }
-        BiomeType::Swamp => TreeKind::Swamp,
-        BiomeType::Tundra => TreeKind::Spruce,
-        // Montagne : feuillus en bas, conifères plus haut (voir
-        // `place_vegetation`, qui remplace par un sapin au froid).
-        BiomeType::Mountain => {
-            if pick < 0.6 { TreeKind::Oak { trunk_min: 7, trunk_max: 11 } } else if pick < 0.8 { TreeKind::Birch } else { TreeKind::Spruce }
-        }
-        // Taïga : pessières, quelques bouleaux.
-        BiomeType::Taiga => {
-            if pick < 0.84 { TreeKind::Spruce } else if pick < 0.96 { TreeKind::Birch } else { TreeKind::Dead }
-        }
-        // Savane : arbres étalés isolés (houppier large, type acacia).
-        BiomeType::Savanna => {
-            if pick < 0.7 { TreeKind::BigOak } else if pick < 0.8 { TreeKind::Dead } else { TreeKind::Oak { trunk_min: 5, trunk_max: 8 } }
-        }
-        // Jungle : géants émergents épars au-dessus d'une canopée continue,
-        // petits arbres et palmiers du sous-étage.
-        BiomeType::Jungle => {
-            if pick < 0.1 {
-                TreeKind::Emergent
-            } else if pick < 0.55 {
-                TreeKind::JungleCanopy
-            } else if pick < 0.8 {
-                TreeKind::Understory
-            } else {
-                TreeKind::JunglePalm
-            }
-        }
-        BiomeType::Badlands => if pick < 0.5 { TreeKind::Dead } else { TreeKind::Cactus },
-        BiomeType::Desert => TreeKind::Cactus,
-        BiomeType::Beach => return None,
-        // Îles : décidé dans `place_vegetation` (selon le climat).
-        BiomeType::Ocean | BiomeType::Abyss => return None,
-    })
+/// Premier élément dont le seuil dépasse le tirage `pick` (le dernier sinon).
+fn pick_in<T: Copy>(table: &[(f64, T)], pick: f64) -> Option<T> {
+    table.iter().find(|&&(threshold, _)| pick < threshold).or(table.last()).map(|&(_, item)| item)
 }
 
-/// Sous-bois : probabilités (fougère, rocher, tronc couché) qu'une case de
-/// la grille du sous-bois en porte un, par biome.
-fn undergrowth_density(biome: BiomeType) -> (f64, f64, f64) {
-    match biome {
-        BiomeType::Forest => (0.45, 0.04, 0.03),
-        BiomeType::Swamp => (0.3, 0.01, 0.03),
-        BiomeType::Plain => (0.03, 0.03, 0.005),
-        BiomeType::Mountain => (0.0, 0.12, 0.0),
-        BiomeType::Tundra => (0.0, 0.06, 0.01),
-        // Galets et bois flotté (troncs couchés blanchis) sur les plages,
-        // blocs épars dans le désert.
-        BiomeType::Beach => (0.0, 0.012, 0.0015),
-        BiomeType::Desert => (0.0, 0.025, 0.0),
-        BiomeType::Taiga => (0.2, 0.05, 0.03),
-        BiomeType::Jungle => (0.85, 0.02, 0.05),
-        BiomeType::Savanna => (0.0, 0.03, 0.002),
-        BiomeType::Badlands => (0.0, 0.06, 0.0),
-        _ => (0.0, 0.0, 0.0),
-    }
+/// Essence d'un arbre du biome (`None` : pas d'arbre) : essences regroupées
+/// en bosquets (bruit à ~70 blocs, voir `Biome::trees`) plutôt que
+/// mélangées au hasard.
+fn plant_for(data: &Biome, tx: i64, tz: i64) -> Option<TreeKind> {
+    let pick = rand01(tx, tz, 60);
+    let group = match data.trees {
+        [] => return None,
+        [only] => only,
+        groups => {
+            let grove = value_noise(tx, tz, 70, 61);
+            groups.iter().find(|g| grove < g.grove_max).unwrap_or(&groups[groups.len() - 1])
+        }
+    };
+    pick_in(group.mix, pick)
 }
 
 /// Taille de la grille du sous-bois (plus fine que celle des arbres).
@@ -284,62 +137,49 @@ fn ground_cover_density(surface: BlockType) -> f64 {
     }
 }
 
-/// Flore au sol d'une colonne : (densité, plante) selon le biome, sa
-/// variante, le bloc de surface et la température (altitude comprise). Les
-/// tirages (`roll`, colonies) sont faits par l'appelant.
-fn ground_flora(biome: BiomeType, variant: Variant, surface: BlockType, temperature: f64, wx: i64, wz: i64) -> (f64, BlockType) {
+/// Flore au sol d'une colonne : (densité, plante) selon les règles du biome
+/// et de sa variante (voir `Biome::flora`), le bloc de surface et la
+/// température (altitude comprise). Les tirages (`roll`, colonies) sont
+/// faits par l'appelant.
+fn ground_flora(data: &Biome, surface: BlockType, temperature: f64, wx: i64, wz: i64) -> (f64, BlockType) {
+    let Some(rule) = data.flora.iter().find(|r| r.surfaces.is_empty() || r.surfaces.contains(&surface)) else {
+        return (0.0, BlockType::Air);
+    };
+    let density = match rule.density {
+        Density::Fixed(density) => density,
+        Density::Cover => ground_cover_density(surface),
+    };
     let roll = rand01(wx, wz, 73);
-    // Fleurs en colonies : une couleur par tache (~30 blocs).
-    let color = value_noise(wx, wz, 30, 74);
-    let flower = |alpine: bool| {
-        if alpine {
-            if color > 0.5 { BlockType::FlowerBlue } else { BlockType::FlowerPurple }
-        } else if color < 0.3 {
-            BlockType::FlowerRed
-        } else if color < 0.55 {
-            BlockType::FlowerYellow
-        } else if color < 0.8 {
-            BlockType::FlowerBlue
-        } else {
-            BlockType::FlowerPurple
+    let plant = match pick_in(rule.plants, roll) {
+        None => return (0.0, BlockType::Air),
+        Some(Plant::Block(block)) => block,
+        Some(Plant::Flower { colony, grass_only, alpine }) => {
+            // Fleurs en colonies : une couleur par tache (~30 blocs).
+            let color = value_noise(wx, wz, 30, 74);
+            if value_noise(wx, wz, 14, 72) > colony && (!grass_only || surface == BlockType::Grass) {
+                // Alpages : fleurs bleues et violettes (gentianes, campanules).
+                let alpine = match alpine {
+                    Alpine::No => false,
+                    Alpine::Yes => true,
+                    Alpine::Cold => temperature < 0.5,
+                };
+                if alpine {
+                    if color > 0.5 { BlockType::FlowerBlue } else { BlockType::FlowerPurple }
+                } else if color < 0.3 {
+                    BlockType::FlowerRed
+                } else if color < 0.55 {
+                    BlockType::FlowerYellow
+                } else if color < 0.8 {
+                    BlockType::FlowerBlue
+                } else {
+                    BlockType::FlowerPurple
+                }
+            } else {
+                BlockType::TallGrass
+            }
         }
     };
-    let colony = value_noise(wx, wz, 14, 72);
-    match variant {
-        Variant::SaltFlat => return (0.0, BlockType::Air),
-        Variant::FlowerField => return (0.95, if roll < 0.7 { flower(false) } else { BlockType::TallGrass }),
-        Variant::FlowerMeadow => {
-            let density = ground_cover_density(surface);
-            return (density, if colony > 0.45 && roll < 0.5 { flower(false) } else { BlockType::TallGrass });
-        }
-        Variant::Bog => return (0.6, if roll < 0.8 { BlockType::Moss } else { BlockType::TallGrass }),
-        Variant::DeadForest => return (0.15, BlockType::DryGrass),
-        _ => {}
-    }
-    match biome {
-        BiomeType::Savanna => (0.75, if roll < 0.7 { BlockType::DryGrass } else { BlockType::TallGrass }),
-        BiomeType::Taiga => (0.55, if roll < 0.55 { BlockType::Moss } else { BlockType::TallGrass }),
-        BiomeType::Tundra => match surface {
-            BlockType::Grass => (0.55, if roll < 0.7 { BlockType::Lichen } else { BlockType::TallGrass }),
-            BlockType::Gravel => (0.3, BlockType::Lichen),
-            _ => (0.0, BlockType::Air),
-        },
-        BiomeType::Desert | BiomeType::Badlands => match surface {
-            BlockType::Sand | BlockType::RedSand => (0.03, BlockType::DryGrass),
-            // Oasis.
-            _ => (ground_cover_density(surface), BlockType::TallGrass),
-        },
-        // Jungle : herbe dans les clairières ; sous la canopée (litière),
-        // quelques coussins de mousse seulement.
-        BiomeType::Jungle => if surface == BlockType::Grass { (0.9, BlockType::TallGrass) } else { (0.12, BlockType::Moss) },
-        _ => {
-            let density = ground_cover_density(surface);
-            // Alpages : fleurs bleues et violettes (gentianes, campanules).
-            let alpine = biome == BiomeType::Mountain && temperature < 0.5;
-            let flowers = surface == BlockType::Grass && colony > 0.72 && roll < 0.5;
-            (density, if flowers { flower(alpine) } else { BlockType::TallGrass })
-        }
-    }
+    (density, plant)
 }
 
 /// Herbe haute, fleurs et flore propre aux biomes, une plante par colonne au
@@ -348,13 +188,13 @@ fn ground_flora(biome: BiomeType, variant: Variant, surface: BlockType, temperat
 /// de 4 x 4 points par chunk (pas un calcul de climat par colonne).
 fn place_ground_cover(chunk_x: i32, chunk_z: i32, sections: &mut [ChunkSection], heightmap: &[Vec<usize>], water: &[Vec<usize>], biomes_map: &BiomeMap) {
     let (min_x, min_z) = (chunk_x as i64 * CHUNK_SIZE as i64, chunk_z as i64 * CHUNK_SIZE as i64);
-    let mut samples = [[(BiomeType::Plain, Variant::None, 0.5); 4]; 4];
+    let mut samples = [[(get_biome_data(BiomeType::Plain, Variant::None), 0.5); 4]; 4];
     for (i, row) in samples.iter_mut().enumerate() {
         for (j, sample) in row.iter_mut().enumerate() {
             let (x, z) = (min_x + 2 + 4 * i as i64, min_z + 2 + 4 * j as i64);
-            let biome = biomes_map.get_biome(x, z);
+            let biome = biomes_map.surface_biome(x, z);
             let ground = heightmap[2 + 4 * i][2 + 4 * j] as f64;
-            *sample = (biome, biomes_map.variant(x, z, biome).0, biomes_map.temperature_at_altitude(x, z, ground));
+            *sample = (get_biome_data(biome, biomes_map.variant(x, z, biome).0), biomes_map.temperature_at_altitude(x, z, ground));
         }
     }
     for lx in 0..CHUNK_SIZE {
@@ -370,8 +210,8 @@ fn place_ground_cover(chunk_x: i32, chunk_z: i32, sections: &mut [ChunkSection],
             }
             let wx = min_x + lx as i64;
             let wz = min_z + lz as i64;
-            let (biome, variant, temperature) = samples[lx / 4][lz / 4];
-            let (base_density, plant) = ground_flora(biome, variant, surface, temperature, wx, wz);
+            let (data, temperature) = &samples[lx / 4][lz / 4];
+            let (base_density, plant) = ground_flora(data, surface, *temperature, wx, wz);
             if base_density == 0.0 {
                 continue;
             }
@@ -426,9 +266,34 @@ fn place_aquatic(chunk_x: i32, chunk_z: i32, heightmap: &[Vec<usize>], water: &[
             let clump = 0.4 + 1.2 * value_noise(tx, tz, 10, 805);
             let kind = if ground < level {
                 let depth = level - ground;
-                if level > sea {
-                    // Eau douce (lacs, rivières).
-                    if depth <= 1 && temperature > 0.22 && roll < 0.35 * calm * clump {
+                // Mares du marais : au niveau de la mer, mais eau douce (pas de
+                // corail ni de varech). Plantes propres au marais (voir
+                // `Biome::marsh`), puis roseaux et nénuphars ordinaires.
+                let biome = biomes_map.get_biome(tx, tz);
+                let marsh = get_biome_data(biome, biomes_map.variant(tx, tz, biome).0).marsh;
+                if level > sea || marsh.is_some() {
+                    let shallow = (1..=3).contains(&depth) && calm > 0.9;
+                    let marsh_plant = marsh.and_then(|m| {
+                        if let Some((tree, chance)) = m.water_tree {
+                            if shallow && rand01(cell_x, cell_z, 806) < chance {
+                                return Some(Some(tree));
+                            }
+                        }
+                        if let Some((max_depth, chance)) = m.reeds {
+                            if depth <= max_depth && roll < chance {
+                                return Some(Some(TreeKind::Reeds));
+                            }
+                        }
+                        let lily = Some(Some(TreeKind::LilyPads { depth: depth.min(4) as u8 }));
+                        match m.exclusive {
+                            Exclusive::All => if roll < m.lily { lily } else { Some(None) },
+                            Exclusive::Shallow if shallow => Some(None),
+                            _ => if shallow && roll < m.lily { lily } else { None },
+                        }
+                    });
+                    if let Some(plant) = marsh_plant {
+                        match plant { Some(kind) => kind, None => continue }
+                    } else if depth <= 1 && temperature > 0.22 && roll < 0.35 * calm * clump {
                         TreeKind::Reeds
                     } else if (2..=4).contains(&depth) && temperature > 0.42 && calm > 0.9 && roll < 0.14 {
                         TreeKind::LilyPads { depth: depth as u8 }
@@ -454,7 +319,15 @@ fn place_aquatic(chunk_x: i32, chunk_z: i32, heightmap: &[Vec<usize>], water: &[
             } else {
                 // Berge au ras de l'eau : bord de rivière, ou rive de lac
                 // (colonne voisine sous l'eau d'un lac).
-                if ground > level.max(sea) + 1 || temperature < 0.22 || roll >= (0.1 + 0.3 * calm) * clump {
+                // Roselière : roseaux serrés sur toutes les rives basses.
+                let biome = biomes_map.get_biome(tx, tz);
+                let bank_reeds = get_biome_data(biome, biomes_map.variant(tx, tz, biome).0).marsh.and_then(|m| m.bank_reeds);
+                let chance = bank_reeds.unwrap_or((0.1 + 0.3 * calm) * clump);
+                if ground > level.max(sea) + 1 || temperature < 0.22 || roll >= chance {
+                    continue;
+                }
+                if bank_reeds.is_some() {
+                    trees.push(TreeInstance { x: tx, z: tz, ground: ground as i32, kind: TreeKind::Reeds });
                     continue;
                 }
                 let lake_shore = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dz)| {
@@ -535,8 +408,9 @@ pub fn place_vegetation(
             let edge = (1.0 - ((grove - 0.55) / 0.15).powi(2)).max(0.0);
             // Moins de buissons là où la variante éclaircit les arbres (rien
             // sur un désert de sel).
-            let thinning = if tree_d > 0.0 || bank > 0.0 { 1.0 } else { variant_thinning(biomes_map, tx, tz) };
-            let bush_d = biomes_map.blend(tx, tz, bush_density) * (0.25 + 2.0 * edge) * thinning + 0.15 * bank;
+            let thinning = if tree_d > 0.0 || bank > 0.0 { 1.0 } else { variant_factor(biomes_map, tx, tz, |d| d.tree_factor) };
+            let bush_d = biomes_map.blend(tx, tz, |b| get_biome_data(b, Variant::None).bush_density) * (0.25 + 2.0 * edge) * thinning
+                * variant_factor(biomes_map, tx, tz, |d| d.bush_factor) + 0.15 * bank;
             let is_bush = !is_tree && roll < tree_d + bush_d;
             if !is_tree && !is_bush {
                 continue;
@@ -566,32 +440,36 @@ pub fn place_vegetation(
             let sea_temperature = biomes_map.temperature_at(tx, tz);
             let kind = if is_riparian {
                 if temperature < TREE_LINE_TEMPERATURE + 0.05 { continue; }
-                Some(riparian_plant(sea_temperature, pick))
-            } else if is_tree {
-                let (variant, weight) = biomes_map.variant(tx, tz, biome);
-                // Forêt géante de la jungle : géants tropicaux (émergents et
-                // canopée), pas les séquoias des forêts tempérées.
-                let variant_tree = if rand01(tx, tz, 62) >= weight {
-                    None
-                } else if biome == BiomeType::Jungle && variant == Variant::GiantForest {
-                    Some(if pick < 0.35 { TreeKind::Emergent } else if pick < 0.85 { TreeKind::JungleCanopy } else { TreeKind::Understory })
+                // Rivière qui traverse une plage : palmiers si la côte est
+                // chaude, sinon rien (pas de ripisylve sur le sable).
+                if biome == BiomeType::Beach {
+                    if sea_temperature < 0.58 || ground <= SEA_LEVEL + 1 { continue; }
+                    Some(TreeKind::Palm)
                 } else {
-                    variant_plant(variant, pick)
-                };
+                    Some(riparian_plant(sea_temperature, pick))
+                }
+            } else if is_tree {
+                // Essences de la variante (selon son poids) ou du biome.
+                let (variant, weight) = biomes_map.variant(tx, tz, biome);
+                let data = get_biome_data(biome, if rand01(tx, tz, 62) < weight { variant } else { Variant::None });
                 let oasis = matches!(biome, BiomeType::Desert | BiomeType::Badlands) && biomes_map.oasis(tx, tz).1 > 0.3;
                 if oasis {
                     Some(if pick < 0.75 { TreeKind::Palm } else { TreeKind::Bush })
+                } else if biome == BiomeType::Beach {
+                    // Palmiers des plages chaudes, un peu en retrait de l'eau.
+                    if sea_temperature < 0.58 || ground <= SEA_LEVEL + 1 { continue; }
+                    Some(TreeKind::Palm)
                 } else if matches!(biome, BiomeType::Ocean | BiomeType::Abyss) {
                     // Île : pas sur la plage.
                     if ground <= SEA_LEVEL + 2 { continue; }
                     Some(if sea_temperature > 0.6 { TreeKind::Palm } else if sea_temperature > 0.35 { TreeKind::Oak { trunk_min: 6, trunk_max: 9 } } else { TreeKind::Spruce })
                 } else {
-                    variant_tree.or_else(|| plant_for(biome, tx, tz)).map(|kind| {
+                    plant_for(&data, tx, tz).map(|kind| {
                         // Étage des conifères en altitude.
                         if temperature < CONIFER_TEMPERATURE && biome == BiomeType::Mountain { TreeKind::Spruce } else { kind }
                     })
                 }
-            } else if dry_bushes(biome) {
+            } else if get_biome_data(biome, Variant::None).dry_bushes {
                 Some(TreeKind::DryBush)
             } else {
                 Some(TreeKind::Bush)
@@ -611,9 +489,9 @@ pub fn place_vegetation(
             if tx < min_x - MAX_REACH || tx > max_x + MAX_REACH || tz < min_z - MAX_REACH || tz > max_z + MAX_REACH {
                 continue;
             }
-            let fern = biomes_map.blend(tx, tz, |b| undergrowth_density(b).0);
-            let rock = biomes_map.blend(tx, tz, |b| undergrowth_density(b).1);
-            let log = biomes_map.blend(tx, tz, |b| undergrowth_density(b).2);
+            let fern = biomes_map.blend(tx, tz, |b| get_biome_data(b, Variant::None).fern_density);
+            let rock = biomes_map.blend(tx, tz, |b| get_biome_data(b, Variant::None).rock_density);
+            let log = biomes_map.blend(tx, tz, |b| get_biome_data(b, Variant::None).log_density);
             let fern = fern * (value_noise(tx, tz, 16, 503) * 1.8 - 0.2).clamp(0.0, 1.0);
             // Rochers en chaos (champs de blocs) plutôt que semés partout :
             // très denses là où un bruit à ~70 blocs est haut, rares ailleurs.
@@ -624,31 +502,24 @@ pub fn place_vegetation(
             let beach = biomes_map.blend(tx, tz, |b| if b == BiomeType::Beach { 1.0 } else { 0.0 });
             let log = log * (beach + (1.0 - beach) * near_trees);
             let roll = rand01(cell_x, cell_z, 504);
+            let here = biomes_map.get_biome(tx, tz);
+            let (variant, vw) = biomes_map.variant(tx, tz, here);
+            let data = get_biome_data(here, variant);
+            // Forêt de cheminées de fée, désert de roches, arches : bien plus
+            // de roches (le tirage de la case est refait avec cette densité) ;
+            // erg et gypse : pas de blocs sur les dunes.
+            let rock = (rock * (1.0 + (data.rock_factor - 1.0) * vw)).min(0.6);
             let kind = if roll < rock {
-                TreeKind::Rock
+                // Roches propres au biome (cheminées de fée, arches,
+                // termitières), rochers sinon.
+                data.rock_kinds.iter()
+                    .find(|r| outcrop_noise(tx, tz) > r.min_outcrop && rand01(cell_x, cell_z, r.salt) < r.chance)
+                    .map_or(TreeKind::Rock, |r| r.kind)
             } else if roll < rock + log {
                 TreeKind::FallenLog
             } else if roll < rock + log + fern {
-                // Jungle : sous-bois de grandes feuilles (fougères géantes,
-                // philodendrons, bananiers, héliconias, jeunes palmiers).
-                if biomes_map.get_biome(tx, tz) == BiomeType::Jungle {
-                    let pick = rand01(cell_x, cell_z, 505);
-                    if pick < 0.22 {
-                        TreeKind::BigFern
-                    } else if pick < 0.47 {
-                        TreeKind::Philodendron
-                    } else if pick < 0.62 {
-                        TreeKind::Banana
-                    } else if pick < 0.84 {
-                        TreeKind::Heliconia
-                    } else if pick < 0.92 {
-                        TreeKind::JunglePalm
-                    } else {
-                        TreeKind::Fern
-                    }
-                } else {
-                    TreeKind::Fern
-                }
+                // Jungle : sous-bois de grandes feuilles (voir `Biome::ferns`).
+                pick_in(data.ferns, rand01(cell_x, cell_z, 505)).unwrap_or(TreeKind::Fern)
             } else {
                 continue;
             };

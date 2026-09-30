@@ -76,6 +76,22 @@ pub enum TreeKind {
     Banana,
     Heliconia,
     Philodendron,
+    /// Savane : acacia (tronc fourchu, houppier plat en parasol) et baobab
+    /// (fût énorme, petites branches).
+    Acacia,
+    Baobab,
+    /// Marais : cyprès chauve, pied évasé dans l'eau, mousse pendante
+    /// (rendu seulement, posé dans l'eau).
+    Cypress,
+    /// Badlands : cheminée de fée (colonne de roche rouge coiffée) ;
+    /// savane : termitière.
+    Hoodoo,
+    TermiteMound,
+    /// Arche de roche rouge (badlands, rare).
+    Arch,
+    /// Palétuvier (mangrove) : tronc court porté par des racines-échasses
+    /// arquées qui plongent dans l'eau, houppier dense vert sombre.
+    Mangrove,
     /// Rendu seulement, sans blocs : touffe de roseaux (berges, eau peu
     /// profonde) ; nénuphars à la surface d'une eau calme de `depth` blocs ;
     /// varech (mer tempérée) de `depth` blocs d'eau ; corail et herbier marin.
@@ -109,6 +125,8 @@ pub enum CardKind {
     Broadleaf,
     Liana,
     Heliconia,
+    /// Mousse espagnole (texture de liane, teinte gris-vert).
+    Moss,
 }
 
 /// Grande feuille, palme, liane ou fleur rendue en bande texturée (voir
@@ -165,6 +183,11 @@ pub struct TreeSkeleton {
     pub cards: Vec<Card>,
     /// Feuillage tropical (grandes feuilles vernies, vert sombre).
     pub tropical: bool,
+    /// Matière des rochers : 0 roche, 1 roche rouge (badlands), 2 terre
+    /// (termitière).
+    pub rock_style: u8,
+    /// Feuillage sombre et fin (cyprès).
+    pub conifer_like: bool,
 }
 
 /// Carte partant de `base` dans la direction horizontale d'angle `azimuth`,
@@ -477,6 +500,127 @@ impl TreeInstance {
             }
             TreeKind::Fern => {
                 sk.fern = 0.7 + rand_f(tx, tz, 110) * 0.6;
+            }
+            TreeKind::Acacia => {
+                // Tronc qui se divise en 2 ou 3 branches obliques ; au bout,
+                // un houppier plat et large (parasol).
+                let h = rand_range(tx, tz, 940, 3, 5) as f32;
+                let top = trunk(&mut sk, tx, tz, 941, h, 0.28, 0.2);
+                let n = rand_range(tx, tz, 942, 2, 3);
+                let start = rand_f(tx, tz, 943) * TAU;
+                let spread = 2.5 + rand_f(tx, tz, 944) * 1.5;
+                let crown_y = h + 2.5 + rand_f(tx, tz, 945) * 1.5;
+                for i in 0..n {
+                    let a = start + i as f32 / n as f32 * TAU + (rand_f(tx, tz, 946 + i as u64) - 0.5) * 0.5;
+                    let end = Vec3::new(a.cos() * spread * 0.7, crown_y, a.sin() * spread * 0.7);
+                    sk.wood.push(Segment { a: top - Vec3::Y * 0.3, b: end, r0: 0.18, r1: 0.08 });
+                    sk.blobs.push(LeafBlob { center: end + Vec3::Y * 0.3, radius: Vec3::new(2.4, 0.55, 2.4) });
+                }
+                sk.blobs.push(LeafBlob { center: Vec3::new(0.0, crown_y + 0.4, 0.0), radius: Vec3::new(spread + 1.2, 0.6, spread + 1.2) });
+            }
+            TreeKind::Baobab => {
+                // Fût en bouteille, énorme ; quelques grosses branches courtes
+                // et tordues au sommet, peu de feuilles (saison sèche).
+                let h = rand_range(tx, tz, 950, 7, 10) as f32;
+                let r0 = 1.5 + rand_f(tx, tz, 951) * 0.5;
+                sk.wood.push(Segment { a: Vec3::new(0.0, -0.6, 0.0), b: Vec3::new(0.0, h * 0.55, 0.0), r0, r1: r0 * 0.95 });
+                sk.wood.push(Segment { a: Vec3::new(0.0, h * 0.55, 0.0), b: Vec3::new(0.0, h, 0.0), r0: r0 * 0.95, r1: r0 * 0.55 });
+                let top = Vec3::new(0.0, h, 0.0);
+                crown(&mut sk, tx, tz, 952, top, rand_range(tx, tz, 953, 4, 6), 1.1, 2.8, r0 * 0.28, 1, true);
+                for blob in &mut sk.blobs {
+                    blob.radius *= 0.7;
+                }
+            }
+            TreeKind::Cypress => {
+                // Pied évasé (planté dans l'eau), fût droit, houppier étroit
+                // et haut ; mousse espagnole qui pend des branches.
+                let h = rand_range(tx, tz, 960, 10, 15) as f32;
+                let r0 = 0.45 + rand_f(tx, tz, 961) * 0.15;
+                let top = trunk(&mut sk, tx, tz, 962, h, r0, 0.12);
+                buttresses(&mut sk, tx, tz, r0 * 0.9, h * 0.6);
+                let count = rand_range(tx, tz, 963, 6, 9);
+                let start = rand_f(tx, tz, 964) * TAU;
+                for i in 0..count {
+                    let t = 0.4 + 0.55 * i as f32 / count as f32;
+                    let a = start + i as f32 * 2.4;
+                    let base = Vec3::new(0.0, -0.6, 0.0).lerp(top, t);
+                    let dir = Vec3::new(a.cos(), 0.25, a.sin()).normalize();
+                    let len = (1.0 - t) * 4.0 + 1.2;
+                    grow_branch(&mut sk, tx, tz, 970 + i as u64 * 7, base, dir, len, 0.1, 1, true);
+                }
+                for blob in &mut sk.blobs {
+                    blob.radius *= 0.8;
+                }
+                // Mousse : rideaux gris-vert sous les branches.
+                let anchors: Vec<Vec3> = sk.wood.iter().filter(|w| w.b.y > h * 0.35 && Vec3::new(w.b.x, 0.0, w.b.z).length() > 1.0).map(|w| w.b).collect();
+                for i in 0..rand_range(tx, tz, 965, 5, 9).min(anchors.len() as i32) {
+                    let s = 980 + i as u64 * 3;
+                    let anchor = anchors[(rand_f(tx, tz, s) * anchors.len() as f32) as usize % anchors.len()];
+                    let a = rand_f(tx, tz, s + 1) * TAU;
+                    sk.cards.push(Card { kind: CardKind::Moss, base: anchor, dir: -Vec3::Y, side: Vec3::new(a.cos(), 0.0, a.sin()), length: 1.5 + rand_f(tx, tz, s + 2) * 2.5, width: 0.9, droop: 0.0 });
+                }
+                sk.conifer_like = true;
+            }
+            TreeKind::Hoodoo => {
+                // Colonne de roche rouge (empilement de blocs de plus en plus
+                // étroits), coiffée d'un chapeau plus large et plus clair.
+                let h = 8.0 + rand_f(tx, tz, 990) * 10.0;
+                let r = 1.5 + rand_f(tx, tz, 991) * 1.0;
+                let n = 4;
+                for k in 0..n {
+                    let t = k as f32 / n as f32;
+                    let w = r * (1.0 - 0.45 * t) * (0.85 + 0.3 * rand_f(tx, tz, 992 + k as u64));
+                    sk.rocks.push(LeafBlob { center: Vec3::new(0.0, h * t + h / n as f32 * 0.5, 0.0), radius: Vec3::new(w, h / n as f32 * 0.75, w) });
+                }
+                sk.rocks.push(LeafBlob { center: Vec3::new(0.0, h + 0.3, 0.0), radius: Vec3::new(r * 1.1, 0.55, r * 1.0) });
+                sk.rock_style = 1;
+            }
+            TreeKind::Mangrove => {
+                // Racines-échasses : arcs du tronc (à ~1,8 m) jusqu'au sol,
+                // tout autour, en deux segments (sortie oblique, plongée).
+                let lift = 1.4 + rand_f(tx, tz, 1000) * 0.8;
+                let h = lift + 3.0 + rand_f(tx, tz, 1001) * 3.0;
+                let r0 = 0.22 + rand_f(tx, tz, 1002) * 0.08;
+                sk.wood.push(Segment { a: Vec3::new(0.0, lift - 0.3, 0.0), b: Vec3::new(0.0, h, 0.0), r0, r1: r0 * 0.6 });
+                let n = rand_range(tx, tz, 1003, 7, 11);
+                let start = rand_f(tx, tz, 1004) * TAU;
+                for i in 0..n {
+                    let a = start + i as f32 / n as f32 * TAU + (rand_f(tx, tz, 1005 + i as u64) - 0.5) * 0.5;
+                    let out = Vec3::new(a.cos(), 0.0, a.sin());
+                    let reach = 1.4 + rand_f(tx, tz, 1020 + i as u64) * 1.4;
+                    let from = Vec3::new(0.0, lift * (0.6 + 0.5 * rand_f(tx, tz, 1040 + i as u64)), 0.0);
+                    let knee = from + out * reach * 0.55 + Vec3::Y * 0.35;
+                    sk.wood.push(Segment { a: from, b: knee, r0: 0.08, r1: 0.07 });
+                    sk.wood.push(Segment { a: knee, b: out * reach - Vec3::Y * 0.8, r0: 0.07, r1: 0.05 });
+                }
+                crown(&mut sk, tx, tz, 1060, Vec3::new(0.0, h, 0.0), rand_range(tx, tz, 1061, 3, 4), 0.95, 2.4, r0 * 0.5, 1, true);
+                sk.blobs.push(LeafBlob { center: Vec3::new(0.0, h + 0.6, 0.0), radius: Vec3::new(2.8, 1.4, 2.8) });
+                sk.conifer_like = true;
+            }
+            TreeKind::Arch => {
+                // Blocs de roche le long d'un demi-cercle vertical, piliers
+                // épais au pied, voûte plus fine au sommet.
+                let a = rand_f(tx, tz, 1100) * TAU;
+                let dir = Vec3::new(a.cos(), 0.0, a.sin());
+                let span = 3.5 + rand_f(tx, tz, 1101) * 2.0;
+                let rise = 6.0 + rand_f(tx, tz, 1102) * 5.0;
+                let n = 11;
+                for k in 0..=n {
+                    let t = k as f32 / n as f32 * std::f32::consts::PI;
+                    let p = dir * (-t.cos() * span) + Vec3::Y * (t.sin() * rise);
+                    let foot = 1.0 - t.sin();
+                    let r = 1.0 + 0.9 * foot + 0.2 * rand_f(tx, tz, 1110 + k as u64);
+                    sk.rocks.push(LeafBlob { center: p, radius: Vec3::new(r, r * 0.9, r * 1.1) });
+                }
+                sk.rock_style = 1;
+            }
+            TreeKind::TermiteMound => {
+                // Cône de terre rouge-ocre, parfois avec une cheminée.
+                let h = 1.4 + rand_f(tx, tz, 995) * 1.8;
+                let r = 0.6 + rand_f(tx, tz, 996) * 0.35;
+                sk.rocks.push(LeafBlob { center: Vec3::new(0.0, h * 0.35, 0.0), radius: Vec3::new(r, h * 0.55, r) });
+                sk.rocks.push(LeafBlob { center: Vec3::new(0.1, h * 0.85, 0.0), radius: Vec3::new(r * 0.45, h * 0.35, r * 0.45) });
+                sk.rock_style = 2;
             }
             TreeKind::Emergent => {
                 // Fût lisse et droit qui perce la canopée, branches seulement

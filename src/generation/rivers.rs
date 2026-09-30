@@ -41,7 +41,8 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use crate::constants::{SEA_LEVEL, WORLD_SIZE};
-use crate::generation::biome::BiomeType;
+use crate::generation::biome::{get_biome_data, BiomeType};
+use crate::generation::landforms::Variant;
 use crate::generation::generate_biome_map::BiomeMap;
 use crate::generation::generate_height_map::{HeightMap, LAKE_LEVEL};
 use crate::generation::procedural::{gradient_noise, hash, rand01};
@@ -142,6 +143,8 @@ const LAKE_MIN_DEPTH: f32 = 6.0;
 const LAKE_CELLS: (f64, f64) = (2.0, 8.0);
 const LAKE_RADIUS: f64 = 150.0;
 pub const LAKE_CORE: f64 = 0.45;
+/// Déformation max (blocs) des rives des lacs de cuvette (voir `lake_at`).
+const LAKE_SHORE_WARP: f64 = 55.0;
 const LAKE_BOWL: f64 = 7.0;
 /// Pente (blocs par bloc) de la rive imposée autour d'un lac de cuvette.
 const LAKE_RIM_SLOPE: f64 = 0.4;
@@ -293,18 +296,8 @@ impl WaterTint {
 
 /// Apport local (par unité de pluie) au caractère de l'eau, selon le biome.
 fn local_tint(biome: BiomeType, temperature: f32, mountain: f32) -> WaterTint {
-    let (silt, tannin) = match biome {
-        BiomeType::Badlands => (1.0, 0.0),
-        BiomeType::Desert => (0.8, 0.0),
-        BiomeType::Savanna => (0.7, 0.0),
-        BiomeType::Plain => (0.55, 0.0),
-        BiomeType::Jungle => (0.5, 0.35),
-        BiomeType::Swamp => (0.3, 0.85),
-        BiomeType::Forest => (0.2, 0.1),
-        BiomeType::Taiga => (0.1, 0.45),
-        BiomeType::Tundra => (0.1, 0.25),
-        _ => (0.05, 0.0),
-    };
+    let data = get_biome_data(biome, Variant::None);
+    let (silt, tannin) = (data.water_silt, data.water_tannin);
     // Farine glaciaire : montagnes froides (glaciers, névés).
     let cold = ((0.38 - temperature) / 0.2).clamp(0.0, 1.0);
     WaterTint { silt, tannin, glacial: (mountain * 1.5).min(1.0) * cold, frozen: 0.0 }
@@ -817,12 +810,16 @@ impl RiverNetwork {
                         let (x, z) = (x as i64, z as i64);
                         // Aridité : part des biomes secs (déserts, badlands, un
                         // peu la savane), pas l'humidité brute (les plaines
-                        // froides et sèches ne sont pas des déserts).
-                        let weight = |wanted: BiomeType| -> f32 {
-                            map.relief_weights(x, z).iter().filter(|(biome, _)| *biome == wanted).map(|&(_, w)| w as f32).sum()
-                        };
-                        *b = weight(BiomeType::Badlands);
-                        *a = (weight(BiomeType::Desert) + *b + 0.4 * weight(BiomeType::Savanna)).clamp(0.0, 1.0);
+                        // froides et sèches ne sont pas des déserts). Voir
+                        // `Biome::aridity`, `Biome::canyons`.
+                        let (mut arid, mut canyons) = (0f32, 0f32);
+                        for &(biome, w) in map.relief_weights(x, z).iter() {
+                            let data = get_biome_data(biome, Variant::None);
+                            arid += data.aridity * w as f32;
+                            canyons += data.canyons * w as f32;
+                        }
+                        *b = canyons;
+                        *a = arid.clamp(0.0, 1.0);
                     }
                 });
             }
@@ -992,6 +989,28 @@ impl RiverNetwork {
             // Dans un lac de cuvette : sa surface (jamais au-dessus de l'amont).
             if !lake[i].is_nan() {
                 l = lake[i].min(upstream_min[i]);
+            }
+            // Dans l'emprise d'un lac de cuvette (disques de `LAKE_RADIUS`
+            // autour de ses cases, voir `lake_at`), sans être dans une de ses
+            // cases : au plus à sa surface. Sinon le lit passait au-dessus du
+            // lac et son eau débordait sur la rive plate.
+            else {
+                let (ix, iz) = ((i % n) as i64, (i / n) as i64);
+                let reach = ((LAKE_RADIUS + LAKE_SHORE_WARP) / RIVER_CELL as f64).ceil() as i64;
+                let here = node_pos(i);
+                for dz in -reach..=reach {
+                    for dx in -reach..=reach {
+                        let (jx, jz) = (ix + dx, iz + dz);
+                        if jx < 0 || jz < 0 || jx >= n as i64 || jz >= n as i64 {
+                            continue;
+                        }
+                        let j = jz as usize * n + jx as usize;
+                        let there = node_pos(j);
+                        if !lake[j].is_nan() && (here.0 - there.0).hypot(here.1 - there.1) < LAKE_RADIUS * (1.0 - 0.5 * LAKE_CORE) + LAKE_SHORE_WARP {
+                            l = l.min(lake[j]);
+                        }
+                    }
+                }
             }
             level[i] = l;
             if d != NONE {

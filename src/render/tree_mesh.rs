@@ -230,7 +230,7 @@ fn dome(b: &mut Builder, center: Vec3, dir: Vec3, radius: f32, rect: Rect) {
 /// strates horizontales), au format du terrain lisse (voir terrain.wgsl) :
 /// roche en projection triplanaire (pas d'étirement de texture sur les gros
 /// blocs), mousse (couche d'herbe) sur le dessus, occlusion au pied.
-fn rock(b: &mut Builder, center: Vec3, radius: Vec3, seed: (i64, i64, u32), cover: f32, snowy: bool) {
+fn rock(b: &mut Builder, center: Vec3, radius: Vec3, seed: (i64, i64, u32), cover: f32, snowy: bool, style: u8) {
     let (rings, segments) = (10usize, 18usize);
     let r = |k: u32| hash(seed.0, seed.1, seed.2 + k);
     let lobes: Vec<(Vec3, f32)> = (0..5).map(|k| {
@@ -287,8 +287,16 @@ fn rock(b: &mut Builder, center: Vec3, radius: Vec3, seed: (i64, i64, u32), cove
             // (terrain.wgsl), qui lit le 1er canal d'UV comme part de terre
             // rouge et de minerai. La position qu'on y mettait les rendait
             // orange vif et mouchetés.
-            b.uvs.push([0.0, 0.0]);
-            if snowy {
+            // Roche rouge des badlands (couche de terre rouge, dont le côté
+            // est la roche rouge) ; termitière : terre, un peu rouge.
+            b.uvs.push(match style { 1 => [1.0, 0.0], 2 => [0.45, 0.0], _ => [0.0, 0.0] });
+            if style == 2 {
+                b.colors.push([0.0, 1.0, 0.0, 0.0]);
+                b.sway.push([0.0, ao]);
+            } else if style == 1 {
+                b.colors.push([0.0, 0.0, 0.0, 0.0]);
+                b.sway.push([0.0, ao]);
+            } else if snowy {
                 b.colors.push([0.0, 0.0, 1.0 - top, 0.0]);
                 b.sway.push([top, ao]);
             } else {
@@ -356,7 +364,7 @@ fn card_strip(b: &mut Builder, origin: Vec3, card: &Card, rect: Rect, tint: Vec3
     let (u0, u1) = (rect.0[0], rect.0[0] + rect.1[0]);
     let (v_top, v_bottom) = (rect.0[1], rect.0[1] + rect.1[1]);
     let phase = hash(seed.0, seed.1, seed.2) + crate::render::plant_mesh::GROUND_PLANT;
-    let liana = card.kind == CardKind::Liana;
+    let liana = matches!(card.kind, CardKind::Liana | CardKind::Moss);
     let at = |t: f32| origin + card.base + card.dir * card.length * t - Vec3::Y * card.droop * card.length * t * t;
     // Lianes : une tuile tous les 1,6 x largeur ; autres cartes : une seule
     // tuile sur toute la longueur.
@@ -522,7 +530,7 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
             let cover = match blocks { 0 => 1.0, 1..=2 => 0.8, _ => 0.62 };
             let snowy = nb.block(lx, tree.ground, lz) == BlockType::Snow;
             for (i, r) in sk.rocks.iter().enumerate() {
-                rock(&mut rocks, origin + r.center, r.radius, (tree.x, tree.z, 700 + i as u32 * 100), cover, snowy);
+                rock(&mut rocks, origin + r.center, r.radius, (tree.x, tree.z, 700 + i as u32 * 100), cover, snowy && sk.rock_style == 0, sk.rock_style);
             }
         }
         // Fougères : seulement en pleine résolution (des milliers de quads).
@@ -566,7 +574,7 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
             let rect = match c.kind {
                 CardKind::PalmFrond => atlas.palm_frond_uv,
                 CardKind::Broadleaf => atlas.broadleaf_uv,
-                CardKind::Liana => atlas.liana_uv,
+                CardKind::Liana | CardKind::Moss => atlas.liana_uv,
                 CardKind::Heliconia => atlas.heliconia_uv,
             };
             let near_only = c.kind != CardKind::PalmFrond;
@@ -574,6 +582,8 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
             let light = 0.8 + 0.3 * hash(tree.x, tree.z, 40 + i as u32);
             let tint = match c.kind {
                 CardKind::Heliconia => Vec3::splat(1.1),
+                // Mousse espagnole : gris-vert pâle, désaturé.
+                CardKind::Moss => Vec3::new(1.5, 1.0, 1.8) * light,
                 _ => Vec3::new(0.85, 1.0, 0.82) * light,
             };
             card_strip(&mut foliage, origin, c, rect, tint, (tree.x, tree.z, 60 + i as u32));
@@ -583,12 +593,15 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
         let tint = if sk.willow {
             // Saule : vert tendre tirant sur le jaune.
             Vec3::new(1.0, 1.1, 0.72) * (0.8 + 0.25 * hash(tree.x, tree.z, 4))
+        } else if sk.conifer_like {
+            // Cyprès : vert olive sombre.
+            Vec3::new(0.85, 0.95, 0.7) * (0.75 + 0.2 * hash(tree.x, tree.z, 4))
         } else if sk.tropical {
             // Feuillage tropical : vert profond (la texture est déjà sombre).
             Vec3::new(0.95, 1.1, 0.95).lerp(Vec3::new(1.05, 1.1, 0.85), hash(tree.x, tree.z, 3)) * (0.85 + 0.3 * hash(tree.x, tree.z, 4))
         } else if sk.dry {
             // Buisson sec : olive terne à brun paille.
-            Vec3::new(0.95, 0.78, 0.5).lerp(Vec3::new(1.1, 0.8, 0.5), hash(tree.x, tree.z, 3)) * (0.75 + 0.2 * hash(tree.x, tree.z, 4))
+            Vec3::new(1.15, 0.85, 0.72).lerp(Vec3::new(1.25, 0.88, 0.62), hash(tree.x, tree.z, 3)) * (0.7 + 0.2 * hash(tree.x, tree.z, 4))
         } else {
             foliage_tint(tree.x, tree.z, pine)
         };

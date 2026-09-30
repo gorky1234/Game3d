@@ -1,5 +1,5 @@
 use crate::constants::{CHUNK_SIZE, SEA_LEVEL, WORLD_HEIGHT};
-use crate::generation::biome::{get_biome_data, Biome, BiomeType};
+use crate::generation::biome::{get_biome_data, Biome, BiomeType, PatchNoise};
 use crate::generation::generate_biome_map::{BiomeMap, LAPSE_RATE};
 use crate::generation::generate_height_map::{Column, HeightMap};
 use crate::generation::landforms::Variant;
@@ -14,8 +14,8 @@ use crate::world::chunk::{copy_column_in_sections, empty_sections, set_block_in_
 /// blancs en climat tempéré (~SEA+170), dès les contreforts près des pôles,
 /// jamais sous les tropiques.
 pub const SNOW_TEMPERATURE: f64 = 0.2;
-/// En montagne, sous cette température : éboulis (gravier) plutôt qu'alpages.
-const SCREE_TEMPERATURE: f64 = 0.3;
+/// Écart de température sous la limite des neiges où tiennent des névés.
+const NEVE_MARGIN: f64 = 0.12;
 
 /// `lod_stride` : 1 = pleine résolution (une colonne calculée par bloc). >1 =
 /// une seule colonne "représentative" par bloc de `lod_stride × lod_stride`
@@ -72,8 +72,9 @@ pub async fn generate_chunk(x: i32, z: i32, biomes_map: &BiomeMap, height_map: &
             let world_x = x as i64 * CHUNK_SIZE as i64 + local_x as i64;
             let world_z = z as i64 * CHUNK_SIZE as i64 + local_z as i64;
 
-            let biome = biomes_map.get_biome(world_x, world_z);
-            let biome_data = get_biome_data(biome);
+            // Sol : limites de biome irrégulières (voir `surface_biome`).
+            let biome = biomes_map.surface_biome(world_x, world_z);
+            let biome_data = get_biome_data(biome, Variant::None);
             let height = heightmap[local_x][local_z];
             let column = columns[local_x][local_z];
             let info = biomes_map.surface_info(world_x, world_z, biome);
@@ -83,7 +84,7 @@ pub async fn generate_chunk(x: i32, z: i32, biomes_map: &BiomeMap, height_map: &
                 // Oued : sable ou galets.
                 river_bed_block(biome, world_x, world_z)
             } else {
-                surface_block(height, biome, &biome_data, world_x, world_z, &info)
+                surface_block(height, biome, world_x, world_z, &info)
             };
             let province = Province::of(biome, info.volcanic);
 
@@ -217,12 +218,9 @@ fn column_block(y: usize, height: usize, column: &Column, surface: BlockType, bi
 /// Fond du lit d'un cours d'eau : galets en climat froid et en montagne,
 /// vase en zone humide chaude, sable ou gravier (par bancs) ailleurs.
 fn river_bed_block(biome: BiomeType, world_x: i64, world_z: i64) -> BlockType {
-    match biome {
-        BiomeType::Mountain | BiomeType::Tundra | BiomeType::Taiga => BlockType::Gravel,
-        BiomeType::Swamp | BiomeType::Jungle => BlockType::Mud,
-        BiomeType::Desert | BiomeType::Badlands | BiomeType::Savanna | BiomeType::Beach => BlockType::Sand,
-        _ => if value_noise(world_x, world_z, 24, 9201) < 0.55 { BlockType::Sand } else { BlockType::Gravel },
-    }
+    get_biome_data(biome, Variant::None).river_bed.unwrap_or_else(|| {
+        if value_noise(world_x, world_z, 24, 9201) < 0.55 { BlockType::Sand } else { BlockType::Gravel }
+    })
 }
 
 /// Bloc de surface d'une colonne terrestre. `temperature` : température du
@@ -253,12 +251,22 @@ impl BiomeMap {
     }
 }
 
-pub fn surface_block(height: usize, biome: BiomeType, biome_data: &Biome, world_x: i64, world_z: i64, info: &SurfaceInfo) -> BlockType {
+pub fn surface_block(height: usize, biome: BiomeType, world_x: i64, world_z: i64, info: &SurfaceInfo) -> BlockType {
+    let data = get_biome_data(biome, info.variant);
     // Limites ondulées (pas une ligne d'altitude parfaite).
     let wobble = (world_x as f64 * 0.013).sin() * (world_z as f64 * 0.011).cos() * 9.0;
     let t = info.temperature - LAPSE_RATE * (height as f64 - wobble - SEA_LEVEL as f64 - 20.0).max(0.0);
     if t < SNOW_TEMPERATURE && height > SEA_LEVEL + 2 {
         return BlockType::Snow;
+    }
+    // Névés : plaques de neige qui tiennent sous la limite des neiges
+    // (combes à l'ombre), en taches irrégulières.
+    if data.neves && t < SNOW_TEMPERATURE + NEVE_MARGIN && height > SEA_LEVEL + 2 {
+        let k = (SNOW_TEMPERATURE + NEVE_MARGIN - t) / NEVE_MARGIN;
+        let spots = value_noise(world_x, world_z, 22, 9205) * 0.7 + value_noise(world_x, world_z, 7, 9206) * 0.3;
+        if spots > 0.78 - 0.35 * k {
+            return BlockType::Snow;
+        }
     }
     // Taches de sol : casse l'uniformité d'une surface de biome sur des
     // kilomètres (terre nue de savane, herbe dans la taïga...).
@@ -277,26 +285,31 @@ pub fn surface_block(height: usize, biome: BiomeType, biome_data: &Biome, world_
     if info.oasis > 0.45 {
         return BlockType::Grass;
     }
-    match info.variant {
-        Variant::SaltFlat => return BlockType::Salt,
-        Variant::Bog => return if patch() > 0.55 { BlockType::Mud } else { BlockType::Podzol },
-        Variant::DeadForest => return if patch() > 0.6 { BlockType::Gravel } else { BlockType::Dirt },
-        _ => {}
+    // Collines striées : couches rouge, beige et brune selon l'altitude
+    // (bandes ondulées).
+    if data.striped_surface {
+        let band = ((height as f64 + 2.0 * value_noise(world_x, world_z, 40, 9207)) / 3.0).floor() as i64;
+        return match band.rem_euclid(3) { 0 => BlockType::RedSand, 1 => BlockType::Sandstone, _ => BlockType::Dirt };
     }
-    match biome {
-        // Côte à falaises : le haut de la falaise est herbeux (une plage ne
-        // monte jamais aussi haut).
-        BiomeType::Beach if height > SEA_LEVEL + 9 => BlockType::Grass,
-        BiomeType::Tundra => if patch() > 0.7 { BlockType::Gravel } else { BlockType::Grass },
-        // Étages de végétation : alpages en bas, éboulis au-dessus, neige aux
-        // sommets. Les pentes raides restent en roche (voir `terrain_mesh`).
-        BiomeType::Mountain => if t < SCREE_TEMPERATURE { BlockType::Gravel } else { BlockType::Grass },
-        BiomeType::Savanna => if patch() > 0.68 { BlockType::Dirt } else { BlockType::Grass },
-        BiomeType::Taiga => if patch() > 0.62 { BlockType::Grass } else { BlockType::Podzol },
-        // Jungle : litière de feuilles mortes sous la canopée, herbe dans
-        // quelques clairières.
-        BiomeType::Jungle => if patch() > 0.74 { BlockType::Grass } else { BlockType::LeafLitter },
-
-        _ => biome_data.surface_block,
+    // Taches du biome ou de sa variante (voir `Biome::surface_patches`).
+    for p in data.surface_patches {
+        let n = match p.noise {
+            PatchNoise::Patch => patch(),
+            PatchNoise::Cell(cell, salt) => value_noise(world_x, world_z, cell, salt),
+        };
+        if n > p.above {
+            return p.block;
+        }
     }
+    // Côte à falaises : le haut de la falaise est herbeux (une plage ne
+    // monte jamais aussi haut).
+    if data.cliff_grass_above.is_some_and(|h| height > SEA_LEVEL + h) {
+        return BlockType::Grass;
+    }
+    // Étages de végétation : alpages en bas, éboulis au-dessus, neige aux
+    // sommets. Les pentes raides restent en roche (voir `terrain_mesh`).
+    if data.scree_temperature.is_some_and(|scree| t < scree) {
+        return BlockType::Gravel;
+    }
+    data.surface_block
 }

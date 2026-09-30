@@ -127,7 +127,7 @@ pub struct SkyboxPlugin;
 impl Plugin for SkyboxPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SkyState>()
-            .init_resource::<JungleAir>()
+            .init_resource::<BiomeAir>()
             .init_resource::<CloudDrift>()
             .insert_resource(CycleTimer(Timer::from_seconds(SUN_UPDATE_INTERVAL_SECS, TimerMode::Repeating)))
             // La lumière du ciel vient de la carte d'environnement ; cette
@@ -140,7 +140,7 @@ impl Plugin for SkyboxPlugin {
             })
             .add_plugins(MaterialPlugin::<CloudMaterial>::default())
             .add_systems(Startup, (setup_skybox, setup_atmosphere, setup_horizon_ring, setup_clouds))
-            .add_systems(Update, (attach_sky_environment, update_jungle_air, daylight_cycle, follow_horizon_ring, update_clouds, follow_fog_volume));
+            .add_systems(Update, (attach_sky_environment, update_biome_air, daylight_cycle, follow_horizon_ring, update_clouds, follow_fog_volume));
     }
 }
 
@@ -228,45 +228,78 @@ pub fn fog_falloff(amount: f32) -> FogFalloff {
 #[derive(Component)]
 struct FogVolumeMarker;
 
-/// Air de la jungle autour du joueur (0..1, part du biome jungle, lissée
-/// dans le temps) : sous la canopée, brume humide plus dense et verdâtre
-/// (faisceaux de soleil entre les feuillages, voir `daylight_cycle`).
+/// Air des biomes autour du joueur : part (0..1, lissée dans le temps) de
+/// la jungle, du marais, des régions sèches (désert, badlands) et froides
+/// (toundra) ; module brume, faisceaux et étalonnage (`daylight_cycle`) :
+/// - jungle : brume humide verdâtre, faisceaux de soleil sous la canopée ;
+/// - marais : brume basse épaisse, gris-vert, couleurs éteintes ;
+/// - désert : air sec et limpide, lumière chaude ;
+/// - toundra : lumière froide, léger voile blanc.
 #[derive(Resource, Default)]
-pub struct JungleAir {
-    pub amount: f32,
-    target: f32,
+pub struct BiomeAir {
+    pub jungle: f32,
+    pub swamp: f32,
+    pub dry: f32,
+    pub cold: f32,
+    /// Marais mort (0..1) : brume sombre, couleurs presque éteintes.
+    pub gloom: f32,
+    target: [f32; 5],
     since_update: f32,
 }
 
-/// Renforcement de la brume volumétrique (faisceaux) et de la brume de
-/// distance en pleine jungle ; plafond de la brume volumétrique.
+/// Renforcement de la brume volumétrique et de la brume de distance en
+/// pleine jungle / en plein marais ; plafond de la brume volumétrique.
 const JUNGLE_VOLUME_BOOST: f32 = 2.2;
 const JUNGLE_FOG_BOOST: f32 = 2.5;
-const JUNGLE_VOLUME_MAX_DENSITY: f32 = 0.011;
-/// Temps (s) pour passer de la lisière à la pleine jungle.
-const JUNGLE_AIR_FADE: f32 = 4.0;
+const SWAMP_VOLUME_BOOST: f32 = 2.8;
+const SWAMP_FOG_BOOST: f32 = 4.0;
+const DRY_FOG_FACTOR: f32 = 0.55;
+const MOIST_VOLUME_MAX_DENSITY: f32 = 0.012;
+/// Temps (s) pour passer d'un air à l'autre.
+const BIOME_AIR_FADE: f32 = 4.0;
 
-fn update_jungle_air(
+fn update_biome_air(
     time: Res<Time>,
     biome_map: Option<Res<crate::generation::chunk_generation_logic::BiomeMapArc>>,
     players: Query<&Transform, With<Player>>,
-    mut air: ResMut<JungleAir>,
+    mut air: ResMut<BiomeAir>,
 ) {
+    use crate::generation::biome::{get_biome_data, Air};
+    use crate::generation::landforms::Variant;
     let dt = time.delta_secs();
     air.since_update += dt;
     if air.since_update >= 0.5 {
         air.since_update = 0.0;
         if let (Ok(player), Some(map)) = (players.single(), biome_map) {
             let (x, z) = (player.translation.x as i64, player.translation.z as i64);
-            air.target = map.0.relief_weights(x, z).iter()
-                .filter(|(biome, _)| *biome == crate::generation::biome::BiomeType::Jungle)
-                .map(|&(_, w)| w as f32)
-                .sum::<f32>()
-                .clamp(0.0, 1.0);
+            let mut t = [0f32; 5];
+            for (biome, w) in map.0.relief_weights(x, z) {
+                let w = w as f32;
+                match get_biome_data(biome, Variant::None).air {
+                    Air::Jungle => t[0] += w,
+                    Air::Swamp => t[1] += w,
+                    Air::Dry => t[2] += w,
+                    Air::Cold => t[3] += w,
+                    Air::Neutral => {}
+                }
+            }
+            // Variantes : brume des marais plus ou moins épaisse, marais
+            // mort sombre (voir `Biome::air_swamp_factor`, `air_gloom`).
+            let biome = map.0.get_biome(x, z);
+            let (variant, vw) = map.0.variant(x, z, biome);
+            let (data, vw) = (get_biome_data(biome, variant), vw as f32);
+            t[1] *= 1.0 + (data.air_swamp_factor - 1.0) * vw;
+            t[4] += data.air_gloom * vw;
+            air.target = t.map(|v| v.clamp(0.0, 1.6));
         }
     }
-    let k = (dt / JUNGLE_AIR_FADE).min(1.0);
-    air.amount += (air.target - air.amount) * k;
+    let k = (dt / BIOME_AIR_FADE).min(1.0);
+    let t = air.target;
+    air.jungle += (t[0] - air.jungle) * k;
+    air.swamp += (t[1] - air.swamp) * k;
+    air.dry += (t[2] - air.dry) * k;
+    air.cold += (t[3] - air.cold) * k;
+    air.gloom += (t[4] - air.gloom) * k;
 }
 
 fn follow_fog_volume(
@@ -610,11 +643,11 @@ fn daylight_cycle(
     mut timer: ResMut<CycleTimer>,
     mut sky: ResMut<SkyState>,
     weather: Res<Weather>,
-    jungle: Res<JungleAir>,
+    air: Res<BiomeAir>,
     time: Res<Time>,
 ) {
     let weather = weather.current;
-    let jungle = jungle.amount;
+    let (jungle, swamp, dry, cold, gloom) = (air.jungle, air.swamp, air.dry, air.cold, air.gloom);
     timer.0.tick(time.delta());
     // Toujours à la toute première image (le timer n'a pas encore fini) pour
     // ne pas démarrer avec un soleil par défaut.
@@ -689,7 +722,11 @@ fn daylight_cycle(
         let t = (daylight / 0.2).clamp(0.0, 1.0);
         grading.global.post_saturation = 0.3 + 0.7 * t * t * (3.0 - 2.0 * t);
         // Jungle : lumière filtrée par les feuilles, légèrement verte.
-        grading.global.tint = -0.04 * jungle;
+        grading.global.tint = -0.04 * jungle - 0.02 * swamp;
+        // Marais : couleurs éteintes ; désert : lumière chaude ; toundra :
+        // lumière froide.
+        grading.global.post_saturation *= (1.0 - 0.18 * swamp.min(1.0)) * (1.0 - 0.35 * gloom);
+        grading.global.temperature = 0.012 + 0.03 * dry - 0.035 * cold;
     }
 
     for mut environment in &mut environments {
@@ -704,10 +741,17 @@ fn daylight_cycle(
         let grey = Color::srgb(0.58, 0.6, 0.62).to_linear() * (0.05 + 0.95 * daylight);
         fog.color = Color::from(horizon_color(daylight).to_linear().mix(&grey, weather.cloud_grey));
         // Jungle : air humide, brume verdâtre plus proche.
-        let fog_color = fog.color.to_linear().mix(&(Color::srgb(0.55, 0.66, 0.5).to_linear() * (0.05 + 0.95 * daylight)), 0.45 * jungle);
+        let lit = 0.05 + 0.95 * daylight;
+        let fog_color = fog.color.to_linear()
+            .mix(&(Color::srgb(0.55, 0.66, 0.5).to_linear() * lit), 0.45 * jungle)
+            .mix(&(Color::srgb(0.6, 0.64, 0.58).to_linear() * lit), 0.55 * swamp)
+            .mix(&(Color::srgb(0.82, 0.86, 0.9).to_linear() * lit), 0.3 * cold)
+            .mix(&(Color::srgb(0.34, 0.37, 0.34).to_linear() * lit), 0.6 * gloom);
         fog.color = Color::from(fog_color);
-        // Brume plus proche quand elle est épaisse (brouillard, pluie, matin).
-        fog.falloff = fog_falloff(fog_amount * (1.0 + (JUNGLE_FOG_BOOST - 1.0) * jungle));
+        // Brume plus proche quand elle est épaisse (brouillard, pluie, matin),
+        // en forêt humide et au marais ; plus lointaine dans l'air sec.
+        let biome_fog = (1.0 + (JUNGLE_FOG_BOOST - 1.0) * jungle + (SWAMP_FOG_BOOST - 1.0) * swamp) * (1.0 - (1.0 - DRY_FOG_FACTOR) * dry);
+        fog.falloff = fog_falloff(fog_amount * biome_fog);
         // Halo du soleil dans la brume : plus marqué et plus orangé quand il
         // est bas, absent la nuit.
         let low = 1.0 - elevation.clamp(0.0, 0.6) / 0.6;
@@ -723,11 +767,12 @@ fn daylight_cycle(
         // brume de distance.
         // Jungle : brume humide plus dense sous la canopée, où les ombres des
         // feuillages découpent des faisceaux de soleil.
-        let boost = 1.0 + (JUNGLE_VOLUME_BOOST - 1.0) * jungle;
-        let max = FOG_VOLUME_MAX_DENSITY + (JUNGLE_VOLUME_MAX_DENSITY - FOG_VOLUME_MAX_DENSITY) * jungle;
+        let moist = (jungle + swamp).min(1.0);
+        let boost = (1.0 + (JUNGLE_VOLUME_BOOST - 1.0) * jungle + (SWAMP_VOLUME_BOOST - 1.0) * swamp) * (1.0 - 0.5 * dry);
+        let max = FOG_VOLUME_MAX_DENSITY + (MOIST_VOLUME_MAX_DENSITY - FOG_VOLUME_MAX_DENSITY) * moist;
         volume.density_factor = (FOG_VOLUME_DENSITY * (1.0 + 0.8 * low) * daylight.max(0.15) * fog_amount * boost).min(max);
         let warm = Color::srgb(1.0, 0.92 - 0.1 * low, 0.82 - 0.2 * low).to_linear();
-        volume.fog_color = Color::from(warm.mix(&Color::srgb(0.85, 1.0, 0.8).to_linear(), 0.35 * jungle));
+        volume.fog_color = Color::from(warm.mix(&Color::srgb(0.85, 1.0, 0.8).to_linear(), 0.35 * jungle).mix(&Color::srgb(0.85, 0.9, 0.85).to_linear(), 0.4 * swamp));
     }
 }
 

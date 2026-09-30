@@ -5,6 +5,7 @@ use crate::generation::biome::{get_biome_data, BiomeType, INLAND_BIOMES};
 use crate::generation::generate_biome_map::{BiomeMap, LAPSE_RATE, SWAMP_POOL_MAX_DEPTH};
 use crate::generation::procedural::{eroded_fbm, eroded_fbm_d, gully_erosion, micro_relief, noise_seed, smoothstep};
 use std::collections::HashMap;
+use crate::generation::landforms::Variant;
 use crate::generation::rivers::{lake_rim, shape_lake, RiverNetwork, RiverSegment, RIVER_FLOW};
 
 /// Colonne de terrain : hauteur continue (partie entière = bloc de surface,
@@ -184,7 +185,11 @@ impl HeightMap{
             salt = m > 0.45;
         }
         let water = basin_water.unwrap_or(if natural.lake { LAKE_LEVEL } else { SEA_LEVEL });
-        let Some(river) = RiverNetwork::carve(world_x, world_z, natural.height, natural.lake, segments) else {
+        // Lac de cuvette : la rivière garde ses berges (elle peut y arriver
+        // plus haut que la surface, en cascade, et son eau déborderait sur la
+        // rive plate du lac) ; lacs de l'intérieur : sans berges.
+        let lake_carve = natural.lake && basin_water.is_none();
+        let Some(river) = RiverNetwork::carve(world_x, world_z, natural.height, lake_carve, segments) else {
             return Column { height: soft_ceiling(natural.height), water, river_bed: false, dry_bed: false, salt };
         };
         // Dans un lac, sa surface fait loi : une rivière qui y entre plus haut
@@ -235,6 +240,8 @@ impl HeightMap{
         // Parts de désert (oasis, désert de sel), de taïga (tourbières) et de
         // montagne (glaciers) au point.
         let (mut dry_w, mut taiga_w, mut mountain_w) = (0.0, 0.0, 0.0);
+        let mut desert_w = 0.0;
+        let mut badlands_w = 0.0;
         // Pente (blocs par bloc) du relief propre des montagnes : oriente
         // leurs ravines (voir `gully_erosion`).
         let mut mountain_slope = (0.0, 0.0);
@@ -248,20 +255,27 @@ impl HeightMap{
                 continue;
             }
             match relief_biome {
-                BiomeType::Desert | BiomeType::Badlands => dry_w += weight,
+                BiomeType::Desert => {
+                    dry_w += weight;
+                    desert_w += weight;
+                }
+                BiomeType::Badlands => {
+                    dry_w += weight;
+                    badlands_w += weight;
+                }
                 BiomeType::Taiga => taiga_w += weight,
                 BiomeType::Mountain => mountain_w += weight,
                 _ => {}
             }
-            bumps += weight * micro_relief_strength(relief_biome);
-            let data = get_biome_data(relief_biome);
+            let data = get_biome_data(relief_biome, Variant::None);
+            bumps += weight * data.micro_relief;
             if fbms.len() <= data.octaves {
                 fbms.resize_with(data.octaves + 1, || None);
             }
             // set_octaves() (pas une affectation directe de fbm.octaves) : le
             // champ public ne suffit pas, `scale_factor` et `sources` ne
             // seraient pas recalculés.
-            let erosion = erosion_strength(relief_biome);
+            let erosion = data.erosion;
             let noise = if erosion > 0.0 {
                 let ridged = relief_biome == BiomeType::Mountain;
                 if ridged {
@@ -284,7 +298,7 @@ impl HeightMap{
             // Tourbière : relief presque plat.
             let flatten = if relief_biome == BiomeType::Taiga { 1.0 - 0.75 * bog_w } else { 1.0 };
             relief += weight * noise * data.amplitude * variation * flatten;
-            if relief_biome == BiomeType::Badlands {
+            if data.terraces {
                 terraces += weight;
             }
         }
@@ -304,6 +318,49 @@ impl HeightMap{
             relief += mountain_w * gully_erosion(world_x as f64, world_z as f64, mountain_slope, GULLY_CELL, GULLY_DEPTH, GULLY_OCTAVES);
         }
 
+        // Dunes du désert : crêtes transversales au vent (dos en pente douce,
+        // versant raide sous le vent), ondulées et de hauteur variable.
+        // Variantes : erg (dunes géantes), reg (presque plat), désert de
+        // roches (buttes à sommet plat).
+        if desert_w > 1e-5 {
+            let (variant, vw) = biomes_map.variant(world_x, world_z, BiomeType::Desert);
+            let var = get_biome_data(BiomeType::Desert, variant);
+            // Bord du champ de dunes irrégulier (pas la limite droite du
+            // poids du biome) : les dunes s'éteignent par langues.
+            let edge = crate::generation::procedural::gradient_noise(world_x as f64 / 150.0 - 2.3, world_z as f64 / 150.0 + 9.1).0 * 0.35;
+            let field = smoothstep(0.25, 0.85, desert_w + edge);
+            let (x, z) = (world_x as f64, world_z as f64);
+            // Dunes de la variante (erg : plus grandes), pondérées par son
+            // poids ; aplanies (reg, désert de roches).
+            let scaled = if var.dune_scale != 1.0 { vw } else { 0.0 };
+            let dunes = dune_field(x, z, 1.0) * (1.0 - scaled) + dune_field(x, z, var.dune_scale) * var.dune_scale * scaled;
+            relief += field * dunes * (1.0 - var.dune_flatten * vw);
+            // Buttes et inselbergs : sommets plats, flancs raides.
+            let rock = (if var.butte_height > 0.0 { vw } else { 0.0 }) * desert_w;
+            if rock > 0.0 {
+                let n = crate::generation::procedural::gradient_noise(x / 140.0 + 4.4, z / 140.0 - 8.8).0;
+                relief += rock * var.butte_height * smoothstep(0.25, 0.4, n);
+            }
+        }
+        // Badlands : gorges étroites, plateau de mesas surélevé, collines
+        // striées (arrondies, sans terrasses).
+        if badlands_w > 1e-5 {
+            let (variant, vw) = biomes_map.variant(world_x, world_z, BiomeType::Badlands);
+            let var = get_biome_data(BiomeType::Badlands, variant);
+            let share = vw * badlands_w;
+            let (x, z) = (world_x as f64, world_z as f64);
+            let gorges = if var.gorge_depth > 0.0 { share } else { 0.0 };
+            if gorges > 0.0 {
+                // Lignes de crête d'un bruit (|n| petit) : réseau de gorges
+                // sinueuses, étroites et profondes.
+                let n = crate::generation::procedural::gradient_noise(x / 170.0 - 1.7, z / 170.0 + 6.2).0
+                    + 0.35 * crate::generation::procedural::gradient_noise(x / 55.0, z / 55.0).0;
+                let slot = (1.0 - (n.abs() / 0.12).min(1.0)).powi(2);
+                relief -= gorges * var.gorge_depth * slot;
+            }
+            relief += (if var.mesa_lift > 0.0 { share } else { 0.0 }) * var.mesa_lift;
+            terraces *= 1.0 - share * (1.0 - var.terrace_factor);
+        }
         let mut height_f = base_height + relief;
         let mut lake = false;
         let mut inland = false;
@@ -349,7 +406,7 @@ impl HeightMap{
             if mountain_w > 1e-5 {
                 let t_sea = biomes_map.temperature_at(world_x, world_z);
                 if t_sea < 0.6 {
-                    let data = get_biome_data(BiomeType::Mountain);
+                    let data = get_biome_data(BiomeType::Mountain, Variant::None);
                     let smooth = eroded_fbm(world_x as f64, world_z as f64, data.frequency, 2, 1.0, true) * data.amplitude;
                     let top = base_height + smooth * 0.9 + 4.0;
                     let t_top = t_sea - LAPSE_RATE * (top - SEA_LEVEL as f64 - 20.0).max(0.0);
@@ -469,6 +526,31 @@ fn terrace(h: f64) -> f64 {
     LAKE_LEVEL as f64 + TERRACE_STEP * (step + frac.powi(8))
 }
 
+/// Champs de dunes : longueur d'onde (blocs), hauteur max des crêtes,
+/// direction du vent dominant (radians).
+const DUNE_WAVELENGTH: f64 = 70.0;
+const DUNE_HEIGHT: f64 = 11.0;
+const DUNE_WIND: f64 = 0.6;
+
+/// Relief des dunes en (x, z) (0 .. DUNE_HEIGHT environ), longueur d'onde
+/// multipliée par `scale`.
+fn dune_field(x: f64, z: f64, scale: f64) -> f64 {
+    let (x, z) = (x / scale, z / scale);
+    let (c, s) = (DUNE_WIND.cos(), DUNE_WIND.sin());
+    let along = (x * c + z * s) / DUNE_WAVELENGTH;
+    let across = (-x * s + z * c) / DUNE_WAVELENGTH;
+    // Crêtes sinueuses : décalage lent le long de la crête.
+    let bend = crate::generation::procedural::gradient_noise(across * 0.35 + 3.1, along * 0.12 - 7.7).0 * 1.3
+        + crate::generation::procedural::gradient_noise(x / 45.0, z / 45.0).0 * 0.25;
+    let f = (along + bend).rem_euclid(1.0);
+    // Dos (70 % de la longueur d'onde) puis versant d'éboulement raide.
+    let profile = if f < 0.7 { f / 0.7 } else { (1.0 - f) / 0.3 };
+    let profile = profile * profile * (3.0 - 2.0 * profile);
+    // Hauteur des crêtes variable (grandes dunes, zones plus plates).
+    let size = 0.35 + 0.65 * (0.5 + 0.5 * crate::generation::procedural::gradient_noise(x / 400.0 + 11.0, z / 400.0 - 5.0).0).clamp(0.0, 1.0);
+    DUNE_HEIGHT * size * profile
+}
+
 /// Plafond du relief, sous le haut du monde : au-delà de CEILING_START, la
 /// hauteur tend en douceur vers CEILING au lieu d'être tranchée à plat par la
 /// limite des blocs (sommets rabotés).
@@ -481,38 +563,5 @@ fn soft_ceiling(h: f64) -> f64 {
     }
     let range = CEILING - CEILING_START;
     CEILING_START + range * ((h - CEILING_START) / range).tanh()
-}
-
-/// Force du micro-relief (voir `micro_relief`) par biome.
-fn micro_relief_strength(biome: BiomeType) -> f64 {
-    match biome {
-        BiomeType::Plain | BiomeType::Forest => 1.0,
-        BiomeType::Mountain => 1.3,
-        BiomeType::Tundra => 0.8,
-        BiomeType::Taiga | BiomeType::Jungle => 1.0,
-        BiomeType::Savanna => 0.7,
-        BiomeType::Swamp => 0.6,
-        BiomeType::Desert | BiomeType::Badlands => 0.3,
-        _ => 0.15,
-    }
-}
-
-/// Force de l'« érosion » du relief d'un biome (voir `eroded_fbm`), 0 : Fbm
-/// Perlin classique. Pas d'érosion pour les dunes, plages, fonds marins et
-/// marais (formes lisses voulues).
-fn erosion_strength(biome: BiomeType) -> f64 {
-    match biome {
-        // Montagnes : 1,0 lissait tout versant raide (grands cônes sans
-        // aucun détail) ; leurs ravines font le reste (`gully_erosion`).
-        BiomeType::Mountain => 0.6,
-        BiomeType::Plain => 0.6,
-        BiomeType::Forest => 0.5,
-        BiomeType::Tundra => 0.4,
-        BiomeType::Taiga => 0.5,
-        BiomeType::Jungle => 0.8,
-        BiomeType::Savanna => 0.4,
-        BiomeType::Badlands => 0.7,
-        _ => 0.0,
-    }
 }
 
