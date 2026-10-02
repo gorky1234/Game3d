@@ -10,8 +10,8 @@
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy_rapier3d::prelude::{GravityScale, RigidBody, Velocity};
-use crate::generation::generate_biome_map::BiomeMap;
-use crate::generation::generate_height_map::HeightMap;
+use crate::generation::biome_map::BiomeMap;
+use crate::generation::terrain::HeightMap;
 use crate::player::{Player, PlayerCamera, PlayerMode};
 use crate::world::load_save_chunk::WorldData;
 
@@ -148,7 +148,7 @@ fn run_capture(
 /// du rendu pour mesurer ce que chacun coûte (même scène, avec et sans).
 /// Éléments : herbe, feuillage, feuillage_loin, feuillage_proche, ecorce, terrain, eau, nuages, ombres,
 /// ombres_feuillage, ombres_volumes, ombres_terrain, ombres_ecorce, ssao, taa, cas, brume_vol, bloom, expo, film, optique,
-/// ciel_env, brume, embruns (voir waterfall_spray.rs), flou_mouvement,
+/// ombres_douces (PCSS, voir skybox.rs), ciel_env, brume, brume_sol, brume_marais (voir height_fog.rs), arbres_lointains (voir far_terrain.rs), embruns (voir waterfall_spray.rs), flou_mouvement,
 /// profondeur_champ (voir camera.rs), filtre_gauss (-> 2x2 matériel), filtre_gauss_temporel
 /// (-> temporel), ombres_4096 (-> 2048), cascade3 (-> 2 cascades).
 /// L'élément `name` est-il coupé par `GAME3D_DISABLE` ?
@@ -161,16 +161,17 @@ fn apply_disabled_features(
     cameras: Query<Entity, With<Camera3d>>,
     mut lights: Query<(Entity, &mut DirectionalLight)>,
     atlas: Option<Res<crate::texture::TextureAtlasMaterial>>,
-    mut plants: Query<(Entity, &MeshMaterial3d<crate::texture::PlantMaterial>, &mut Visibility)>,
+    mut plants: Query<(Entity, &MeshMaterial3d<crate::texture::PlantMaterial>, &mut Visibility), Without<crate::render::far_terrain::FarTrees>>,
     mut terrain: Query<&mut Visibility, (With<MeshMaterial3d<crate::texture::TerrainMaterial>>, Without<MeshMaterial3d<crate::texture::PlantMaterial>>)>,
     mut water: Query<&mut Visibility, (With<MeshMaterial3d<crate::texture::WaterMaterial>>, Without<MeshMaterial3d<crate::texture::PlantMaterial>>, Without<MeshMaterial3d<crate::texture::TerrainMaterial>>)>,
-    mut bark: Query<&mut Visibility, (With<MeshMaterial3d<StandardMaterial>>, With<crate::render::chunk_loadings_mesh_logic::ChunkSectionMesh>, Without<MeshMaterial3d<crate::texture::PlantMaterial>>, Without<MeshMaterial3d<crate::texture::TerrainMaterial>>, Without<MeshMaterial3d<crate::texture::WaterMaterial>>)>,
-    mut clouds: Query<&mut Visibility, (With<MeshMaterial3d<crate::render::skybox::CloudMaterial>>, Without<MeshMaterial3d<StandardMaterial>>, Without<MeshMaterial3d<crate::texture::PlantMaterial>>, Without<MeshMaterial3d<crate::texture::TerrainMaterial>>, Without<MeshMaterial3d<crate::texture::WaterMaterial>>)>,
+    mut bark: Query<&mut Visibility, (With<MeshMaterial3d<crate::texture::BarkMaterial>>, With<crate::render::chunk_loadings_mesh_logic::ChunkSectionMesh>, Without<MeshMaterial3d<crate::texture::PlantMaterial>>, Without<MeshMaterial3d<crate::texture::TerrainMaterial>>, Without<MeshMaterial3d<crate::texture::WaterMaterial>>)>,
+    mut clouds: Query<&mut Visibility, (With<MeshMaterial3d<crate::render::skybox::CloudMaterial>>, Without<MeshMaterial3d<crate::texture::BarkMaterial>>, Without<MeshMaterial3d<crate::texture::PlantMaterial>>, Without<MeshMaterial3d<crate::texture::TerrainMaterial>>, Without<MeshMaterial3d<crate::texture::WaterMaterial>>)>,
     proxies: Query<Entity, With<MeshMaterial3d<crate::texture::ShadowProxyMaterial>>>,
     tree_foliage: Query<(Entity, &crate::render::chunk_loadings_mesh_logic::TreeFoliage)>,
     player_pos: Query<&Transform, (With<Player>, Without<Camera>)>,
     terrain_casters: Query<Entity, With<MeshMaterial3d<crate::texture::TerrainMaterial>>>,
-    bark_casters: Query<Entity, (With<MeshMaterial3d<StandardMaterial>>, With<crate::render::chunk_loadings_mesh_logic::ChunkSectionMesh>)>,
+    bark_casters: Query<Entity, (With<MeshMaterial3d<crate::texture::BarkMaterial>>, With<crate::render::chunk_loadings_mesh_logic::ChunkSectionMesh>)>,
+    mut far_trees: Query<&mut Visibility, (With<crate::render::far_terrain::FarTrees>, With<MeshMaterial3d<crate::texture::PlantMaterial>>)>,
     mut done: Local<bool>,
 ) {
     use bevy::anti_alias::{contrast_adaptive_sharpening::ContrastAdaptiveSharpening, taa::TemporalAntiAliasing};
@@ -195,6 +196,7 @@ fn apply_disabled_features(
             if off("flou_mouvement") { e.remove::<bevy::post_process::motion_blur::MotionBlur>(); }
             if off("ciel_env") { e.remove::<(AtmosphereEnvironmentMapLight, GeneratedEnvironmentMapLight)>(); }
             if off("brume") { e.remove::<DistanceFog>(); }
+            if off("brume_sol") { e.remove::<crate::render::height_fog::HeightFog>(); }
             if off("filtre_gauss") { e.insert(bevy::light::ShadowFilteringMethod::Hardware2x2); }
             if off("filtre_gauss_temporel") { e.insert(bevy::light::ShadowFilteringMethod::Temporal); }
             *done = true;
@@ -208,6 +210,7 @@ fn apply_disabled_features(
             commands.entity(entity).insert(bevy::light::CascadeShadowConfigBuilder { num_cascades: 2, first_cascade_far_bound: 30.0, maximum_distance: 220.0, ..default() }.build());
         }
         if off("ombres") { light.shadow_maps_enabled = false; }
+        if off("ombres_douces") && light.soft_shadow_size.is_some() { light.soft_shadow_size = None; }
         if off("brume_vol") { commands.entity(entity).remove::<VolumetricLight>(); }
     }
     if let Some(atlas) = atlas {
@@ -233,4 +236,5 @@ fn apply_disabled_features(
     if off("ombres_terrain") { terrain_casters.iter().for_each(|e| { commands.entity(e).try_insert(NotShadowCaster); }); }
     if off("ombres_ecorce") { bark_casters.iter().for_each(|e| { commands.entity(e).try_insert(NotShadowCaster); }); }
     if off("nuages") { clouds.iter_mut().for_each(|mut v| hide(&mut v)); }
+    if off("arbres_lointains") { far_trees.iter_mut().for_each(|mut v| hide(&mut v)); }
 }

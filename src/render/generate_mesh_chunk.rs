@@ -2,7 +2,7 @@
 //! (block_mesh.rs), plantes (plant_mesh.rs), terrain lisse (smooth_terrain.rs),
 //! puis arbres (tree_mesh.rs).
 use bevy::prelude::*;
-use crate::generation::generate_biome_map::BiomeMap;
+use crate::generation::biome_map::BiomeMap;
 use crate::generation::rivers::{unwarp, RiverNetwork, RiverSegment, WaterTint};
 use crate::render::block_mesh::{generate_quads_for_section, quads_to_mesh, Direction, Quad};
 use crate::render::plant_mesh::plant_mesh;
@@ -506,19 +506,73 @@ fn tint_uv(tint: WaterTint) -> [f32; 2] {
     [tint.silt - tint.glacial, tint.tannin]
 }
 
-/// Couleur propre de l'eau des cours d'eau à chaque sommet (voir `tint_uv`) ;
-/// nulle en mer et dans les lacs.
+/// Couleur propre de l'eau à chaque sommet (voir `tint_uv`) : celle du
+/// cours d'eau le plus proche, et celle du biome pour l'eau dormante (lacs,
+/// mares, nappes des marais) -- seuls les cours d'eau étaient teintés, une
+/// mare du marais mort était bleu turquoise et limpide comme un lac de
+/// montagne. Pas la mer.
 fn mark_water_tint(mesh: &mut Mesh, origin: (i32, i32, i32), segments: &[RiverSegment]) {
     let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) else { return };
-    let tints: Vec<WaterTint> = if segments.is_empty() {
-        vec![WaterTint::default(); positions.len()]
-    } else {
-        positions.iter().map(|p| RiverNetwork::water_tint(origin.0 as f64 + p[0] as f64, origin.2 as f64 + p[2] as f64, segments)).collect()
-    };
+    let mut cache: std::collections::HashMap<(i64, i64), WaterTint> = std::collections::HashMap::new();
+    let tints: Vec<WaterTint> = positions.iter().map(|p| {
+        let (x, z) = (origin.0 as f64 + p[0] as f64, origin.2 as f64 + p[2] as f64);
+        let river = if segments.is_empty() { WaterTint::default() } else { RiverNetwork::water_tint(x, z, segments) };
+        // Teinte du biome, par cases de 4 blocs (elle varie lentement).
+        let key = ((x as i64).div_euclid(4), (z as i64).div_euclid(4));
+        let still = *cache.entry(key).or_insert_with(|| still_water_tint(key.0 * 4 + 2, key.1 * 4 + 2));
+        WaterTint {
+            silt: river.silt.max(still.silt),
+            tannin: river.tannin.max(still.tannin),
+            glacial: river.glacial.max(still.glacial),
+            frozen: river.frozen,
+        }
+    }).collect();
     // 1er canal d'UV (inutile pour l'eau : pas de texture) : glace (voir
     // water.wgsl), à écrire pour tous les sommets.
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, tints.iter().map(|t| [t.frozen, 0.0]).collect::<Vec<_>>());
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, tints.iter().map(|&t| tint_uv(t)).collect::<Vec<_>>());
+}
+
+/// Caractère de l'eau dormante du biome en (x, z) : limon et tanins du
+/// biome (et de sa variante), un peu éclaircis hors des marais (les lacs
+/// décantent), farine glaciaire en montagne et en toundra froides, rien en
+/// mer.
+fn still_water_tint(x: i64, z: i64) -> WaterTint {
+    use crate::generation::biome::{get_biome_data, BiomeType};
+    use crate::generation::geology::landforms::Variant;
+    let map = BiomeMap::global();
+    // Mélangée entre biomes voisins, et entre la variante et le biome selon
+    // son poids : une bascule nette dessinait, à la frontière, une ligne
+    // droite (diagonale des grands quads d'eau) dans les lentilles d'eau.
+    let still = |biome: BiomeType, variant: Variant| -> (f64, f64) {
+        if matches!(biome, BiomeType::Ocean | BiomeType::Abyss | BiomeType::Beach) {
+            return (0.0, 0.0);
+        }
+        let data = get_biome_data(biome, variant);
+        let settle = if biome == BiomeType::Swamp { 1.0 } else { 0.6 };
+        (data.water_silt as f64 * settle, data.water_tannin as f64 * settle)
+    };
+    let silt = map.blend(x, z, |b| still(b, Variant::None).0);
+    let tannin = map.blend(x, z, |b| still(b, Variant::None).1);
+    let biome = map.get_biome(x, z);
+    let (variant, weight) = map.variant(x, z, biome);
+    let (base, with_variant) = (still(biome, Variant::None), still(biome, variant));
+    let share = map.blend(x, z, |b| if b == biome { 1.0 } else { 0.0 }) * weight;
+    let silt = (silt + (with_variant.0 - base.0) * share) as f32;
+    let tannin = (tannin + (with_variant.1 - base.1) * share) as f32;
+    // Mangrove : eau limoneuse et brune (vase remuée par la marée, tanins
+    // des palétuviers), jusque dans la mer peu profonde qui la borde.
+    let mangrove = map.mangrove(x, z) as f32;
+    let mangrove_data = get_biome_data(BiomeType::Swamp, Variant::Mangrove);
+    let (mangrove_silt, mangrove_tannin) = (mangrove_data.water_silt * mangrove, mangrove_data.water_tannin * mangrove);
+    if matches!(biome, BiomeType::Ocean | BiomeType::Abyss | BiomeType::Beach) {
+        return WaterTint { silt: mangrove_silt, tannin: mangrove_tannin, ..WaterTint::default() };
+    }
+    let (silt, tannin) = (silt.max(mangrove_silt), tannin.max(mangrove_tannin));
+    let temperature = map.temperature_at(x, z) as f32;
+    let cold = ((0.36 - temperature) / 0.2).clamp(0.0, 1.0);
+    let glacial = cold * if matches!(biome, BiomeType::Mountain | BiomeType::Tundra) { 0.9 } else { 0.4 };
+    WaterTint { silt: silt * (1.0 - glacial), tannin, glacial, frozen: 0.0 }
 }
 
 /// Courant de l'eau à chaque sommet, dans le RVB de sa couleur (lu par

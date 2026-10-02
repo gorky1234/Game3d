@@ -32,7 +32,7 @@ pub enum BlockType {
     Lichen,
     FlowerBlue,
     FlowerPurple,
-    /// Roches du sous-sol (voir generation/underground.rs) et minerais.
+    /// Roches du sous-sol (voir generation/geology/underground) et minerais.
     Granite,
     Limestone,
     Basalt,

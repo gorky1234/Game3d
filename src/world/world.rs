@@ -1,5 +1,5 @@
 use bevy::app::{App, Plugin};
-use crate::generation::chunk_generation_logic::ChunkGenerationPlugin;
+use crate::generation::chunk::chunk_generation_logic::ChunkGenerationPlugin;
 use crate::world::chunk_loadings_logic::ChunkLoadingsPlugin;
 use crate::world::load_save_chunk::{WorldData, WorldDataPlugin};
 use crate::world::weather::WeatherPlugin;

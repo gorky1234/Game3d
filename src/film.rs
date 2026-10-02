@@ -5,16 +5,17 @@
 //! Rendu calqué sur la FXAA de Bevy : un triangle plein écran qui lit l'image
 //! et écrit dans l'autre texture principale de la vue.
 use bevy::core_pipeline::schedule::{Core3d, Core3dSystems};
+use bevy::anti_alias::contrast_adaptive_sharpening::cas;
 use bevy::core_pipeline::tonemapping::tonemapping;
 use bevy::core_pipeline::FullscreenShader;
 use bevy::prelude::*;
 use bevy::render::camera::ExtractedCamera;
 use bevy::render::extract_component::{ExtractComponent, ExtractComponentPlugin};
-use bevy::render::render_resource::binding_types::{sampler, texture_2d, uniform_buffer};
+use bevy::render::render_resource::binding_types::{sampler, texture_2d, texture_depth_2d, uniform_buffer};
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, ViewQuery};
 use bevy::render::uniform::{ComponentUniforms, DynamicUniformIndex, UniformComponentPlugin};
-use bevy::render::view::{ExtractedView, ViewTarget};
+use bevy::render::view::{ExtractedView, ViewDepthTexture, ViewTarget};
 use bevy::render::{GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems};
 
 /// Réglages de la passe, sur la caméra. Couleurs en espace gamma (ajoutées à
@@ -28,8 +29,14 @@ pub struct FilmLook {
     /// x : force du grain, y : temps (s, mis à jour chaque image), z :
     /// saturation globale, w : désaturation des verts francs (0..1).
     pub params: Vec4,
-    /// x : relèvement des noirs (« fade » pellicule), yzw : inutilisés.
+    /// x : relèvement des noirs (« fade » pellicule), y : distorsion de
+    /// chaleur (0..1), z : position de l'horizon à l'écran (v, 0 en haut),
+    /// w : plan proche de la caméra (distance depuis la profondeur).
     pub params2: Vec4,
+    /// Reflets de lentille : xy position du soleil à l'écran (uv), z force
+    /// (0 : soleil derrière la caméra, nuit, ciel couvert), w : flou
+    /// atmosphérique lointain (0..1).
+    pub sun: Vec4,
 }
 
 impl Default for FilmLook {
@@ -38,7 +45,8 @@ impl Default for FilmLook {
             shadows: Vec4::new(-0.4, 0.05, 0.6, 0.04),
             highlights: Vec4::new(0.7, 0.35, -0.5, 0.035),
             params: Vec4::new(0.03, 0.0, 0.92, 0.45),
-            params2: Vec4::new(0.018, 0.0, 0.0, 0.0),
+            params2: Vec4::new(0.018, 0.0, 0.0, 0.1),
+            sun: Vec4::ZERO,
         }
     }
 }
@@ -54,16 +62,64 @@ impl Plugin for FilmPlugin {
             .init_gpu_resource::<SpecializedRenderPipelines<FilmPipeline>>()
             .add_systems(RenderStartup, init_film_pipeline)
             .add_systems(Render, prepare_film_pipelines.in_set(RenderSystems::Prepare))
-            .add_systems(Core3d, film.after(tonemapping).in_set(Core3dSystems::PostProcess));
+            // Après l'accentuation (CAS), elle aussi après le tonemapping :
+            // sans ordre entre les deux, Bevy pouvait les exécuter dans un
+            // ordre et envoyer leurs commandes au GPU dans l'autre -- chacune
+            // lisait alors la mauvaise texture de la paire, et l'écran
+            // montrait l'image d'avant le tonemapping (claire, saturée), au
+            // gré du moindre changement dans l'ordre d'exécution.
+            .add_systems(Core3d, film.after(tonemapping).after(cas).in_set(Core3dSystems::PostProcess));
     }
 }
 
 /// Grain animé : le temps change le tirage du bruit (24 fois par seconde,
 /// dans le shader, comme une pellicule).
-fn advance_grain(time: Res<Time>, mut looks: Query<&mut FilmLook>) {
-    for mut look in &mut looks {
+fn advance_grain(
+    time: Res<Time>,
+    mut looks: Query<(&mut FilmLook, &GlobalTransform, &Projection, &Camera)>,
+    suns: Query<&Transform, With<crate::render::skybox::Sun>>,
+    air: Res<crate::render::skybox::BiomeAir>,
+    sky: Res<crate::render::skybox::SkyState>,
+    weather: Res<crate::world::weather::Weather>,
+    clouds: Res<crate::render::cloud_shadows::SunThroughClouds>,
+    quality: Res<crate::graphics_quality::GraphicsQuality>,
+) {
+    let to_sun = suns.single().ok().map(|t| t.back().as_vec3());
+    for (mut look, transform, projection, camera) in &mut looks {
         look.params.y = time.elapsed_secs_wrapped();
+        // Distorsion de chaleur : régions sèches, en plein jour, soleil
+        // haut (sol brûlant), pas sous les nuages.
+        let heat = air.dry * sky.daylight * weather.current.sun * smoothstep_f32(0.25, 0.7, sky.sun_height());
+        look.params2.y = heat;
+        // Horizon à l'écran : là où ondule l'air au-dessus du sol lointain.
+        if let Projection::Perspective(p) = projection {
+            let forward = transform.forward();
+            let pitch = forward.y.clamp(-0.99, 0.99).asin();
+            let ndc_y = (-pitch).tan() / (p.fov * 0.5).tan();
+            look.params2.z = 0.5 - ndc_y * 0.5;
+            look.params2.w = p.near;
+        }
+        // Soleil à l'écran pour les reflets de lentille (le shader vérifie
+        // qu'il n'est pas masqué par le décor).
+        look.sun.z = 0.0;
+        if let Some(dir) = to_sun.filter(|d| d.y > -0.02 && sky.daylight > 0.05) {
+            if let Some(ndc) = camera.world_to_ndc(transform, transform.translation() + dir * 10_000.0) {
+                if ndc.z > 0.0 && ndc.x.abs() < 1.6 && ndc.y.abs() < 1.6 {
+                    look.sun.x = ndc.x * 0.5 + 0.5;
+                    look.sun.y = 0.5 - ndc.y * 0.5;
+                    look.sun.z = sky.daylight * weather.current.sun * clouds.0;
+                }
+            }
+        }
+        // Flou lointain : léger, qualité haute seulement (la profondeur de
+        // champ de Bevy s'arrête à 2000 blocs).
+        look.sun.w = if *quality == crate::graphics_quality::GraphicsQuality::High { 1.0 } else { 0.0 };
     }
+}
+
+fn smoothstep_f32(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[derive(Resource)]
@@ -88,6 +144,7 @@ fn init_film_pipeline(
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
                 uniform_buffer::<FilmLook>(true),
+                texture_depth_2d(),
             ),
         ),
     );
@@ -139,13 +196,13 @@ fn prepare_film_pipelines(
 }
 
 fn film(
-    view: ViewQuery<(&ViewTarget, &FilmPipelineId, &DynamicUniformIndex<FilmLook>)>,
+    view: ViewQuery<(&ViewTarget, &FilmPipelineId, &DynamicUniformIndex<FilmLook>, &ViewDepthTexture)>,
     film_pipeline: Res<FilmPipeline>,
     pipeline_cache: Res<PipelineCache>,
     uniforms: Res<ComponentUniforms<FilmLook>>,
     mut ctx: RenderContext,
 ) {
-    let (target, pipeline_id, uniform_index) = view.into_inner();
+    let (target, pipeline_id, uniform_index, depth) = view.into_inner();
     let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id.0) else { return };
     let Some(uniform_binding) = uniforms.uniforms().binding() else { return };
 
@@ -153,7 +210,7 @@ fn film(
     let bind_group = ctx.render_device().create_bind_group(
         Some("film_bind_group"),
         &pipeline_cache.get_bind_group_layout(&film_pipeline.layout),
-        &BindGroupEntries::sequential((post_process.source, &film_pipeline.sampler, uniform_binding)),
+        &BindGroupEntries::sequential((post_process.source, &film_pipeline.sampler, uniform_binding, depth.view())),
     );
     let pass_descriptor = RenderPassDescriptor {
         label: Some("film"),

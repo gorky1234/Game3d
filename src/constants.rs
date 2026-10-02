@@ -16,7 +16,10 @@ pub const VIEW_DISTANCE: i32 = 48;
 /// (1 colonne sur 16) au-delà jusqu'à VIEW_DISTANCE. Voir `generate_chunk` et
 /// `HeightMap::get_chunk`. LOD0_DISTANCE doit rester >= PHYSICS_DISTANCE : tout
 /// ce qui peut recevoir un collider doit toujours être en pleine résolution.
-pub const LOD0_DISTANCE: i32 = 6;
+/// 8 (128 blocs ; 6 auparavant) : l'herbe haute n'existe qu'en pleine
+/// résolution, la prairie s'arrêtait sur une ligne à ~90 blocs, bien visible
+/// en plaine. Coût mesuré : ~2 FPS (GTX 1650 SUPER).
+pub const LOD0_DISTANCE: i32 = 8;
 pub const LOD1_DISTANCE: i32 = 14;
 
 /// Rayon (en chunks) au-delà duquel un chunk déjà maillé libère ses blocs (voir

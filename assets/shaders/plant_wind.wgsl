@@ -9,7 +9,7 @@
     view_transformations::position_world_to_clip,
     mesh_view_bindings::{globals, view},
 }
-#import "shaders/wind_common.wgsl"::{wind_offset, ground_plant_hidden}
+#import "shaders/wind_common.wgsl"::{wind_offset, ground_plant_hidden, is_far_tree, far_tree_vertex}
 
 @vertex
 fn vertex(vertex: Vertex) -> VertexOutput {
@@ -17,12 +17,15 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let world_from_local = mesh_functions::get_world_from_local(vertex.instance_index);
     var world = mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(vertex.position, 1.0));
 #ifdef VERTEX_UVS_B
-    world = vec4(world.xyz + wind_offset(world.xyz, vertex.uv_b.x, vertex.uv_b.y, globals.time), 1.0);
-#endif
-#ifdef VERTEX_UVS_B
-    // Touffe trop lointaine : tous ses sommets au même point (rien à dessiner).
-    if ground_plant_hidden(world.xyz, vertex.uv_b.y, view.world_position, view.clip_from_view[3][3] == 1.0) {
-        world = vec4(0.0, -10000.0, 0.0, 1.0);
+    if is_far_tree(vertex.uv_b) {
+        // Arbre lointain : quad tourné vers la caméra, sans vent.
+        world = vec4(far_tree_vertex(world.xyz, vertex.uv_b, view.world_position), 1.0);
+    } else {
+        world = vec4(world.xyz + wind_offset(world.xyz, vertex.uv_b.x, vertex.uv_b.y, globals.time), 1.0);
+        // Touffe trop lointaine : tous ses sommets au même point (rien à dessiner).
+        if ground_plant_hidden(world.xyz, vertex.uv_b.y, view.world_position, view.clip_from_view[3][3] == 1.0) {
+            world = vec4(0.0, -10000.0, 0.0, 1.0);
+        }
     }
 #endif
     out.world_position = world;

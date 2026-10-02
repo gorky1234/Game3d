@@ -24,8 +24,8 @@ use bevy::post_process::motion_blur::MotionBlur;
 use crate::constants::CHUNK_SIZE;
 use crate::world::block::BlockType;
 use crate::world::load_save_chunk::WorldData;
-use crate::generation::generate_biome_map::BiomeMap;
-use crate::generation::generate_height_map::HeightMap;
+use crate::generation::biome_map::BiomeMap;
+use crate::generation::terrain::HeightMap;
 use crate::constants::SEA_LEVEL;
 use crate::render::chunk_loadings_mesh_logic::ChunkOpaqueSection;
 
@@ -217,6 +217,10 @@ fn spawn_player(
             // chaque côté. Les vecteurs de mouvement viennent du prépass
             // déjà requis par le TAA.
             MotionBlur { shutter_angle: 0.35, samples: 2 },
+            // Filtrage des ombres renouvelé à chaque image et lissé par le
+            // TAA : requis par les ombres douces du soleil (PCSS, voir
+            // skybox.rs), bruitées sinon.
+            bevy::light::ShadowFilteringMethod::Temporal,
             // Pas d'ombres de contact (`ContactShadows`) : soleil bas, elles
             // assombrissaient à tort les faces éclairées (rochers, relief).
         ));
@@ -227,6 +231,8 @@ fn spawn_player(
     commands.entity(cam).insert(DepthPrepass);
     // Étalonnage et grain de film (passe maison, voir film.rs).
     commands.entity(cam).insert(FilmLook::default());
+    // Brume au ras du sol (réglée avec l'heure, voir `daylight_cycle`).
+    commands.entity(cam).insert(crate::render::height_fog::HeightFog::default());
     // Pas d'occlusion culling GPU (`OcclusionCulling`) : mesuré sur 5 paires de
     // lancements, il coûte 1 à 2 FPS dans ces paysages ouverts (le relief et le
     // feuillage cachent trop peu de sections pour rentabiliser le Hi-Z).

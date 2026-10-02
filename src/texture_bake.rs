@@ -6,7 +6,10 @@
 //!
 //! Deux atlas par carte (couleur, normales, rugosité) :
 //! - terrain (`terrain_*.ktx2`) : les tuiles du terrain lisse seules, en
-//!   pleine résolution (1024 px pour 4 blocs : vues de près) ;
+//!   pleine résolution (1024 px pour 4 blocs : vues de près), une tuile par
+//!   calque d'un tableau de textures : le shader les répète sans déborder
+//!   sur une voisine, avec toute la chaîne de mipmaps et le filtrage
+//!   anisotrope (sol vu en rasant) ;
 //! - général (`atlas_*.ktx2`) : toutes les tuiles à demi-résolution (512 px
 //!   par bloc suffisent aux cubes, aux plantes et aux arbres), à la même
 //!   disposition que l'atlas source (mêmes UV).
@@ -33,9 +36,6 @@ const TERRAIN_TILES: [&str; 14] = [
     "litter.png", "podzol.png", "mud.png", "gravel.png", "sandstone.png", "salt.png", "rock_macro.png",
 ];
 const TILE: u32 = 1024;
-const MARGIN: u32 = 32;
-const SLOT: u32 = TILE + 2 * MARGIN;
-const TERRAIN_COLUMNS: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -78,13 +78,15 @@ struct Source {
     frames: HashMap<String, Frame>,
 }
 
-/// Disposition de l'atlas terrain : coin (px) de chaque tuile, taille de
-/// l'atlas.
+/// Disposition de l'atlas terrain : calque de chaque tuile, et albédo moyen
+/// (linéaire) de chaque tuile : la couleur qu'elle prend vue de loin,
+/// reprise par le relief lointain (far_terrain.rs).
 #[derive(Serialize, Deserialize)]
 pub struct TerrainAtlas {
-    pub tiles: HashMap<String, [u32; 2]>,
-    pub size: [u32; 2],
-    pub tile: u32,
+    #[serde(default)]
+    pub layers: HashMap<String, u32>,
+    #[serde(default)]
+    pub average: HashMap<String, [f32; 3]>,
 }
 
 fn modified(path: &str) -> Option<SystemTime> {
@@ -103,7 +105,12 @@ pub fn up_to_date() -> bool {
         let Some(t) = modified(&path) else { return false };
         oldest_output = Some(oldest_output.map_or(t, |o: SystemTime| o.min(t)));
     }
-    matches!((newest_source, oldest_output), (Some(s), Some(o)) if o >= s)
+    // Ancienne disposition (atlas à plat, sans couleurs moyennes) : à
+    // recuire.
+    let has_averages = fs::read_to_string(TERRAIN_JSON).ok()
+        .and_then(|json| serde_json::from_str::<TerrainAtlas>(&json).ok())
+        .is_some_and(|atlas| !atlas.average.is_empty() && !atlas.layers.is_empty());
+    has_averages && matches!((newest_source, oldest_output), (Some(s), Some(o)) if o >= s)
 }
 
 /// Cuit les six atlas (voir le module).
@@ -112,43 +119,61 @@ pub fn bake() {
     fs::create_dir_all(BAKED_DIR).expect("création de assets/baked impossible");
     let source: Source = serde_json::from_str(&fs::read_to_string(SOURCE_JSON).expect("atlas_texture.json illisible"))
         .expect("atlas_texture.json mal formé");
-    let rows = (TERRAIN_TILES.len() as u32).div_ceil(TERRAIN_COLUMNS);
-    let terrain_size = [TERRAIN_COLUMNS * SLOT, rows * SLOT];
-    let mut layout = TerrainAtlas { tiles: HashMap::new(), size: terrain_size, tile: TILE };
+    let mut layout = TerrainAtlas { layers: HashMap::new(), average: HashMap::new() };
     for (i, name) in TERRAIN_TILES.iter().enumerate() {
-        let (col, row) = (i as u32 % TERRAIN_COLUMNS, i as u32 / TERRAIN_COLUMNS);
-        layout.tiles.insert(name.to_string(), [col * SLOT + MARGIN, row * SLOT + MARGIN]);
+        layout.layers.insert(name.to_string(), i as u32);
     }
     for (src, map, kind) in MAPS {
         let t = Instant::now();
         let atlas = image::open(src).unwrap_or_else(|e| panic!("{src} illisible : {e}")).to_rgba8();
-        // Atlas terrain : tuiles recopiées avec leurs marges.
-        let mut terrain = RgbaImage::new(terrain_size[0], terrain_size[1]);
+        // Atlas terrain : une tuile par calque, mipmaps jusqu'à 4 px (un
+        // bloc BC7).
+        let mut layers = Vec::new();
         for name in TERRAIN_TILES {
             let r = &source.frames.get(name).unwrap_or_else(|| panic!("tuile {name} absente de l'atlas")).frame;
-            let [x, y] = layout.tiles[name];
-            let tile = image::imageops::crop_imm(&atlas, r.x - MARGIN, r.y - MARGIN, SLOT, SLOT).to_image();
-            image::imageops::replace(&mut terrain, &tile, (x - MARGIN) as i64, (y - MARGIN) as i64);
+            let tile = image::imageops::crop_imm(&atlas, r.x, r.y, TILE, TILE).to_image();
+            if kind == Kind::Color {
+                layout.average.insert(name.to_string(), average_color(&atlas, r.x, r.y));
+            }
+            layers.push(mip_chain(tile, kind, 4));
         }
-        write_ktx2(&format!("assets/{}", terrain_path(map)), mip_chain(terrain, kind), kind);
+        // Niveau par niveau, tous les calques de chaque niveau.
+        let levels = (0..layers[0].len()).map(|l| layers.iter().map(|chain| chain[l].clone()).collect()).collect();
+        write_ktx2(&format!("assets/{}", terrain_path(map)), levels, kind);
         // Atlas général à demi-résolution.
         let half = downsample(&atlas, kind);
         drop(atlas);
-        write_ktx2(&format!("assets/{}", general_path(map)), mip_chain(half, kind), kind);
+        write_ktx2(&format!("assets/{}", general_path(map)), mip_chain(half, kind, 32).into_iter().map(|l| vec![l]).collect(), kind);
         println!("atlas {map} cuit en {:.1} s", t.elapsed().as_secs_f32());
     }
     fs::write(TERRAIN_JSON, serde_json::to_string_pretty(&layout).unwrap()).expect("écriture de terrain_atlas.json impossible");
     println!("atlas cuits en {:.1} s ({BAKED_DIR})", start.elapsed().as_secs_f32());
 }
 
+/// Albédo moyen (linéaire) de la tuile dont le coin est en (x, y).
+fn average_color(atlas: &RgbaImage, x: u32, y: u32) -> [f32; 3] {
+    let mut sum = [0.0f64; 3];
+    // Un pixel sur 4 dans chaque direction : largement assez pour une moyenne.
+    for py in (y..y + TILE).step_by(4) {
+        for px in (x..x + TILE).step_by(4) {
+            let p = atlas.get_pixel(px, py);
+            for c in 0..3 {
+                sum[c] += to_linear(p[c]) as f64;
+            }
+        }
+    }
+    let n = ((TILE / 4) * (TILE / 4)) as f64;
+    sum.map(|v| (v / n) as f32)
+}
+
 /// Niveaux de mipmap, tant que les côtés du niveau suivant restent
-/// multiples de 4 (blocs BC7) et d'au moins 32 px.
-fn mip_chain(level0: RgbaImage, kind: Kind) -> Vec<RgbaImage> {
+/// multiples de 4 (blocs BC7) et d'au moins `min` px.
+fn mip_chain(level0: RgbaImage, kind: Kind, min: u32) -> Vec<RgbaImage> {
     let mut levels = vec![level0];
     loop {
         let last = levels.last().unwrap();
         let (w, h) = (last.width() / 2, last.height() / 2);
-        if w < 32 || h < 32 || w % 4 != 0 || h % 4 != 0 {
+        if w < min || h < min || w % 4 != 0 || h % 4 != 0 {
             break;
         }
         let next = downsample(last, kind);
@@ -236,10 +261,12 @@ fn compress(level: &RgbaImage, kind: Kind) -> Vec<u8> {
 
 /// Fichier KTX2 (en-tête, index des niveaux, descripteur de format, puis
 /// les niveaux du plus petit au plus grand, alignés sur 16 octets).
-fn write_ktx2(path: &str, levels: Vec<RgbaImage>, kind: Kind) {
+/// `levels[niveau][calque]` : plusieurs calques font un tableau de textures.
+fn write_ktx2(path: &str, levels: Vec<Vec<RgbaImage>>, kind: Kind) {
     let format = if kind == Kind::Color { ktx2::Format::BC7_SRGB_BLOCK } else { ktx2::Format::BC7_UNORM_BLOCK };
-    let (w, h) = levels[0].dimensions();
-    let data: Vec<Vec<u8>> = levels.iter().map(|level| compress(level, kind)).collect();
+    let (w, h) = levels[0][0].dimensions();
+    let layer_count = if levels[0].len() > 1 { levels[0].len() as u32 } else { 0 };
+    let data: Vec<Vec<u8>> = levels.iter().map(|layers| layers.iter().flat_map(|layer| compress(layer, kind)).collect()).collect();
     let (basic, _) = ktx2::dfd::Basic::from_format(format).expect("format BC7 sans descripteur");
     let block = ktx2::dfd::Block::Basic(basic).to_vec();
     let mut dfd = ((block.len() + 4) as u32).to_le_bytes().to_vec();
@@ -259,7 +286,7 @@ fn write_ktx2(path: &str, levels: Vec<RgbaImage>, kind: Kind) {
         pixel_width: w,
         pixel_height: h,
         pixel_depth: 0,
-        layer_count: 0,
+        layer_count,
         face_count: 1,
         level_count: data.len() as u32,
         supercompression_scheme: None,

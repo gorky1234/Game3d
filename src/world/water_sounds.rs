@@ -5,7 +5,7 @@
 //! une source étendue, on l'entend autour de soi.
 use bevy::audio::{AudioSinkPlayback, Volume};
 use bevy::prelude::*;
-use crate::generation::chunk_generation_logic::BiomeMapArc;
+use crate::generation::chunk::chunk_generation_logic::BiomeMapArc;
 use crate::player::Player;
 
 /// Volume max de chaque boucle.

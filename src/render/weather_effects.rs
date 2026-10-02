@@ -28,6 +28,8 @@ fn update_wetness(
     weather: Res<Weather>,
     atlas: Option<Res<TextureAtlasMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut bark_materials: ResMut<Assets<crate::texture::BarkMaterial>>,
+    mut plant_materials: ResMut<Assets<crate::texture::PlantMaterial>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut last: Local<f32>,
     mut last_terrain: Local<f32>,
@@ -41,8 +43,8 @@ fn update_wetness(
         return;
     }
     *last = wet;
+    let dark = 1.0 - 0.3 * wet;
     if let Some(mut material) = materials.get_mut(&atlas.opaque_handle) {
-        let dark = 1.0 - 0.3 * wet;
         material.base_color = Color::srgb(dark, dark, dark);
         material.perceptual_roughness = 1.0 - 0.45 * wet;
     }
@@ -55,8 +57,22 @@ fn update_wetness(
     if let Some(material) = terrain_materials.get(&atlas.terrain_handle) {
         if (material.extension.terrain.params.y - step).abs() > 0.01 && now - *last_terrain > 2.0 {
             *last_terrain = now;
-            if let Some(mut material) = terrain_materials.get_mut(&atlas.terrain_handle) {
-                material.extension.terrain.params.y = step;
+            for handle in [&atlas.terrain_handle, &atlas.terrain_edge_handle] {
+                if let Some(mut material) = terrain_materials.get_mut(handle) {
+                    material.extension.terrain.params.y = step;
+                }
+            }
+            // Écorce et feuillage mouillés, aux mêmes paliers (des milliers
+            // de sections les utilisent aussi).
+            let dark = 1.0 - 0.3 * step;
+            if let Some(mut material) = bark_materials.get_mut(&atlas.bark_handle) {
+                material.base.base_color = Color::srgb(dark, dark, dark);
+                material.base.perceptual_roughness = 1.0 - 0.45 * step;
+            }
+            for handle in [&atlas.plant_handle, &atlas.foliage_handle] {
+                if let Some(mut material) = plant_materials.get_mut(handle) {
+                    material.extension.weather.x = step;
+                }
             }
         }
     }

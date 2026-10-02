@@ -22,7 +22,7 @@
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing},
     forward_io::{Vertex, VertexOutput, FragmentOutput},
     view_transformations::{depth_ndc_to_view_z, position_world_to_ndc, position_ndc_to_world, ndc_to_uv, position_world_to_clip},
-    mesh_view_bindings::{view, globals, view_transmission_texture, view_transmission_sampler},
+    mesh_view_bindings::{view, globals, lights, view_transmission_texture, view_transmission_sampler},
 }
 #ifdef DEPTH_PREPASS
 #import bevy_pbr::prepass_utils::prepass_depth
@@ -250,6 +250,18 @@ fn river_boils(q: vec2<f32>) -> vec2<f32> {
     return vec2(foam_noise(q + vec2(e, 0.0)) - c, foam_noise(q + vec2(0.0, e)) - c) / e;
 }
 
+// Marée : la mer (eau au niveau de la mer) baisse et remonte lentement,
+// découvrant vasières et pieds des palétuviers à marée basse. Seulement vers
+// le bas depuis le niveau des blocs : plus haut, les bords de l'eau
+// resteraient en l'air contre les rivages au ras de l'eau. Surface de la mer
+// (SEA_LEVEL + 1, voir constants.rs), marnage (blocs), période (s).
+const SEA_SURFACE: f32 = 127.0;
+const TIDE_RANGE: f32 = 0.18;
+const TIDE_PERIOD: f32 = 240.0;
+fn tide_drop(y: f32, t: f32) -> f32 {
+    return select(0.0, TIDE_RANGE * (0.5 + 0.5 * sin(t * 6.2831853 / TIDE_PERIOD)), abs(y - SEA_SURFACE) < 0.3);
+}
+
 // Houle : trois longues ondes (longueurs 44, 27 et 19 blocs) orientées par
 // le vent, vitesse des vagues en eau profonde (c = sqrt(g / k)).
 // Renvoie (hauteur, d/dx, d/dz) pour une amplitude de base `amplitude`.
@@ -282,6 +294,11 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     var out: VertexOutput;
     let world_from_local = mesh_functions::get_world_from_local(vertex.instance_index);
     var world = mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(vertex.position, 1.0));
+#ifdef VERTEX_NORMALS
+    if vertex.normal.y > 0.5 {
+        world.y -= tide_drop(world.y, globals.time);
+    }
+#endif
 #ifdef VERTEX_COLORS
     // Surfaces horizontales seulement (pas les rares faces verticales).
     if vertex.normal.y > 0.5 {
@@ -411,6 +428,11 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #endif
     flow *= 1.0 - frozen;
     turbulence *= 1.0 - frozen;
+    // Eau de marais (tanins, voir `still_water_tint`) : dormante.
+    var marsh = 0.0;
+#ifdef VERTEX_UVS_B
+    marsh = smoothstep(0.3, 0.7, in.uv_b.y) * (1.0 - frozen);
+#endif
     // Pluie : rivières en crue, plus rapides (ronds à la surface, eau plus
     // trouble : plus bas).
     let rain = clamp(water.weather.x, 0.0, 1.0) * (1.0 - frozen);
@@ -442,6 +464,12 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         g += swell(p, t, swell_amplitude(in.color.a)).yz;
 #endif
         g *= 1.0 - frozen;
+        // Marais : eau presque immobile (abritée, couverte), et bulles de
+        // gaz qui crèvent çà et là (petits ronds, rares).
+        g *= 1.0 - 0.75 * marsh;
+        if marsh > 0.01 {
+            g += rain_ripples(p * 0.5 + vec2(31.0, 17.0), t * 0.5, 0.08 * marsh) * 0.6 * (1.0 / (1.0 + dist / 15.0));
+        }
         if rain > 0.02 {
             g += rain_ripples(p, t, rain) * (1.0 / (1.0 + dist / 20.0));
         }
@@ -491,6 +519,20 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let enclosed = max(max(river, frozen), 1.0 - smoothstep(0.75, 0.95, openness));
     let shore_foam = mix(1.0, 0.15, enclosed);
     var foam = clamp(near_shore * (n * 1.5 - 0.5 + 0.7 * rolling), 0.0, 1.0) * 0.85 * shore_foam;
+    // Vagues de plage (eau libre) : rouleaux d'écume qui avancent vers la
+    // berge (la phase suit la profondeur : les crêtes vont vers l'eau
+    // mince), déferlent sur ~2,5 blocs de fond puis s'étalent en nappe qui
+    // se retire. Crêtes déchirées par le bruit.
+    let open_sea = 1.0 - enclosed;
+    if open_sea > 0.01 && depth < 3.0 {
+        let phase = depth * 1.4 + t * 0.55;
+        let crest = smoothstep(0.82, 0.97, sin(phase * 3.14159) * 0.5 + 0.5 + (n - 0.5) * 0.35);
+        let zone = smoothstep(3.0, 1.2, depth) * smoothstep(0.0, 0.25, depth);
+        // Nappe qui se retire : écume mince et laiteuse juste au bord.
+        let wash = smoothstep(0.6, 0.1, depth) * (0.5 + 0.5 * sin(t * 0.55 * 3.14159 + n * 2.0));
+        let surf = clamp(crest * zone + wash * 0.45 * n, 0.0, 1.0) * open_sea;
+        foam = max(foam, surf * 0.9);
+    }
 
     // Rivière : traînées d'écume emportées par le courant (plus nombreuses en
     // eau vive), bouillonnement autour des cascades et des rapides.
@@ -579,6 +621,20 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     scatter_color = mix(scatter_color, SILT_SCATTER, flood * 0.6);
     absorption = mix(absorption, SILT_ABSORPTION, flood * 0.6);
     turbidity = mix(turbidity, 0.9, flood * 0.6);
+    // Lentilles d'eau : nappes vertes sur l'eau dormante des marais, plus
+    // pleines près des berges, déchirées en bord de nappe (grain fin).
+    var duck = 0.0;
+    if marsh > 0.01 && river < 0.5 && in.world_normal.y > 0.5 {
+        let patches = value_noise(p * 0.08 + vec2(5.3, 1.7)) * 0.6 + value_noise(p * 0.3) * 0.4;
+        // Bord : à peine (l'épaisseur vue à l'écran monte aussi au-dessus
+        // de tout objet immergé : bords droits d'un mur de berge, d'un tronc).
+        let shore = 1.0 - smoothstep(0.3, 3.0, thickness);
+        // Grain lisse (pas de cases : en hachage par cellule, damier net
+        // au premier plan).
+        let grain = value_noise(p * 7.0) * 0.65 + value_noise(p * 19.0 + vec2(11.0, 4.0)) * 0.35;
+        duck = smoothstep(0.62 - 0.06 * shore, 0.72 - 0.05 * shore, patches + (grain - 0.5) * 0.16) * marsh * (1.0 - river);
+        leaf = max(leaf, duck);
+    }
     let transmittance = exp(-thickness * absorption);
     let scattered = 1.0 - exp(-thickness * turbidity);
     // Caustiques sur le fond vu à travers l'eau : la lumière du fond (déjà
@@ -599,7 +655,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
     var body_input = pbr_input;
     // Feuille flottante : surface opaque de la teinte d'une feuille morte.
-    let leaf_color = mix(vec3(0.25, 0.14, 0.04), vec3(0.16, 0.2, 0.05), fract(p.x * 0.37 + p.y * 0.21));
+    var leaf_color = mix(vec3(0.25, 0.14, 0.04), vec3(0.16, 0.2, 0.05), fract(p.x * 0.37 + p.y * 0.21));
+    // Lentilles d'eau : vert tendre, piqueté.
+    let duck_color = vec3(0.1, 0.2, 0.025) * (0.75 + 0.5 * value_noise(p * 23.0 + vec2(3.0, 9.0)));
+    leaf_color = mix(leaf_color, duck_color, duck / max(leaf, 1e-3));
     body_input.material.base_color = vec4(mix(mix(scatter_color, FOAM, foam), leaf_color, leaf), 1.0);
     body_input.material.perceptual_roughness = 1.0;
     body_input.material.reflectance = vec3(0.0);
@@ -683,9 +742,29 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
 #endif
 
+    // Scintillement du soleil : paillettes là où une facette de vaguelette
+    // (normale perturbée par cellule, renouvelée en continu) renvoie le
+    // soleil vers la caméra -- surtout à contre-jour au soleil bas. Le
+    // reflet lisse de Bevy ne donne qu'une tache floue.
+    var glitter = vec3(0.0);
+    if lights.n_directional_lights > 0u && foam < 0.5 && frozen < 0.5 {
+        let light = lights.directional_lights[0];
+        let L = light.direction_to_light;
+        let dist = length(view.world_position - P);
+        let cell = p * mix(3.0, 0.8, smoothstep(10.0, 300.0, dist));
+        let id = floor(cell);
+        let blink = fract(hash2(id) + t * (0.6 + 0.8 * hash2(id + 7.3)));
+        let tilt = (vec2(hash2(id + 1.7), hash2(id + 4.1)) - 0.5) * 0.5;
+        let facet = normalize(N + vec3(tilt.x, 0.0, tilt.y));
+        let H = normalize(L + V);
+        let spark = pow(max(dot(facet, H), 0.0), 900.0) * smoothstep(0.0, 0.3, blink) * smoothstep(1.0, 0.6, blink);
+        let low_sun = 1.0 - smoothstep(0.1, 0.8, L.y);
+        glitter = light.color.rgb * view.exposure * spark * (0.4 + 1.6 * low_sun) * 0.02 * max(L.y, 0.0) * (1.0 - foam * 2.0);
+    }
+
     var out: FragmentOutput;
     // Feuilles : pas de reflet de l'eau (matière mate posée dessus).
-    out.color = vec4(volume * mix(1.0 - fresnel, 1.0, leaf) + reflection * (1.0 - leaf), 1.0);
+    out.color = vec4(volume * mix(1.0 - fresnel, 1.0, leaf) + reflection * (1.0 - leaf) + glitter * (1.0 - leaf), 1.0);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
     // Glace : blanc bleuté, fissures sombres, plaques de neige poudreuse,
     // un peu translucide (le fond transparaît là où la glace est nue).

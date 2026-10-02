@@ -7,20 +7,7 @@ use bevy::diagnostic::{DiagnosticPath, DiagnosticsStore, EntityCountDiagnosticsP
 
 use bevy_rapier3d::prelude::*;
 
-mod generation {
-    pub mod generate_chunk;
-    pub mod tectonic_plate_map;
-    pub mod generate_biome_map;
-    pub mod generate_height_map;
-    pub mod chunk_generation_logic;
-    pub mod biome;
-    pub mod vegetation;
-    pub mod procedural;
-    pub mod tree_shapes;
-    pub mod rivers;
-    pub mod landforms;
-    pub mod underground;
-}
+mod generation;
 mod world {
     pub mod world;
     pub mod block;
@@ -49,6 +36,8 @@ mod render {
     pub mod meadow;
     pub mod skybox;
     pub mod far_terrain;
+    pub mod far_shadows;
+    pub mod height_fog;
     pub mod cloud_shadows;
     pub mod fireflies;
     pub mod waterfall_spray;
@@ -70,7 +59,7 @@ use bevy::render::RenderPlugin;
 use bevy::window::WindowResolution;
 use bevy::render::settings::{RenderCreation, WgpuSettings};
 use bevy_pbr::wireframe::WireframePlugin;
-use crate::generation::chunk_generation_logic::BiomeMapArc;
+use crate::generation::chunk::chunk_generation_logic::BiomeMapArc;
 use crate::player::{Player, PlayerMode};
 
 /// Taille de la fenêtre : `GAME3D_RESOLUTION=LxH`, sinon 1600x900.
@@ -154,13 +143,13 @@ fn main() {
         let args: Vec<String> = std::env::args().collect();
         let cx: i64 = args[pos + 1].parse().unwrap();
         let cz: i64 = args[pos + 2].parse().unwrap();
-        let map = generation::generate_biome_map::BiomeMap::global();
-        let hm = generation::generate_height_map::HeightMap::new();
+        let map = generation::biome_map::BiomeMap::global();
+        let hm = generation::terrain::HeightMap::new();
         let (mut leaks, mut steps, mut water) = (0, 0, 0);
         let mut examples = Vec::new();
         let mut step_examples = Vec::new();
         for chx in (cx / 16 - 16)..(cx / 16 + 16) { for chz in (cz / 16 - 16)..(cz / 16 + 16) {
-            let c = futures::executor::block_on(generation::generate_chunk::generate_chunk(chx as i32, chz as i32, &map, &hm, 1));
+            let c = futures::executor::block_on(generation::chunk::generate_chunk(chx as i32, chz as i32, &map, &hm, 1));
             for x in 1..15 { for z in 1..15 { for y in 1..300 {
                 if c.get_block_at(x, y, z) != BlockType::Water { continue; }
                 water += 1;
@@ -184,8 +173,8 @@ fn main() {
     // (`GAME3D_CAPTURE`, voir debug_capture.rs).
     if std::env::args().any(|arg| arg == "--find-features") {
         use generation::biome::BiomeType;
-        use generation::landforms::Variant;
-        let map = generation::generate_biome_map::BiomeMap::global();
+        use generation::geology::landforms::Variant;
+        let map = generation::biome_map::BiomeMap::global();
         let mut found: std::collections::BTreeMap<String, Vec<(i64, i64)>> = Default::default();
         let mut add = |k: &str, x: i64, z: i64| { let v = found.entry(k.to_string()).or_default(); if v.len() < 4 { v.push((x, z)); } };
         for zi in -150..150 { for xi in -150..150 {
@@ -199,6 +188,8 @@ fn main() {
             if map.rift_at(x, z) > 0.8 { add("rift", x, z); }
             if biome == BiomeType::Beach && map.base_height(x, z) > 140.0 && (0..8).any(|k| { let a = k as f64 * 0.785; map.is_ocean(x + (a.cos() * 200.0) as i64, z + (a.sin() * 200.0) as i64) }) { add("falaise", x, z); }
             if biome == BiomeType::Mountain && map.temperature_at(x, z) < 0.3 { add("montagne_froide", x, z); }
+            let (mangrove, zone) = map.mangrove_site(x, z);
+            if mangrove > 0.9 && (-0.05..0.25).contains(&zone) { add("mangrove_rivage", x, z); }
             let (variant, w) = map.variant(x, z, biome);
             if w > 0.95 && variant != Variant::None { add(&format!("{variant:?}"), x, z); }
             if matches!(biome, BiomeType::Desert) { let (b, _) = map.oasis(x, z); if b > 0.3 { add("oasis", x, z); } }
@@ -207,8 +198,8 @@ fn main() {
                 add("cote_froide", x, z);
             }
         }}
-        let hm = generation::generate_height_map::HeightMap::new();
-        let springs: Vec<(i64, i64)> = map.rivers().into_iter().flat_map(|r| r.all_segments()).filter(generation::underground::is_spring).filter(|s| s.a.1.abs() < 30000.0).take(5).map(|s| (s.a.0 as i64, s.a.1 as i64)).collect();
+        let hm = generation::terrain::HeightMap::new();
+        let springs: Vec<(i64, i64)> = map.rivers().into_iter().flat_map(|r| r.all_segments()).filter(generation::geology::underground::is_spring).filter(|s| s.a.1.abs() < 30000.0).take(5).map(|s| (s.a.0 as i64, s.a.1 as i64)).collect();
         println!("resurgences: {springs:?}");
         for (k, v) in found {
             let hs: Vec<String> = v.iter().map(|&(x, z)| format!("{:.0}/v{:.0}", hm.column_at(x, z, &map).height, map.volcano(x, z).floor)).collect();
@@ -253,7 +244,7 @@ fn main() {
             // cœurs), ComputeTaskPool le reste. Or plus rien dans ce projet
             // n'utilise IoTaskPool (chargement/génération/meshing de chunks
             // tournent tous sur AsyncComputeTaskPool, voir chunk_loadings_mesh_logic.rs
-            // et chunk_generation_logic.rs) -- seul Bevy lui-même s'en sert
+            // et generation/chunk/chunk_generation_logic.rs) -- seul Bevy lui-même s'en sert
             // encore en interne pour le chargement d'assets, d'où le minimum
             // de 1 thread conservé plutôt que 0. AsyncComputeTaskPool est
             // maintenant notre unique goulot pour tout le streaming de monde :
@@ -291,6 +282,10 @@ fn main() {
                 primary_window: Some(Window {
                     title: "Game3d".into(),
                     resolution: window_resolution(),
+                    // `GAME3D_NOVSYNC` : images sans attendre l'écran (mesures,
+                    // captures écran éteint : la synchronisation bridait
+                    // alors le jeu à 4 images par seconde).
+                    present_mode: if std::env::var("GAME3D_NOVSYNC").is_ok() { bevy::window::PresentMode::AutoNoVsync } else { default() },
                     ..default()
                 }),
                 ..default()
@@ -326,6 +321,7 @@ fn main() {
         .add_plugins(debug_capture::DebugCapturePlugin)
         .add_plugins(graphics_quality::GraphicsQualityPlugin)
         .add_plugins(film::FilmPlugin)
+        .add_plugins(render::height_fog::HeightFogPlugin)
         .add_plugins(world::water_sounds::WaterSoundsPlugin)
 
         .add_systems(Startup, setup_physics)
@@ -441,7 +437,7 @@ fn text_update_system(
 /// fidèlement ce qui sera généré en jeu.
 fn export_biome_map(path: &str, center_x: i64, center_z: i64, size: u32, scale: i64) {
     use generation::biome::BiomeType;
-    use generation::generate_biome_map::BiomeMap;
+    use generation::biome_map::BiomeMap;
     use image::{ImageBuffer, Rgb, RgbImage};
 
     fn biome_color(biome: BiomeType) -> Rgb<u8> {
@@ -536,8 +532,8 @@ fn export_biome_map(path: &str, center_x: i64, center_z: i64, size: u32, scale: 
 fn export_relief_map(path: &str, center_x: i64, center_z: i64, size: i64) {
     use constants::{CHUNK_SIZE, SEA_LEVEL};
     use generation::biome::BiomeType;
-    use generation::generate_biome_map::BiomeMap;
-    use generation::generate_height_map::HeightMap;
+    use generation::biome_map::BiomeMap;
+    use generation::terrain::HeightMap;
     use image::{ImageBuffer, Rgb, RgbImage};
 
     let biome_map = BiomeMap::global();
@@ -620,9 +616,9 @@ fn export_relief_map(path: &str, center_x: i64, center_z: i64, size: i64) {
 
 fn export_top_view(path: &str, center_x: i64, center_z: i64, size: i64) {
     use constants::{CHUNK_SIZE, WORLD_HEIGHT};
-    use generation::generate_biome_map::BiomeMap;
-    use generation::generate_chunk::generate_chunk;
-    use generation::generate_height_map::HeightMap;
+    use generation::biome_map::BiomeMap;
+    use generation::chunk::generate_chunk;
+    use generation::terrain::HeightMap;
     use image::{ImageBuffer, Rgb, RgbImage};
     use world::block::BlockType;
 
@@ -699,7 +695,7 @@ fn export_top_view(path: &str, center_x: i64, center_z: i64, size: i64) {
 /// hauteur du terrain comprise (même formule que `HeightMap::get_chunk`).
 fn find_plain_spawn() {
     use generation::biome::BiomeType;
-    use generation::generate_biome_map::BiomeMap;
+    use generation::biome_map::BiomeMap;
     use noise::{Fbm, NoiseFn, Perlin};
 
     let biome_map = BiomeMap::global();
@@ -742,7 +738,7 @@ fn find_plain_spawn() {
         return;
     };
 
-    let hm = generation::generate_height_map::HeightMap::new().get_chunk(x.div_euclid(16), z.div_euclid(16), &biome_map, 1);
+    let hm = generation::terrain::HeightMap::new().get_chunk(x.div_euclid(16), z.div_euclid(16), &biome_map, 1);
     let height = hm[x.rem_euclid(16) as usize][z.rem_euclid(16) as usize] as f64;
 
     println!("Point Plain trouvé en ({x}, {z}), hauteur de terrain ~{height:.1}");
@@ -751,13 +747,13 @@ fn find_plain_spawn() {
 
 /// Voir `--memory-stats`.
 fn memory_stats() {
-    let map = generation::generate_biome_map::BiomeMap::global();
-    let hm = generation::generate_height_map::HeightMap::new();
+    let map = generation::biome_map::BiomeMap::global();
+    let hm = generation::terrain::HeightMap::new();
     for stride in [1, 2, 4] {
         let (mut chunks, mut sections, mut uniform, mut bytes, mut small_palette, mut rle_runs) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         for (ox, oz) in [(0, 0), (3000, -2000), (-5000, 4000), (9000, 9000)] {
             for cx in 0..8 { for cz in 0..8 {
-                let c = futures::executor::block_on(generation::generate_chunk::generate_chunk(ox / 16 + cx, oz / 16 + cz, &map, &hm, stride));
+                let c = futures::executor::block_on(generation::chunk::generate_chunk(ox / 16 + cx, oz / 16 + cz, &map, &hm, stride));
                 chunks += 1;
                 for s in &c.sections {
                     sections += 1;
@@ -786,8 +782,8 @@ fn memory_stats() {
 
 /// Voir `--export-hillshade`.
 fn export_hillshade(path: &str, center_x: i64, center_z: i64, size: i64, step: i64) {
-    use generation::generate_biome_map::BiomeMap;
-    use generation::generate_height_map::HeightMap;
+    use generation::biome_map::BiomeMap;
+    use generation::terrain::HeightMap;
     let map = BiomeMap::global();
     let n = (size / step) as usize;
     let rows: Vec<Vec<f64>> = std::thread::scope(|scope| {

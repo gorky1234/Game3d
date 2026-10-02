@@ -63,9 +63,13 @@ pub fn plant_mesh(
                         Species::Grass => (base_uv, size_uv),
                         _ => species.uv(atlas).unwrap_or((base_uv, size_uv)),
                     };
-                    // Près du joueur, une seconde touffe dans ~45 % des blocs
-                    // d'herbe haute (densité irrégulière).
-                    let tufts = if leaf_cards && matches!(species, Species::Grass | Species::Seed | Species::Dry) && block == BlockType::TallGrass && plant_hash(wx, wy, wz, 11) < 0.45 { 2 } else { 1 };
+                    // Herbe plus fine et plus dense : 2 ou 3 touffes plus
+                    // petites par bloc (1 ou 2 grosses auparavant : des boules
+                    // espacées sur un sol nu, loin du tapis d'herbe réel). Les
+                    // touffes en plus disparaissent plus tôt avec la distance
+                    // (voir `phase`), là où elles ne se distinguent plus.
+                    let grassy = leaf_cards && ((matches!(species, Species::Grass | Species::Seed | Species::Dry) && block == BlockType::TallGrass) || block == BlockType::DryGrass);
+                    let tufts = if grassy { if plant_hash(wx, wy, wz, 11) < 0.4 { 3 } else { 2 } } else { 1 };
                     for tuft in 0..tufts {
                         let salt = tuft * 20;
                         // N'importe où dans le bloc (±0,25 auparavant : les touffes
@@ -94,13 +98,14 @@ pub fn plant_mesh(
                         // Taille par taches (~7 blocs) : des zones d'herbe haute et
                         // d'autres rases, plutôt qu'un tapis uniforme ; la seconde
                         // touffe d'un bloc est plus petite.
-                        let size = size * (0.6 + 0.8 * value_noise(wx as f32, wz as f32, 7.0, 40)) * if tuft == 0 { 1.0 } else { 0.7 };
+                        let size = size * (0.6 + 0.8 * value_noise(wx as f32, wz as f32, 7.0, 40)) * if tuft == 0 { 1.0 } else { 0.7 } * if grassy { 0.8 } else { 1.0 };
+                        let width = width * if grassy { 0.75 } else { 1.0 };
                         let height = (0.75 + plant_hash(wx, wy, wz, 3 + salt) * 0.45) * size;
                         let r = 0.5 * (0.85 + plant_hash(wx, wy, wz, 4 + salt) * 0.3) * size.max(0.7) * width;
                         let angle = plant_hash(wx, wy, wz, 5 + salt) * std::f32::consts::FRAC_PI_2;
                         let (s, c) = angle.sin_cos();
                         // Pied sur la surface lisse (le bloc de sol est juste dessous).
-                        let y0 = neighborhood.surface_height(x as i32, wy - 1, z as i32) - world_origin.1 as f32;
+                        let y0 = neighborhood.surface_height_at(x as i32, wy - 1, z as i32, cx, cz) - world_origin.1 as f32;
                         let y1 = y0 + height;
 
                         // Teinte par zones (voir `meadow_dryness`) et par plante : prairies qui passent du vert olive au doré, comme
@@ -116,10 +121,13 @@ pub fn plant_mesh(
                                 [0, 1, 2].map(|i| (green[i] + (golden[i] - green[i]) * dry) * bright)
                             }
                             // Texture déjà paille : juste un peu plus terne.
-                            (BlockType::TallGrass, Species::Dry) => [0.92 * bright, 0.88 * bright, 0.8 * bright],
+                            // Moins orange (paille terne, mêlée au reste).
+                            (BlockType::TallGrass, Species::Dry) => [0.84 * bright, 0.82 * bright, 0.76 * bright],
                             // Trèfle : reste vert, même en prairie sèche.
                             (BlockType::TallGrass, Species::Clover) => [0.75 * bright, 0.85 * bright, 0.72 * bright],
-                            (BlockType::DryGrass, _) => [1.0 * bright, 0.9 * bright, 0.68 * bright],
+                            // Paille de savane : terne, un peu verdie à la base
+                            // (orange vif auparavant).
+                            (BlockType::DryGrass, _) => [0.8 * bright, 0.79 * bright, 0.7 * bright],
                             // Mousse, lichen, fleurs, chardon, achillée : couleurs
                             // propres (seule la luminosité varie).
                             _ => [bright; 3],
@@ -184,7 +192,9 @@ pub fn plant_mesh(
                             uvs.extend_from_slice(&[[u0, v_bottom], [u1, v_bottom], [u1, v_top], [u0, v_top]]);
                             colors.extend_from_slice(&[bottom, bottom, top, top]);
                             // Pied fixe, sommet libre.
-                            let phase = plant_hash(wx, wy, wz, 8 + salt) + GROUND_PLANT;
+                            // Touffes en plus : éclaircies dès ~25-60 blocs (aléa
+                            // ramené dans [0 ; 0,4], voir `ground_plant_hidden`).
+                            let phase = plant_hash(wx, wy, wz, 8 + salt) * if tuft == 0 { 1.0 } else { 0.4 } + GROUND_PLANT;
                             let bend = species.sway();
                             sway.extend_from_slice(&[[0.0, phase], [0.0, phase], [bend, phase], [bend, phase]]);
                             indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
@@ -233,7 +243,7 @@ pub fn plant_mesh(
                     let height = (0.3 + plant_hash(wx, wy, wz, 23) * 0.25) * (0.6 + 0.8 * value_noise(wx as f32, wz as f32, 9.0, 41));
                     let r = 0.5 + plant_hash(wx, wy, wz, 24) * 0.2;
                     let angle = plant_hash(wx, wy, wz, 25) * std::f32::consts::FRAC_PI_2;
-                    let y0 = neighborhood.surface_height(xi, wy, zi) - world_origin.1 as f32;
+                    let y0 = neighborhood.surface_height_at(xi, wy, zi, cx, cz) - world_origin.1 as f32;
                     let y1 = y0 + height;
                     // Même teinte que le sol et l'herbe haute (`meadow_dryness`).
                     let dry = meadow_dryness(wx as f32, wz as f32);
@@ -328,7 +338,9 @@ fn species_at(wx: i32, wy: i32, wz: i32, atlas: &TextureAtlasMaterial) -> Specie
     // Colonies : chardons en taches (~25 blocs), achillée (~30), trèfle
     // (~18) ; herbe versée là où la prairie est sèche.
     let colony = |cell: f32, salt: u32, threshold: f32| ((value_noise(fx, fz, cell, salt) - threshold) / (1.0 - threshold)).clamp(0.0, 1.0);
-    let dry = ((meadow_dryness(fx, fz) - 0.5) * 2.5).clamp(0.0, 1.0);
+    // Herbe sèche mêlée à l'herbe verte sur une large plage de sécheresse
+    // (plutôt qu'en plaques nettes qui tranchaient : orange / vert).
+    let dry = ((meadow_dryness(fx, fz) - 0.3) * 1.4).clamp(0.0, 1.0) * 0.75;
     pick(Species::Thistle, 0.45, colony(25.0, 50, 0.7))
         .or_else(|| pick(Species::Yarrow, 0.4, colony(30.0, 51, 0.68)))
         .or_else(|| pick(Species::Clover, 0.6, colony(18.0, 52, 0.6)))

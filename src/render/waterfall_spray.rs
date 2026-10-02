@@ -11,7 +11,7 @@ use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
 use rand::Rng;
-use crate::generation::chunk_generation_logic::BiomeMapArc;
+use crate::generation::chunk::chunk_generation_logic::BiomeMapArc;
 use crate::player::Player;
 use crate::render::skybox::SkyState;
 use crate::world::weather::Weather;

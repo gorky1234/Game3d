@@ -10,7 +10,7 @@ use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use crate::constants::CHUNK_SIZE;
 use crate::generation::procedural;
-use crate::generation::tree_shapes::{Card, CardKind, Segment, TreeInstance, TreeKind};
+use crate::generation::vegetation::tree_shapes::{Card, CardKind, Segment, TreeInstance, TreeKind};
 use crate::world::neighborhood::Neighborhood;
 use crate::texture::TextureAtlasMaterial;
 use crate::world::block::BlockType;
@@ -26,6 +26,9 @@ struct Builder {
     colors: Vec<[f32; 4]>,
     sway: Vec<[f32; 2]>,
     indices: Vec<u32>,
+    /// Rochers seulement : roches du sous-sol au format du terrain lisse
+    /// (granite, calcaire, 1, basalte : voir `stone_mix`, smooth_terrain.rs).
+    stones: Vec<[f32; 4]>,
 }
 
 impl Builder {
@@ -65,12 +68,16 @@ impl Builder {
     fn build(self, with_sway: bool) -> Mesh {
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
         let has_geometry = !self.indices.is_empty();
+        let vertex_count = self.positions.len();
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, self.positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs);
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, self.colors);
         if with_sway {
             mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, self.sway);
+        }
+        if !self.stones.is_empty() && self.stones.len() == vertex_count {
+            mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, self.stones);
         }
         mesh.insert_indices(Indices::U32(self.indices));
         if has_geometry && !with_sway {
@@ -97,7 +104,10 @@ fn hash(x: i64, z: i64, salt: u32) -> f32 {
 /// Tube effilé le long d'un segment, découpé en tronçons de 3,5 blocs au plus
 /// (la texture d'écorce, une tuile tous les 4 blocs, ne doit pas déborder de
 /// sa tuile dans l'atlas). `sides` faces.
-fn tube(b: &mut Builder, seg: &Segment, origin: Vec3, rect: Rect, sides: usize, shade: f32) {
+/// `lobes` : phase propre à l'arbre pour les fûts épais (section non
+/// ronde : cannelures, lobes au pied qui s'évasent en racines), `None` pour
+/// les branches.
+fn tube(b: &mut Builder, seg: &Segment, origin: Vec3, rect: Rect, sides: usize, shade: f32, lobes: Option<f32>) {
     let length = (seg.b - seg.a).length();
     if length < 1e-3 {
         return;
@@ -121,11 +131,25 @@ fn tube(b: &mut Builder, seg: &Segment, origin: Vec3, rect: Rect, sides: usize, 
             let radial = u_axis * a.cos() + w_axis * a.sin();
             let u = rect.0[0] + rect.1[0] * (k as f32 / sides as f32) * u_span;
             let v_len = piece_len / 4.0;
+            // Angle mesuré dans le plan horizontal du monde : mêmes lobes
+            // d'un tronçon du fût au suivant (pas de torsion aux joints).
+            let theta = radial.z.atan2(radial.x);
             for (p, r, v) in [(p0, r0, 0.0), (p1, r1, v_len)] {
+                let r = match lobes {
+                    Some(phase) => {
+                        let height = (p - origin).y.max(0.0);
+                        let foot = 0.05 + 0.3 * (-height / 1.1).exp();
+                        r * (1.0 + foot * (0.6 * (5.0 * theta + phase).cos() + 0.4 * (3.0 * theta + phase * 2.3).cos()) + 0.05 * (2.0 * theta + phase * 0.7 + height * 0.5).cos())
+                    }
+                    None => r,
+                };
                 b.positions.push((p + radial * r).to_array());
                 b.normals.push(radial.to_array());
                 b.uvs.push([u, rect.0[1] + rect.1[1] * (1.0 - v)]);
-                b.colors.push([shade, shade, shade, 1.0]);
+                // Alpha : hauteur au-dessus du pied (0 au sol, 1 à 3 blocs) :
+                // mousse au pied des troncs (voir bark.wgsl).
+                let height = ((p - origin).y / 3.0).clamp(0.0, 1.0);
+                b.colors.push([shade, shade, shade, height]);
                 b.sway.push([0.0, 0.0]);
             }
         }
@@ -140,7 +164,7 @@ fn tube(b: &mut Builder, seg: &Segment, origin: Vec3, rect: Rect, sides: usize, 
 /// dans la silhouette), normale inclinée en conséquence et creux assombris
 /// (couleur de sommet). Sans ça, un simple cylindre à texture rayée : de
 /// loin, un « cornichon » vert lisse. La texture fait le tour une fois.
-fn cactus_tube(b: &mut Builder, seg: &Segment, origin: Vec3, rect: Rect, ribs: usize, per_rib: usize, tint: Vec3) {
+fn cactus_tube(b: &mut Builder, seg: &Segment, origin: Vec3, rect: Rect, ribs: usize, per_rib: usize, tint: Vec3, seed: f32) {
     let length = (seg.b - seg.a).length();
     if length < 1e-3 {
         return;
@@ -162,10 +186,14 @@ fn cactus_tube(b: &mut Builder, seg: &Segment, origin: Vec3, rect: Rect, ribs: u
             let a = k as f32 / sides as f32 * TAU;
             let radial = u_axis * a.cos() + w_axis * a.sin();
             let tangent = -u_axis * a.sin() + w_axis * a.cos();
-            let wave = (ribs as f32 * a).cos();
-            let bump = 1.0 + depth * wave;
+            // Côtes irrégulières : espacement déformé et profondeur variable
+            // autour du fût.
+            let phase = ribs as f32 * a + 0.35 * (3.0 * a + seed).sin();
+            let deep = depth * (0.75 + 0.5 * (0.5 + 0.5 * (2.0 * a + seed * 1.7).sin()));
+            let wave = phase.cos();
+            let bump = 1.0 + deep * wave;
             // d(rayon)/dθ relatif : normale penchée vers le creux voisin.
-            let slope = -depth * ribs as f32 * (ribs as f32 * a).sin() / bump;
+            let slope = -deep * ribs as f32 * phase.sin() / bump;
             let normal = (radial - tangent * slope * 0.6).normalize();
             let groove = 0.62 + 0.38 * (wave * 0.5 + 0.5);
             let c = (tint * groove).extend(1.0).to_array();
@@ -190,7 +218,7 @@ fn cactus_tube(b: &mut Builder, seg: &Segment, origin: Vec3, rect: Rect, ribs: u
 /// Plus d'écart qu'avant (0,85..1,1) : des houppiers voisins nettement plus
 /// clairs ou plus sombres, olive, vert franc ou jaunissant, et un vert
 /// légèrement désaturé (feuillage trop vif = aspect « dessin animé »).
-fn foliage_tint(x: i64, z: i64, pine: bool) -> Vec3 {
+pub(crate) fn foliage_tint(x: i64, z: i64, pine: bool) -> Vec3 {
     let hue = hash(x, z, 1);
     let light = 0.7 + hash(x, z, 2) * 0.4;
     // Texture de sapin 2 à 3 fois plus sombre (en linéaire) que celle des
@@ -200,7 +228,7 @@ fn foliage_tint(x: i64, z: i64, pine: bool) -> Vec3 {
 }
 
 /// Demi-sphère fermant un tube en `center`, tournée vers `dir`.
-fn dome(b: &mut Builder, center: Vec3, dir: Vec3, radius: f32, rect: Rect) {
+fn dome(b: &mut Builder, center: Vec3, dir: Vec3, radius: f32, rect: Rect, tint: Vec3) {
     let reference = if dir.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
     let (u, w) = { let u = dir.cross(reference).normalize(); (u, dir.cross(u)) };
     let (rings, segments) = (3usize, 8usize);
@@ -213,7 +241,40 @@ fn dome(b: &mut Builder, center: Vec3, dir: Vec3, radius: f32, rect: Rect) {
             b.positions.push((center + d * radius).to_array());
             b.normals.push(d.to_array());
             b.uvs.push([rect.0[0] + rect.1[0] * 0.25 * j as f32 / segments as f32, rect.0[1] + rect.1[1] * (0.1 * i as f32 / rings as f32)]);
-            b.colors.push([0.9, 0.9, 0.9, 1.0]);
+            b.colors.push((tint * 0.95).extend(1.0).to_array());
+            b.sway.push([0.0, 0.0]);
+        }
+    }
+    let row = segments as u32 + 1;
+    for i in 0..rings as u32 {
+        for j in 0..segments as u32 {
+            let (a, c) = (base + i * row + j, base + (i + 1) * row + j);
+            b.indices.extend_from_slice(&[a, a + 1, c + 1, c + 1, c, a]);
+        }
+    }
+}
+
+/// Raquette de figuier de Barbarie : ovale épais (ellipsoïde aplati selon
+/// `face`), plus haut que large, de `size` (demi-hauteur).
+fn pad(b: &mut Builder, center: Vec3, face: Vec3, up: Vec3, size: f32, rect: Rect, tint: Vec3) {
+    let side = up.cross(face).normalize_or(Vec3::X);
+    let radius = Vec3::new(size * 0.72, size, size * 0.16);
+    let (rings, segments) = (6usize, 12usize);
+    let base = b.positions.len() as u32;
+    for i in 0..=rings {
+        let phi = i as f32 / rings as f32 * std::f32::consts::PI;
+        for j in 0..=segments {
+            let theta = j as f32 / segments as f32 * TAU;
+            // Sphère unité : x sur le côté, y vers le haut, z vers la face.
+            let d = Vec3::new(phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin());
+            let p = side * d.x * radius.x + up * d.y * radius.y + face * d.z * radius.z;
+            let n = (side * d.x / radius.x + up * d.y / radius.y + face * d.z / radius.z).normalize_or(face);
+            b.positions.push((center + p).to_array());
+            b.normals.push(n.to_array());
+            b.uvs.push([rect.0[0] + rect.1[0] * (j as f32 / segments as f32) * 0.5, rect.0[1] + rect.1[1] * (i as f32 / rings as f32) * 0.5]);
+            // Bords un peu plus clairs (épines, tranche).
+            let rim = 1.0 + 0.12 * (1.0 - d.z.abs());
+            b.colors.push((tint * rim).extend(1.0).to_array());
             b.sway.push([0.0, 0.0]);
         }
     }
@@ -230,8 +291,28 @@ fn dome(b: &mut Builder, center: Vec3, dir: Vec3, radius: f32, rect: Rect) {
 /// strates horizontales), au format du terrain lisse (voir terrain.wgsl) :
 /// roche en projection triplanaire (pas d'étirement de texture sur les gros
 /// blocs), mousse (couche d'herbe) sur le dessus, occlusion au pied.
-fn rock(b: &mut Builder, center: Vec3, radius: Vec3, seed: (i64, i64, u32), cover: f32, snowy: bool, style: u8) {
-    let (rings, segments) = (10usize, 18usize);
+///
+/// Roche du lieu selon le sol (`ground`) : calcaire beige au désert, roche
+/// rouge des badlands, granite chaud moucheté et mousse en prairie et en
+/// forêt, roche nue ailleurs. Partout la même photo gris-bleu auparavant :
+/// des galets étrangers au paysage, surtout sur les sols ocre. `style` : 0
+/// rocher, 1 roche rouge (cheminée), 2 terre (termitière), 3 roche claire
+/// (chapeau de cheminée).
+fn rock(b: &mut Builder, center: Vec3, radius: Vec3, seed: (i64, i64, u32), cover: f32, snowy: bool, style: u8, ground: BlockType) {
+    // (part de terre rouge, [granite, calcaire, 1, basalte], mousse permise)
+    let (red, stone, mossy) = match (style, ground) {
+        (1, _) => (1.0, [0.0, 0.0, 1.0, 0.0], false),
+        (2, _) => (0.45, [0.0, 0.0, 1.0, 0.0], false),
+        (4, _) => (0.0, [0.0, 0.0, 1.0, 0.0], false),
+        (3, _) => (0.45, [0.0, 0.85, 1.0, 0.0], false),
+        (_, BlockType::Sand | BlockType::Sandstone | BlockType::Salt) => (0.0, [0.0, 0.75, 1.0, 0.0], false),
+        (_, BlockType::RedSand) => (0.7, [0.0, 0.0, 1.0, 0.0], false),
+        (_, BlockType::Grass | BlockType::Dirt | BlockType::Mud | BlockType::Podzol | BlockType::LeafLitter) => (0.0, [0.55, 0.0, 1.0, 0.0], true),
+        _ => (0.0, [0.0, 0.0, 1.0, 0.0], true),
+    };
+    // Petits cailloux et mottes : bien moins de faces (des centaines par
+    // chunk).
+    let (rings, segments) = if radius.max_element() < 0.35 { (5usize, 9usize) } else { (10usize, 18usize) };
     let r = |k: u32| hash(seed.0, seed.1, seed.2 + k);
     let lobes: Vec<(Vec3, f32)> = (0..5).map(|k| {
         let (u, v) = (r(10 + k * 3), r(11 + k * 3));
@@ -239,8 +320,11 @@ fn rock(b: &mut Builder, center: Vec3, radius: Vec3, seed: (i64, i64, u32), cove
         (Vec3::new(phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin()), 0.12 + 0.25 * r(12 + k * 3))
     }).collect();
     // Sommet tranché (dalle, bloc) sur un rocher sur deux.
-    let cap = if r(1) < 0.5 { 0.45 + 0.4 * r(2) } else { 2.0 };
-    let strata = 0.04 + 0.05 * r(3);
+    // Fût de cheminée de fée (style 1) : segments sans tranche ni dessous
+    // aplati, qui se fondent en une colonne continue (sinon, disques empilés).
+    let shaft = style == 1;
+    let cap = if !shaft && r(1) < 0.5 { 0.45 + 0.4 * r(2) } else { 2.0 };
+    let strata = if shaft { 0.0 } else { 0.04 + 0.05 * r(3) };
     let shape = |d: Vec3| -> f32 {
         let mut k = 0.82;
         for &(l, a) in &lobes {
@@ -248,7 +332,7 @@ fn rock(b: &mut Builder, center: Vec3, radius: Vec3, seed: (i64, i64, u32), cove
         }
         // Strates : léger ressaut tous les ~quart de hauteur.
         k *= 1.0 + strata * ((d.y * 7.0 + r(4) * 6.0).sin()).signum() * 0.5;
-        k * if d.y < 0.0 { 0.75 } else { 1.0 }
+        k * if d.y < 0.0 && !shaft { 0.75 } else { 1.0 }
     };
     let base = b.positions.len() as u32;
     let mut points = Vec::with_capacity((rings + 1) * (segments + 1));
@@ -289,18 +373,30 @@ fn rock(b: &mut Builder, center: Vec3, radius: Vec3, seed: (i64, i64, u32), cove
             // orange vif et mouchetés.
             // Roche rouge des badlands (couche de terre rouge, dont le côté
             // est la roche rouge) ; termitière : terre, un peu rouge.
-            b.uvs.push(match style { 1 => [1.0, 0.0], 2 => [0.45, 0.0], _ => [0.0, 0.0] });
+            b.uvs.push([red, 0.0]);
+            b.stones.push(stone);
             if style == 2 {
                 b.colors.push([0.0, 1.0, 0.0, 0.0]);
                 b.sway.push([0.0, ao]);
-            } else if style == 1 {
+            } else if style == 4 {
+                // Motte : terre du lieu, herbe sur le dessus en prairie,
+                // sable sur le sable.
+                let w = match ground {
+                    BlockType::Sand | BlockType::Sandstone => [0.0, 0.0, 0.0, 1.0],
+                    BlockType::Grass => [top * 1.4, 1.0 - top * 1.4, 0.0, 0.0],
+                    _ => [0.0, 1.0, 0.0, 0.0],
+                };
+                b.colors.push(w);
+                b.sway.push([0.0, ao]);
+            } else if red >= 1.0 {
                 b.colors.push([0.0, 0.0, 0.0, 0.0]);
                 b.sway.push([0.0, ao]);
             } else if snowy {
                 b.colors.push([0.0, 0.0, 1.0 - top, 0.0]);
                 b.sway.push([top, ao]);
             } else {
-                b.colors.push([top, 0.0, 1.0 - top, 0.0]);
+                let moss = if mossy { top } else { 0.0 };
+                b.colors.push([moss, 0.0, (1.0 - moss) * (1.0 - red), 0.0]);
                 b.sway.push([0.0, ao]);
             }
         }
@@ -422,6 +518,37 @@ fn upright_clump(b: &mut Builder, origin: Vec3, height: f32, width: f32, count: 
     }
 }
 
+/// Massettes d'une touffe de roseaux de hauteur `height` : 2 à 5 tiges
+/// (bande fine prise au milieu de la texture des roseaux) portant un épi
+/// brun (morceau d'écorce teinté), en croix, avec le même balancement que le
+/// haut des roseaux.
+fn cattails(b: &mut Builder, origin: Vec3, height: f32, reed: Rect, bark: Rect, seed: (i64, i64)) {
+    let stalk_rect = ([reed.0[0] + reed.1[0] * 0.45, reed.0[1] + reed.1[1] * 0.3], [reed.1[0] * 0.1, reed.1[1] * 0.6]);
+    let head_rect = ([bark.0[0] + bark.1[0] * 0.4, bark.0[1] + bark.1[1] * 0.4], [bark.1[0] * 0.08, bark.1[1] * 0.2]);
+    let phase = hash(seed.0, seed.1, 611) + crate::render::plant_mesh::GROUND_PLANT;
+    let sway = |y: f32| [0.5 * y / height, phase];
+    let n = 2 + (hash(seed.0, seed.1, 631) * 4.0) as usize;
+    for k in 0..n {
+        let s = 640 + k as u32 * 4;
+        let a = hash(seed.0, seed.1, s) * TAU;
+        let foot = origin + Vec3::new(a.cos(), 0.0, a.sin()) * 0.45 * hash(seed.0, seed.1, s + 1);
+        let top = height * (0.8 + 0.3 * hash(seed.0, seed.1, s + 2));
+        let head = (top - 0.32, top - 0.05);
+        let green = [0.5, 0.62, 0.3, 1.0];
+        let brown = [0.55, 0.3, 0.16, 1.0];
+        for j in 0..2 {
+            let t = a + j as f32 * std::f32::consts::FRAC_PI_2;
+            let side = Vec3::new(t.cos(), 0.0, t.sin());
+            let face = Vec3::new(-t.sin(), 0.0, t.cos());
+            let w = side * 0.02;
+            b.quad([foot - w, foot + w, foot + w + Vec3::Y * top, foot - w + Vec3::Y * top], face, stalk_rect, [green; 4], [sway(0.0), sway(0.0), sway(top), sway(top)]);
+            let w = side * 0.055;
+            let (lo, hi) = (foot + Vec3::Y * head.0, foot + Vec3::Y * head.1);
+            b.quad([lo - w, lo + w, hi + w, hi - w], face, head_rect, [brown; 4], [sway(head.0), sway(head.0), sway(head.1), sway(head.1)]);
+        }
+    }
+}
+
 /// Feuilles de nénuphar : panneaux horizontaux posés à la surface de l'eau
 /// (`surface`), orientation au hasard.
 fn lily_pads(b: &mut Builder, surface: Vec3, rect: Rect, seed: (i64, i64)) {
@@ -490,35 +617,54 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
         let origin = Vec3::new(lx as f32 + 0.5, ground, lz as f32 + 0.5);
         let sk = tree.skeleton();
 
-        let wood_rect = if sk.cactus { cactus_rect } else if sk.birch { atlas.birch_uv.or(log_rect) } else { log_rect };
+        // Écorce de l'essence (voir `TreeKind::species`), sinon bouleau ou
+        // écorce par défaut.
+        let species = tree.kind.species();
+        let wood_rect = if sk.cactus {
+            cactus_rect
+        } else if sk.birch {
+            atlas.birch_uv.or(log_rect)
+        } else {
+            atlas.bark_uvs.get(species).copied().or(log_rect)
+        };
         // Bois mort plus terne ; bouleau : sa texture est déjà claire.
         let (trunk_shade, branch_shade) = if sk.dead { (0.72, 0.65) } else if sk.birch { (0.7, 0.62) } else { (0.9, 0.8) };
         if let (true, Some(rect)) = (sk.cactus, wood_rect) {
             // Gris-vert poussiéreux, variable d'un cactus à l'autre (la
             // texture est d'un vert franc : vert atténué par rapport au rouge).
             let tint = Vec3::new(0.95, 0.78, 0.82).lerp(Vec3::new(1.02, 0.8, 0.72), hash(tree.x, tree.z, 7)) * (0.85 + 0.2 * hash(tree.x, tree.z, 8));
-            let (ribs, per_rib) = match step { 1 => (13, 4), 2 => (13, 2), _ => (0, 1) };
+            // Côtes : de 10 à 16 selon le cactus (13 partout auparavant :
+            // tubes réguliers, synthétiques), irrégulières (voir
+            // `cactus_tube`).
+            let rib_count = 10 + (hash(tree.x, tree.z, 9) * 7.0) as usize;
+            let (ribs, per_rib) = match step { 1 => (rib_count, 4), 2 => (rib_count, 2), _ => (0, 1) };
+            let seed = hash(tree.x, tree.z, 10) * TAU;
             for seg in &sk.wood {
-                cactus_tube(&mut bark, seg, origin, rect, ribs, per_rib, tint);
+                cactus_tube(&mut bark, seg, origin, rect, ribs, per_rib, tint, seed);
                 // Bout arrondi là où aucun autre segment ne repart.
                 let open_end = !sk.wood.iter().any(|o| o.a.distance(seg.b) < seg.r1 * 1.2);
                 if open_end {
-                    dome(&mut bark, origin + seg.b, (seg.b - seg.a).normalize_or(Vec3::Y), seg.r1, rect);
+                    dome(&mut bark, origin + seg.b, (seg.b - seg.a).normalize_or(Vec3::Y), seg.r1, rect, tint);
                 }
+            }
+            for &(center, face, up, size) in &sk.pads {
+                pad(&mut bark, origin + center, face, up, size, rect, tint * 1.05);
             }
         }
         if let (false, Some(rect)) = (sk.cactus, wood_rect) {
             for seg in &sk.wood {
                 // Au loin, seulement les grosses branches (les fines, cachées
                 // par le feuillage, feraient des milliers de tubes).
-                let min_radius = match step { 1 => 0.0, 2 => 0.1, _ => 0.2 };
+                let min_radius = match step { 1 => 0.016, 2 => 0.1, _ => 0.2 };
                 if seg.r0 < min_radius {
                     continue;
                 }
                 // Tronc (et grosses branches) : plus de faces et teinte du tronc.
                 let thick = seg.r0 >= 0.25;
                 let sides = if thick { trunk_sides } else { branch_sides };
-                tube(&mut bark, seg, origin, rect, sides, if thick { trunk_shade } else { branch_shade });
+                // Lobes : fût (épais, presque vertical) seulement.
+                let lobes = (thick && (seg.b - seg.a).normalize_or_zero().y > 0.7 && seg.a.y < 6.0).then(|| hash(tree.x, tree.z, 77) * TAU);
+                tube(&mut bark, seg, origin, rect, sides, if thick { trunk_shade } else { branch_shade }, lobes);
             }
         }
 
@@ -529,8 +675,27 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
             let blocks = (1..=8).filter(|dy| nb.block(lx, tree.ground + 1 + dy, lz).is_solid()).count();
             let cover = match blocks { 0 => 1.0, 1..=2 => 0.8, _ => 0.62 };
             let snowy = nb.block(lx, tree.ground, lz) == BlockType::Snow;
+            // Sol du lieu : au pied et à 5 blocs alentour (le pied est
+            // souvent du gravier, d'un lit à sec ou d'un éboulis), le plus
+            // caractéristique l'emporte (terre rouge, sable, herbe).
+            let ground = [(0, 0), (5, 0), (-5, 0), (0, 5), (0, -5)].iter()
+                .map(|&(dx, dz)| {
+                    let (x, z) = (lx + dx, lz + dz);
+                    let top = (tree.ground - 3..=tree.ground + 3).rev().find(|&y| nb.block(x, y, z).is_solid()).unwrap_or(tree.ground);
+                    nb.block(x, top, z)
+                })
+                .max_by_key(|b| match b {
+                    BlockType::RedSand => 4,
+                    BlockType::Sand | BlockType::Sandstone | BlockType::Salt => 3,
+                    BlockType::Grass | BlockType::Dirt | BlockType::Mud | BlockType::Podzol | BlockType::LeafLitter => 2,
+                    _ => 1,
+                })
+                .unwrap_or(BlockType::Rock);
             for (i, r) in sk.rocks.iter().enumerate() {
-                rock(&mut rocks, origin + r.center, r.radius, (tree.x, tree.z, 700 + i as u32 * 100), cover, snowy && sk.rock_style == 0, sk.rock_style);
+                rock(&mut rocks, origin + r.center, r.radius, (tree.x, tree.z, 700 + i as u32 * 100), cover, snowy && sk.rock_style == 0, sk.rock_style, ground);
+            }
+            if let Some(cap) = &sk.cap {
+                rock(&mut rocks, origin + cap.center, cap.radius, (tree.x, tree.z, 690), cover, false, 3, ground);
             }
         }
         // Fougères : seulement en pleine résolution (des milliers de quads).
@@ -543,6 +708,13 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
             if let (Some(rect), true) = (atlas.reed_uv, sk.reeds > 0.0) {
                 let tint = Vec3::new(0.95, 1.0, 0.85) * (0.8 + 0.25 * hash(tree.x, tree.z, 5));
                 upright_clump(&mut foliage, origin, sk.reeds, 1.3, 3, rect, tint, 0.5, seed);
+                // Massettes : épis bruns en haut de tiges fines, dans six
+                // touffes sur dix (de près seulement).
+                if let (1, Some(bark_rect)) = (step, atlas.bark_uvs.get("dead").copied().or(log_rect)) {
+                    if hash(tree.x, tree.z, 630) < 0.6 {
+                        cattails(&mut foliage, origin, sk.reeds, rect, bark_rect, seed);
+                    }
+                }
             }
             if let (Some(rect), true) = (atlas.lily_uv, sk.lily > 0.0) {
                 lily_pads(&mut foliage, origin + Vec3::Y * sk.lily, rect, seed);
@@ -589,8 +761,10 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
             card_strip(&mut foliage, origin, c, rect, tint, (tree.x, tree.z, 60 + i as u32));
         }
 
-        let pine = tree.kind == TreeKind::Spruce;
-        let tint = if sk.willow {
+        let pine = matches!(tree.kind, TreeKind::Spruce | TreeKind::Pine);
+        let tint = if let Some(tint) = sk.leaf_tint {
+            tint * (0.85 + 0.25 * hash(tree.x, tree.z, 4))
+        } else if sk.willow {
             // Saule : vert tendre tirant sur le jaune.
             Vec3::new(1.0, 1.1, 0.72) * (0.8 + 0.25 * hash(tree.x, tree.z, 4))
         } else if sk.conifer_like {
@@ -686,7 +860,15 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
             foliage.quad([m - x - z, m + x - z, m + x + z, m - x + z], Vec3::Y, rect, [top; 4], [[0.05, phase]; 4]);
         }
 
-        let leaf_rect = if sk.tropical { atlas.jungle_leaf_uv.or(leaf_rect) } else { leaf_rect };
+        // Feuillage de l'essence, sinon feuilles tropicales ou rameau par
+        // défaut.
+        let leaf_rect = match atlas.leaf_uvs.get(species) {
+            // Pin : touffes d'aiguilles.
+            _ if tree.kind == TreeKind::Pine => pine_rect.or(leaf_rect),
+            Some(&rect) => Some(rect),
+            None if sk.tropical => atlas.jungle_leaf_uv.or(leaf_rect),
+            None => leaf_rect,
+        };
         if let (Some(rect), None) = (leaf_rect, impostor) {
             for blob in &sk.blobs {
                 let r = blob.radius;
@@ -699,7 +881,8 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
                 // couverture) : depuis la ramification récursive, un arbre a
                 // bien plus d'amas, et 2,0 touffes par unité de surface
                 // coûtaient ~4 FPS en forêt.
-                let count = ((area * 1.2 / 3.6 * detail) as usize).clamp(2, 90);
+                let density = if sk.leaf_density > 0.0 { sk.leaf_density } else { 1.0 };
+                let count = ((area * 1.2 / 3.6 * detail * density) as usize).clamp(2, 90);
                 let center = origin + blob.center;
                 // Forme bosselée plutôt qu'un ellipsoïde lisse : quelques
                 // lobes qui gonflent l'amas dans leur direction, et sur les
@@ -772,7 +955,46 @@ pub fn tree_meshes(trees: &[TreeInstance], chunk_x: i32, chunk_z: i32, nb: &Neig
                 foliage.quad([b - side, b + side, t + side, t - side], Vec3::Y * 0.8 + face * 0.3, rect, [low, low, high, high], [[0.0, phase], [0.0, phase], [0.06, phase], [0.06, phase]]);
             }
         }
-        if let (Some(rect), None) = (pine_rect, pine_impostor) {
+        if let (Some(rect), None, false) = (pine_rect, pine_impostor, sk.sprays.is_empty()) {
+            // Rameaux le long de chaque branche (deux tronçons : vers le
+            // coude, puis le bout relevé), en croix pour le volume.
+            let low_c = |y: f32, ao: f32| (tint * (0.8 + 0.2 * (y / 12.0).clamp(0.0, 1.0))).extend(ao).to_array();
+            for spray in &sk.sprays {
+                let phase = next(&mut salt);
+                let roll = (next(&mut salt) - 0.5) * 0.8;
+                let width = spray.width * card_scale.sqrt();
+                let points = [(spray.a, 0.3, 0.45, 0.03), (spray.b, 1.0, 0.65, 0.14), (spray.c, 0.55, 0.9, 0.25)];
+                for layer in 0..if spray.main { 2 } else { 1 } {
+                    for k in 0..2 {
+                        let (p, w, ao, sway) = points[k];
+                        let (q, w2, ao2, sway2) = points[k + 1];
+                        let along = (q - p).normalize_or(Vec3::X);
+                        let flat = along.cross(Vec3::Y).normalize_or(Vec3::Z);
+                        let up = flat.cross(along);
+                        // Couche 0 : à plat (un peu roulée) ; couche 1 :
+                        // inclinée, retombante.
+                        let tilt = if layer == 0 { roll } else { 1.0 + roll * 0.5 };
+                        let side = flat * tilt.cos() + up * tilt.sin();
+                        let normal = (up * tilt.cos() - flat * tilt.sin() + Vec3::Y * 0.6).normalize_or(Vec3::Y);
+                        let (pa, qa) = (origin + p, origin + q);
+                        let corners = [pa - side * width * w * 0.5, pa + side * width * w * 0.5, qa + side * width * w2 * 0.5, qa - side * width * w2 * 0.5];
+                        let (c0, c1) = (low_c(p.y, ao), low_c(q.y, ao2));
+                        foliage.quad(corners, normal, rect, [c0, c0, c1, c1], [[sway, phase], [sway, phase], [sway2, phase], [sway2, phase]]);
+                    }
+                }
+            }
+            if let Some(top) = sk.whorls.last() {
+                // Flèche du sommet.
+                let tip = origin + Vec3::new(0.0, top.y + 1.6, 0.0);
+                let c = tint.extend(1.0).to_array();
+                for (dx, dz) in [(0.35, 0.0), (0.0, 0.35)] {
+                    let s = Vec3::new(dx, 0.0, dz);
+                    let base = tip - Vec3::Y * 1.9;
+                    foliage.quad([base - s, base + s, tip + s * 0.15, tip - s * 0.15], Vec3::Y, rect, [c; 4], [[0.05, 0.0], [0.05, 0.0], [0.2, 0.0], [0.2, 0.0]]);
+                }
+            }
+        }
+        if let (Some(rect), None, true) = (pine_rect, pine_impostor, sk.sprays.is_empty()) {
             for whorl in &sk.whorls {
                 // Branches tombantes réparties autour du tronc. Longueur,
                 // hauteur d'attache, retombée et roulis tirés au hasard par

@@ -7,7 +7,8 @@ use bevy::asset::{Assets, AssetServer, Handle};
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::{default, Res, ResMut, Resource};
 use crate::texture_bake::{general_path, terrain_path, TerrainAtlas, TERRAIN_JSON};
-use bevy::image::{ImageSampler, ImageSamplerDescriptor};
+use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+use crate::graphics_quality::GraphicsQuality;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::image::ImageLoaderSettings;
@@ -15,6 +16,9 @@ use bevy::asset::RenderAssetUsages;
 use bevy::shader::ShaderRef;
 use crate::world::block::BlockType;
 use crate::render::smooth_terrain::{ATTRIBUTE_TERRAIN_LAYERS, ATTRIBUTE_TERRAIN_SALT};
+use crate::render::far_shadows::FarShadowUniform;
+use crate::render::far_terrain::{new_far_shadow_image, seam_shader_defs, FarPalette, FarShadowImage, FarTreeShadowImage};
+use crate::render::far_shadows::{FAR_TREE_RES, NEAR_RES};
 use bevy::pbr::{MaterialExtensionKey, MaterialExtensionPipeline};
 use bevy::render::mesh::MeshVertexBufferLayoutRef;
 use bevy::render::render_resource::{RenderPipelineDescriptor, SpecializedMeshPipelineError};
@@ -111,6 +115,8 @@ fn filename_to_card_block_type(name: &str) -> Option<BlockType> {
 #[derive(Resource,Clone)]
 pub struct TextureAtlasMaterial {
     pub opaque_handle: Handle<StandardMaterial>,
+    /// Écorce des arbres (voir `BarkMaterial`).
+    pub bark_handle: Handle<BarkMaterial>,
     /// Eau : vagues, couleur selon la profondeur, écume (voir `WaterExtension`).
     pub water_handle: Handle<WaterMaterial>,
     /// Plantes en croix (herbe haute, fleurs) : découpe alpha, pas de culling.
@@ -123,8 +129,10 @@ pub struct TextureAtlasMaterial {
     pub side_uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>,
     /// Cartes de feuillage (voir `filename_to_card_block_type`).
     pub card_uv_map: HashMap<BlockType, ([f32; 2], [f32; 2])>,
-    /// Terrain lisse (voir smooth_terrain.rs et terrain.wgsl).
+    /// Terrain lisse (voir smooth_terrain.rs et terrain.wgsl), et sa
+    /// variante des chunks du bord de la zone chargée (voir `TerrainKey`).
     pub terrain_handle: Handle<TerrainMaterial>,
+    pub terrain_edge_handle: Handle<TerrainMaterial>,
     pub shadow_proxy_handle: Handle<ShadowProxyMaterial>,
     /// Variantes d'herbe (voir `plant_mesh`) : tapis d'herbe courte posé sur
     /// les blocs d'herbe, et graminée à épis qui remplace une partie des
@@ -159,6 +167,10 @@ pub struct TextureAtlasMaterial {
     pub broadleaf_uv: Option<([f32; 2], [f32; 2])>,
     pub liana_uv: Option<([f32; 2], [f32; 2])>,
     pub heliconia_uv: Option<([f32; 2], [f32; 2])>,
+    /// Écorce et feuillage propres à chaque essence (voir
+    /// `TreeKind::species`, tools/gen_tree_species.py).
+    pub bark_uvs: HashMap<String, ([f32; 2], [f32; 2])>,
+    pub leaf_uvs: HashMap<String, ([f32; 2], [f32; 2])>,
 }
 
 
@@ -185,6 +197,24 @@ pub struct WindExtension {
     /// position d'un pixel dans sa tuile (relief des imposteurs d'arbres).
     #[uniform(100)]
     pub atlas: Vec4,
+    /// Ombres du relief au-delà des cartes d'ombre (voir `FarShadowUniform`).
+    #[uniform(100)]
+    pub far_area: Vec4,
+    #[uniform(100)]
+    pub far_timing: Vec4,
+    /// Ombres du relief pour les arbres lointains (texture grossière sur
+    /// ±2,6 km, voir `FarTreeShadowImage`).
+    #[uniform(100)]
+    pub far_tree_area: Vec4,
+    /// x : humidité (pluie) : feuilles assombries et luisantes.
+    #[uniform(100)]
+    pub weather: Vec4,
+    #[texture(101)]
+    #[sampler(102)]
+    pub far_shadow: Handle<Image>,
+    #[texture(103)]
+    #[sampler(104)]
+    pub far_tree_shadow: Handle<Image>,
 }
 
 /// Grille de l'atlas (tools/gen_*.py) : tuiles de 1024 px espacées de
@@ -204,6 +234,25 @@ impl MaterialExtension for WindExtension {
     fn fragment_shader() -> ShaderRef {
         "shaders/plant_light.wgsl".into()
     }
+
+    /// Fondu entre niveaux de détail (voir lod_fade.wgsl).
+    fn prepass_fragment_shader() -> ShaderRef {
+        "shaders/lod_fade_prepass.wgsl".into()
+    }
+
+    /// Bord de la zone chargée (arbres lointains, voir wind_common.wgsl).
+    fn specialize(
+        _pipeline: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.vertex.shader_defs.extend(seam_shader_defs());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.extend(seam_shader_defs());
+        }
+        Ok(())
+    }
 }
 
 /// Matériau du terrain lisse : le `StandardMaterial` (éclairage) dont
@@ -213,31 +262,57 @@ pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 
 #[derive(Clone, Copy, Default, Debug, Reflect, ShaderType)]
 pub struct TerrainUniform {
-    /// Tuile (coin UV, taille UV) du dessus puis du côté de chaque couche :
+    /// Tuile (x : calque de l'atlas terrain) du dessus puis du côté de chaque couche :
     /// herbe, terre, roche, sable, neige, terre rouge, litière, podzol,
     /// vase, gravier, grès, sel (voir `layer_of`, smooth_terrain.rs).
     pub tiles: [Vec4; 24],
     /// x : blocs couverts par une répétition de tuile, y : humidité (0..1,
     /// pluie : sol mouillé et flaques).
     pub params: Vec4,
-    /// Tuile (coin UV, taille UV) de la paroi photo projetée en grand sur la
-    /// roche (voir tools/gen_rock_macro.py) ; taille nulle : absente.
+    /// Tuile (x : calque) de la paroi photo projetée en grand sur la roche
+    /// (voir tools/gen_rock_macro.py) ; z nul : absente.
     pub rock_macro: Vec4,
+    /// Ombres du relief au-delà des cartes d'ombre (voir far_shadows.rs).
+    pub far_shadow: FarShadowUniform,
 }
 
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+#[bind_group_data(TerrainKey)]
 pub struct TerrainExtension {
     #[uniform(100)]
     pub terrain: TerrainUniform,
-    #[texture(101)]
+    #[texture(101, dimension = "2d_array")]
     #[sampler(102)]
     pub color: Handle<Image>,
-    #[texture(103)]
+    #[texture(103, dimension = "2d_array")]
     #[sampler(104)]
     pub normal: Handle<Image>,
-    #[texture(105)]
+    #[texture(105, dimension = "2d_array")]
     #[sampler(106)]
     pub roughness: Handle<Image>,
+    /// Ombres du relief vues de dessus (voir `FarShadowImage`).
+    #[texture(107)]
+    #[sampler(108)]
+    pub far_shadow: Handle<Image>,
+    /// Variante des chunks du bord de la zone chargée : fondu tramé vers le
+    /// relief lointain (voir seam.wgsl et `assign_seam_materials`).
+    pub seam_fade: bool,
+    /// Filtrage anisotrope des tuiles (qualité haute, voir `sample_tile`).
+    pub anisotropic: bool,
+}
+
+/// Clé de pipeline du terrain : avec ou sans le fondu du bord (son `discard`
+/// coûte cher, il n'est compilé que dans la variante qui en a besoin).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TerrainKey {
+    seam_fade: bool,
+    anisotropic: bool,
+}
+
+impl From<&TerrainExtension> for TerrainKey {
+    fn from(extension: &TerrainExtension) -> Self {
+        TerrainKey { seam_fade: extension.seam_fade, anisotropic: extension.anisotropic }
+    }
 }
 
 impl MaterialExtension for TerrainExtension {
@@ -249,6 +324,12 @@ impl MaterialExtension for TerrainExtension {
         "shaders/terrain.wgsl".into()
     }
 
+    /// Fondu tramé au bord de la zone chargée (voir `TerrainUniform::hole`),
+    /// aussi dans la passe de profondeur.
+    fn prepass_fragment_shader() -> ShaderRef {
+        "shaders/terrain_prepass.wgsl".into()
+    }
+
     /// Poids des couches 7 à 11 : attributs propres au terrain lisse (voir
     /// `ATTRIBUTE_TERRAIN_LAYERS`), ajoutés au tampon de sommets de toutes
     /// les passes (ignorés par celles de profondeur et d'ombre) et lus par
@@ -257,8 +338,19 @@ impl MaterialExtension for TerrainExtension {
         _pipeline: &MaterialExtensionPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         layout: &MeshVertexBufferLayoutRef,
-        _key: MaterialExtensionKey<Self>,
+        key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        // Fondu du bord (voir `TerrainKey`), aussi dans les passes de
+        // profondeur (voir terrain_prepass.wgsl).
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.extend(seam_shader_defs());
+            if key.bind_group_data.seam_fade {
+                fragment.shader_defs.push("SEAM_FADE".into());
+            }
+            if key.bind_group_data.anisotropic {
+                fragment.shader_defs.push("TERRAIN_ANISOTROPIC".into());
+            }
+        }
         if layout.0.contains(ATTRIBUTE_TERRAIN_LAYERS) && layout.0.contains(ATTRIBUTE_TERRAIN_SALT) {
             let extra = layout.0.get_layout(&[
                 ATTRIBUTE_TERRAIN_LAYERS.at_shader_location(10),
@@ -275,6 +367,38 @@ impl MaterialExtension for TerrainExtension {
             }
         }
         Ok(())
+    }
+}
+
+/// Matériau de l'écorce (troncs, branches, cactus) : le `StandardMaterial`
+/// de l'atlas, éclairé comme le terrain (voir bark.wgsl) : lumière de
+/// sous-bois, rebond du sol, ombres du relief, mousse au pied. Avec le
+/// matériau standard seul, les troncs ressortaient trop clairs et bleutés à
+/// l'ombre, à côté d'un sol assombri.
+pub type BarkMaterial = ExtendedMaterial<StandardMaterial, BarkExtension>;
+
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+pub struct BarkExtension {
+    /// Ombres du relief et canopée (voir `FarShadowUniform`).
+    #[uniform(100)]
+    pub far_area: Vec4,
+    #[uniform(100)]
+    pub far_timing: Vec4,
+    #[texture(101)]
+    #[sampler(102)]
+    pub far_shadow: Handle<Image>,
+}
+
+impl MaterialExtension for BarkExtension {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/bark.wgsl".into()
+    }
+
+    /// Fondu entre niveaux de détail (voir lod_fade.wgsl). Le matériau est
+    /// en découpe alpha (jamais déclenchée) pour que Bevy exécute ce shader
+    /// aussi dans la passe de profondeur seule.
+    fn prepass_fragment_shader() -> ShaderRef {
+        "shaders/lod_fade_prepass.wgsl".into()
     }
 }
 
@@ -333,6 +457,7 @@ impl Plugin for TexturePlugin {
         app.add_plugins(MaterialPlugin::<WaterMaterial>::default());
         app.add_plugins(MaterialPlugin::<TerrainMaterial>::default());
         app.add_plugins(MaterialPlugin::<ShadowProxyMaterial>::default());
+        app.add_plugins(MaterialPlugin::<BarkMaterial>::default());
         app.add_systems(Startup, setup_texture_atlas);
     }
 }
@@ -340,11 +465,14 @@ impl Plugin for TexturePlugin {
 pub fn setup_texture_atlas(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut plant_materials: ResMut<Assets<PlantMaterial>>,
     mut water_materials: ResMut<Assets<WaterMaterial>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut shadow_proxy_materials: ResMut<Assets<ShadowProxyMaterial>>,
+    mut bark_materials: ResMut<Assets<BarkMaterial>>,
+    quality: Res<GraphicsQuality>,
 ) {
     // Atlas cuits (BC7 et mipmaps, voir texture_bake.rs) : envoyés tels
     // quels au GPU, sans copie gardée en mémoire vive. Filtrage anisotrope
@@ -363,11 +491,36 @@ pub fn setup_texture_atlas(
     let texture_handle = load(general_path("color"), true);
     let normal_map_handle = load(general_path("normal"), false);
     let metallic_roughness_handle = load(general_path("mr"), false);
-    let terrain_color = load(terrain_path("color"), true);
-    let terrain_normal = load(terrain_path("normal"), false);
-    let terrain_mr = load(terrain_path("mr"), false);
+    // Tuiles du terrain (tableau de textures) : répétées, filtrage
+    // anisotrope (sol vu en rasant jusqu'à plusieurs centaines de blocs).
+    // Plus poussé sur la couleur, qui se voit le plus ; les normales et la
+    // rugosité se contentent de moins. Qualité basse : sans (voir
+    // `sample_tile`, terrain.wgsl).
+    let high = *quality == GraphicsQuality::High;
+    let load_terrain = |path: String, srgb: bool, anisotropy: u16| -> Handle<Image> {
+        asset_server.load_builder().with_settings(move |settings: &mut ImageLoaderSettings| {
+            settings.is_srgb = srgb;
+            settings.asset_usage = RenderAssetUsages::RENDER_WORLD;
+            settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::Repeat,
+                address_mode_v: ImageAddressMode::Repeat,
+                anisotropy_clamp: anisotropy,
+                ..ImageSamplerDescriptor::linear()
+            });
+        }).load(path)
+    };
+    let terrain_color = load_terrain(terrain_path("color"), true, if high { 8 } else { 1 });
+    let terrain_normal = load_terrain(terrain_path("normal"), false, if high { 4 } else { 1 });
+    let terrain_mr = load_terrain(terrain_path("mr"), false, if high { 4 } else { 1 });
     let terrain_atlas: TerrainAtlas = serde_json::from_str(&fs::read_to_string(TERRAIN_JSON).expect("atlas terrain non cuit"))
         .expect("terrain_atlas.json mal formé");
+    // Couleurs du relief lointain, et texture de ses ombres sur la zone
+    // chargée (voir far_terrain.rs, far_shadows.rs).
+    commands.insert_resource(FarPalette::from_averages(&terrain_atlas.average));
+    let far_shadow = images.add(new_far_shadow_image(NEAR_RES));
+    commands.insert_resource(FarShadowImage(far_shadow.clone()));
+    let far_tree_shadow = images.add(new_far_shadow_image(FAR_TREE_RES));
+    commands.insert_resource(FarTreeShadowImage(far_tree_shadow.clone()));
 
     // Eau : surface lisse (reflets nets du soleil sur les vagues de
     // water.wgsl), sans texture de l'atlas (la tuile d'eau, claire et de
@@ -395,7 +548,7 @@ pub fn setup_texture_atlas(
     });
 
 
-    let standard_material = materials.add(StandardMaterial {
+    let standard = StandardMaterial {
         base_color_texture: Some(texture_handle.clone()),
         normal_map_texture: Some(normal_map_handle.clone()),
         metallic_roughness_texture: Some(metallic_roughness_handle.clone()),
@@ -410,7 +563,12 @@ pub fn setup_texture_atlas(
         // de l'herbe, le reflet du ciel doit rester discret.
         specular_tint: Color::srgb(0.35, 0.35, 0.35),
         ..default()
+    };
+    let bark_material = bark_materials.add(BarkMaterial {
+        base: StandardMaterial { alpha_mode: AlphaMode::Mask(0.5), ..standard.clone() },
+        extension: BarkExtension { far_area: Vec4::ZERO, far_timing: Vec4::ZERO, far_shadow: far_shadow.clone() },
     });
+    let standard_material = materials.add(standard);
 
     let json_path = Path::new("assets/atlas_texture.json");
     let json_str = fs::read_to_string(json_path).expect("Impossible de lire spritesheet.json");
@@ -439,6 +597,12 @@ pub fn setup_texture_atlas(
         extension: WindExtension {
             params: Vec4::new(PLANT_TRANSLUCENCY, 0.0, 0.0, 0.0),
             atlas: Vec4::new(atlas_width, atlas_height, ATLAS_SLOT, ATLAS_MARGIN),
+            far_area: Vec4::ZERO,
+            far_timing: Vec4::ZERO,
+            far_tree_area: Vec4::ZERO,
+            weather: Vec4::ZERO,
+            far_shadow: far_shadow.clone(),
+            far_tree_shadow: far_tree_shadow.clone(),
         },
     };
     let mut foliage = plant.clone();
@@ -469,6 +633,8 @@ pub fn setup_texture_atlas(
     let (mut reed_uv, mut lily_uv, mut kelp_uv, mut coral_uv) = (None, None, None, None);
     let (mut jungle_leaf_uv, mut palm_frond_uv, mut broadleaf_uv, mut liana_uv, mut heliconia_uv) = (None, None, None, None, None);
 
+    let mut bark_uvs = HashMap::new();
+    let mut leaf_uvs = HashMap::new();
     for (filename, frame_data) in atlas_data.frames.iter() {
         let frame = &frame_data.frame;
         // On convertit les coordonnées pixels -> UV
@@ -503,6 +669,12 @@ pub fn setup_texture_atlas(
             "broadleaf.png" => broadleaf_uv = Some(rect),
             "liana.png" => liana_uv = Some(rect),
             "heliconia.png" => heliconia_uv = Some(rect),
+            name if name.starts_with("bark_") => {
+                bark_uvs.insert(name.trim_start_matches("bark_").trim_end_matches(".png").to_string(), rect);
+            }
+            name if name.starts_with("leaves_") => {
+                leaf_uvs.insert(name.trim_start_matches("leaves_").trim_end_matches(".png").to_string(), rect);
+            }
             _ => {}
         }
     }
@@ -512,14 +684,12 @@ pub fn setup_texture_atlas(
     crown_uvs.sort_by(|a, b| a.0.cmp(&b.0));
     let crown_uvs: Vec<_> = crown_uvs.into_iter().map(|(_, rect)| rect).collect();
 
-    // Tuiles du terrain lisse (dans l'atlas terrain, en pleine résolution) :
-    // (dessus, côté) de chaque couche. Sur les pentes raides, l'herbe
-    // laisse voir la terre, la neige la roche.
+    // Tuiles du terrain lisse (calques du tableau de textures, en pleine
+    // résolution) : (dessus, côté) de chaque couche. Sur les pentes raides,
+    // l'herbe laisse voir la terre, la neige la roche. x : calque, z : 1
+    // (tuile présente).
     let tile = |name: &str| -> Vec4 {
-        let [x, y] = terrain_atlas.tiles[name];
-        let [w, h] = terrain_atlas.size.map(|v| v as f32);
-        let t = terrain_atlas.tile as f32;
-        Vec4::new(x as f32 / w, y as f32 / h, t / w, t / h)
+        Vec4::new(terrain_atlas.layers[name] as f32, 0.0, 1.0, 1.0)
     };
     let layers = [
         ("grass.png", "dirt.png"), ("dirt.png", "dirt.png"), ("rock.png", "rock.png"), ("sand.png", "sand.png"),
@@ -532,7 +702,7 @@ pub fn setup_texture_atlas(
         tiles[2 * i] = tile(top);
         tiles[2 * i + 1] = tile(side);
     }
-    let terrain_material = terrain_materials.add(TerrainMaterial {
+    let terrain = TerrainMaterial {
         base: StandardMaterial {
             perceptual_roughness: 1.0,
             reflectance: 0.15,
@@ -542,17 +712,32 @@ pub fn setup_texture_atlas(
         extension: TerrainExtension {
             terrain: TerrainUniform {
                 tiles,
-                params: Vec4::new(4.0, 0.0, 0.0, 0.0),
-                rock_macro: if terrain_atlas.tiles.contains_key("rock_macro.png") { tile("rock_macro.png") } else { Vec4::ZERO },
+                // w : relief des textures (parallaxe, auto-ombrage), 0 pour le
+                // couper (mesure : GAME3D_DISABLE=relief_textures).
+                params: Vec4::new(4.0, 0.0, 0.0, if crate::debug_capture::is_disabled("relief_textures") { 0.0 } else { 1.0 }),
+                rock_macro: if terrain_atlas.layers.contains_key("rock_macro.png") { tile("rock_macro.png") } else { Vec4::ZERO },
+                far_shadow: FarShadowUniform::default(),
             },
             color: terrain_color,
             normal: terrain_normal,
             roughness: terrain_mr,
+            far_shadow,
+            seam_fade: false,
+            anisotropic: high,
         },
-    });
+    };
+    let mut terrain_edge = terrain.clone();
+    terrain_edge.extension.seam_fade = true;
+    // Découpe alpha (jamais déclenchée) : Bevy n'exécute le shader de la
+    // passe de profondeur que pour un matériau qui peut éliminer des pixels
+    // (voir le relief lointain, far_terrain.rs).
+    terrain_edge.base.alpha_mode = AlphaMode::Mask(0.5);
+    let terrain_material = terrain_materials.add(terrain);
+    let terrain_edge_material = terrain_materials.add(terrain_edge);
 
     commands.insert_resource(TextureAtlasMaterial {
         opaque_handle: standard_material,
+        bark_handle: bark_material,
         water_handle: water_material,
         plant_handle: plant_material,
         foliage_handle: foliage_material,
@@ -560,6 +745,7 @@ pub fn setup_texture_atlas(
         side_uv_map,
         card_uv_map,
         terrain_handle: terrain_material,
+        terrain_edge_handle: terrain_edge_material,
         shadow_proxy_handle: shadow_proxy_materials.add(ShadowProxyMaterial {}),
         short_grass_uv,
         seed_grass_uv,
@@ -580,6 +766,8 @@ pub fn setup_texture_atlas(
         broadleaf_uv,
         liana_uv,
         heliconia_uv,
+        bark_uvs,
+        leaf_uvs,
     });
 }
 

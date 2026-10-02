@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.19", features = ["jpeg", "pbr_clustered_decals", "pbr_light_textures"] }
+bevy = { version = "0.19", features = ["jpeg", "pbr_clustered_decals", "pbr_light_textures", "experimental_pbr_pcss"] }
 bevy_pbr = "0.19"
 bevy_rapier3d = "0.36"
 noise = "0.8"

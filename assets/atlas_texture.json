@@ -423,13 +423,205 @@
         "w": 1024,
         "h": 1024
       }
+    },
+    "bark_big_oak.png": {
+      "frame": {
+        "x": 5472,
+        "y": 6560,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_spruce.png": {
+      "frame": {
+        "x": 6560,
+        "y": 6560,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_willow.png": {
+      "frame": {
+        "x": 7648,
+        "y": 6560,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_acacia.png": {
+      "frame": {
+        "x": 8736,
+        "y": 32,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_baobab.png": {
+      "frame": {
+        "x": 8736,
+        "y": 1120,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_cypress.png": {
+      "frame": {
+        "x": 8736,
+        "y": 2208,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_giant.png": {
+      "frame": {
+        "x": 8736,
+        "y": 3296,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_palm.png": {
+      "frame": {
+        "x": 8736,
+        "y": 4384,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_emergent.png": {
+      "frame": {
+        "x": 8736,
+        "y": 5472,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_jungle.png": {
+      "frame": {
+        "x": 8736,
+        "y": 6560,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_mangrove.png": {
+      "frame": {
+        "x": 9824,
+        "y": 32,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_dead.png": {
+      "frame": {
+        "x": 9824,
+        "y": 1120,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "bark_bush.png": {
+      "frame": {
+        "x": 9824,
+        "y": 2208,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_big_oak.png": {
+      "frame": {
+        "x": 9824,
+        "y": 3296,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_birch.png": {
+      "frame": {
+        "x": 9824,
+        "y": 4384,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_willow.png": {
+      "frame": {
+        "x": 9824,
+        "y": 5472,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_acacia.png": {
+      "frame": {
+        "x": 9824,
+        "y": 6560,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_baobab.png": {
+      "frame": {
+        "x": 10912,
+        "y": 32,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_cypress.png": {
+      "frame": {
+        "x": 10912,
+        "y": 1120,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_giant.png": {
+      "frame": {
+        "x": 10912,
+        "y": 2208,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_emergent.png": {
+      "frame": {
+        "x": 10912,
+        "y": 3296,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_mangrove.png": {
+      "frame": {
+        "x": 10912,
+        "y": 4384,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_bush.png": {
+      "frame": {
+        "x": 10912,
+        "y": 5472,
+        "w": 1024,
+        "h": 1024
+      }
+    },
+    "leaves_dry_bush.png": {
+      "frame": {
+        "x": 10912,
+        "y": 6560,
+        "w": 1024,
+        "h": 1024
+      }
     }
   },
   "meta": {
     "app": "build_hd_atlas.py (ambientCG CC0 1K + tuiles proc\u00e9durales)",
     "image": "atlas_texture.png",
     "size": {
-      "w": 8704,
+      "w": 12288,
       "h": 7680
     }
   }

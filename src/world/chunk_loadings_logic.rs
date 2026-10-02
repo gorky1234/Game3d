@@ -2,7 +2,7 @@ use bevy::app::{App, Plugin, Update};
 use bevy::math::IVec2;
 use bevy::prelude::{Commands, MessageWriter, SystemSet, IntoScheduleConfigs, Query, ResMut, Resource, Transform, With};
 use crate::constants::{CHUNK_SIZE, LOD1_DISTANCE, SECTION_HEIGHT, VIEW_DISTANCE, WORLD_HEIGHT, WORLD_SIZE};
-use crate::generation::chunk_generation_logic::ToGenerateChunkEvent;
+use crate::generation::chunk::chunk_generation_logic::ToGenerateChunkEvent;
 use crate::player::Player;
 use crate::world::load_save_chunk::{chunk_lod_stride, ToLoadChunkEvent, WorldData};
 

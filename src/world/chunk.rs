@@ -1,6 +1,6 @@
 use crate::constants::{CHUNK_SIZE, SECTION_HEIGHT, WORLD_HEIGHT};
 use crate::world::block::BlockType;
-use crate::generation::tree_shapes::TreeInstance;
+use crate::generation::vegetation::tree_shapes::TreeInstance;
 
 /// Nombre de blocs d'une section.
 const SECTION_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * SECTION_HEIGHT;

@@ -64,6 +64,55 @@ fn stone_mix(nb: &Neighborhood, x: i32, y: i32, z: i32, step: i32, outcrop: bool
 /// Nombre de couches de matériau du terrain lisse (voir `layer_of`).
 const LAYERS: usize = 12;
 
+/// Amplitude (blocs) du micro-relief selon la couche (voir `ground_relief`) :
+/// mottes et creux sur la terre, l'herbe et la litière, bosses de roche,
+/// presque rien sur le sable, la neige, la vase et le sel.
+const RELIEF_AMPLITUDE: [f32; LAYERS] = [0.42, 0.45, 0.5, 0.12, 0.1, 0.3, 0.45, 0.4, 0.15, 0.2, 0.35, 0.0];
+
+fn relief_hash(x: i32, z: i32, salt: u32) -> f32 {
+    let mut h = (x as u32).wrapping_mul(0x8DA6_B343) ^ (z as u32).wrapping_mul(0xCB1A_B31F) ^ salt.wrapping_mul(0x9E37_79B9);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    (h & 0xFFFF) as f32 / 65535.0
+}
+
+/// Bruit de valeur lissé (0..1), cellules de 1.
+fn relief_noise(x: f32, z: f32, salt: u32) -> f32 {
+    let (x0, z0) = (x.floor(), z.floor());
+    let (fx, fz) = (x - x0, z - z0);
+    let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
+    let (ix, iz) = (x0 as i32, z0 as i32);
+    let a = relief_hash(ix, iz, salt) + (relief_hash(ix + 1, iz, salt) - relief_hash(ix, iz, salt)) * sx;
+    let b = relief_hash(ix, iz + 1, salt) + (relief_hash(ix + 1, iz + 1, salt) - relief_hash(ix, iz + 1, salt)) * sx;
+    a + (b - a) * sz
+}
+
+/// Micro-relief du sol proche (blocs, vers le haut) en (wx, wz) monde :
+/// mottes, petites buttes et creux de 2 à 10 m, plus marqués par zones. Le
+/// maillage lisse (densité floutée sur 3 blocs) n'en gardait rien : sol
+/// « nappe tendue ». `amplitude` : selon le matériau et la pente (voir
+/// `relief_amplitude`). Appliqué au maillage proche (`terrain_mesh`, pas
+/// 1) et au pied des plantes (`surface_height`) : les mêmes valeurs.
+pub fn ground_relief(wx: f32, wz: f32, amplitude: f32) -> f32 {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if amplitude <= 0.0 || *OFF.get_or_init(|| crate::debug_capture::is_disabled("relief_sol")) {
+        return 0.0;
+    }
+    let n = relief_noise(wx / 2.3, wz / 2.3, 71) * 0.5 + relief_noise(wx / 4.7 + 31.0, wz / 4.7 - 17.0, 72) * 0.33 + relief_noise(wx / 9.5 - 5.0, wz / 9.5 + 8.0, 73) * 0.17;
+    let zones = 0.35 + 0.65 * relief_noise(wx / 23.0 + 3.0, wz / 23.0, 74);
+    (n - 0.5) * 2.0 * amplitude * zones
+}
+
+/// Amplitude du micro-relief : selon les couches (`weights`), nulle sur les
+/// pentes raides (la normale `up` y mène, la roche y a son propre relief) et
+/// sur les berges (`bank`, voir `bank_wetness` : le sol percerait l'eau).
+fn relief_amplitude(weights: &[f32; LAYERS], up: f32, bank: f32) -> f32 {
+    let amp: f32 = weights.iter().zip(RELIEF_AMPLITUDE).map(|(w, a)| w * a).sum();
+    let flat = ((up - 0.55) / 0.3).clamp(0.0, 1.0);
+    amp * flat * (1.0 - (bank / 0.2).clamp(0.0, 1.0))
+}
+
 /// Poids des couches 7 à 10 (podzol, vase, gravier, grès) et 11 (sel) :
 /// les attributs standard de Bevy sont tous pris (voir `terrain_mesh`),
 /// terrain.wgsl les lit aux emplacements 10 et 11 (voir
@@ -183,6 +232,18 @@ impl Neighborhood {
     /// du dessus du bloc de sol `ground_y` : sert à poser l'herbe et les fleurs
     /// sur le terrain lisse plutôt qu'au sommet (disparu) du cube.
     pub fn surface_height(&self, x: i32, ground_y: i32, z: i32) -> f32 {
+        self.surface_height_at(x, ground_y, z, x as f32 + 0.5, z as f32 + 0.5)
+    }
+
+    /// Comme `surface_height`, au point (px, pz) de la colonne (coordonnées
+    /// locales au chunk) : le micro-relief varie sur 2 m, une touffe posée à
+    /// 0,5 bloc du centre de sa colonne flottait ou s'enfonçait.
+    pub fn surface_height_at(&self, x: i32, ground_y: i32, z: i32, px: f32, pz: f32) -> f32 {
+        self.smooth_height(x, ground_y, z) + self.relief_at(x, z, ground_y, px, pz)
+    }
+
+    /// Hauteur de la surface lisse sans le micro-relief.
+    fn smooth_height(&self, x: i32, ground_y: i32, z: i32) -> f32 {
         let mut below = self.density(x, ground_y - 2, z, 1);
         for y in (ground_y - 1)..=(ground_y + 2) {
             let above = self.density(x, y, z, 1);
@@ -193,6 +254,33 @@ impl Neighborhood {
             below = above;
         }
         ground_y as f32 + 1.0
+    }
+
+    /// Micro-relief (voir `ground_relief`) au centre de la colonne (x, z),
+    /// comme sur le maillage proche : matériau du bloc de sol, pente des
+    /// colonnes voisines, berge.
+    fn relief_at(&self, x: i32, z: i32, ground_y: i32, px: f32, pz: f32) -> f32 {
+        let Some(center) = self.center() else { return 0.0 };
+        let mut weights = [0.0f32; LAYERS];
+        weights[layer_of(self.block(x, ground_y, z))] = 1.0;
+        let h = |dx: i32, dz: i32| self.column_surface(x + dx, z + dz).unwrap_or(ground_y as f32 + 1.0);
+        let (gx, gz) = ((h(1, 0) - h(-1, 0)) * 0.5, (h(0, 1) - h(0, -1)) * 0.5);
+        let up = 1.0 / (1.0 + gx * gx + gz * gz).sqrt();
+        let bank = bank_wetness(self, Vec3::new(x as f32 + 0.5, ground_y as f32 + 1.0, z as f32 + 0.5));
+        let amplitude = relief_amplitude(&weights, up, bank);
+        if amplitude <= 0.0 {
+            return 0.0;
+        }
+        // Les sommets du maillage proche tombent à peu près sur les coins
+        // entiers des blocs, et le sol est plan entre eux : même
+        // interpolation bilinéaire du relief de ces coins.
+        let (ox, oz) = (center.x as f32 * 16.0, center.z as f32 * 16.0);
+        let (x0, z0) = (px.floor(), pz.floor());
+        let (fx, fz) = (px - x0, pz - z0);
+        let r = |dx: f32, dz: f32| ground_relief(ox + x0 + dx, oz + z0 + dz, amplitude);
+        let top = r(0.0, 0.0) + (r(1.0, 0.0) - r(0.0, 0.0)) * fx;
+        let bottom = r(0.0, 1.0) + (r(1.0, 1.0) - r(0.0, 1.0)) * fx;
+        top + (bottom - top) * fz
     }
 }
 
@@ -431,7 +519,7 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
             normals[i as usize] += face;
         }
     }
-    let normals: Vec<Vec3> = normals.into_iter().map(|v| v.normalize_or(Vec3::Y)).collect();
+    let mut normals: Vec<Vec3> = normals.into_iter().map(|v| v.normalize_or(Vec3::Y)).collect();
 
     // Matériau et occlusion par sommet.
     let mut weights: Vec<[f32; 4]> = Vec::with_capacity(positions.len());
@@ -443,6 +531,8 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
     // (granite, calcaire, 1, basalte). Bevy normalise leur xyz : le 1
     // permet de retrouver les poids par rapport (x / z, y / z).
     let mut stones: Vec<[f32; 4]> = Vec::with_capacity(positions.len());
+    let mut relief: Vec<f32> = Vec::with_capacity(positions.len());
+    let (chunk_x, chunk_z) = nb.center().map_or((0, 0), |c| (c.x, c.z));
     for (vi, &(i, j, k)) in cell_of_vertex.iter().enumerate() {
         // Matériau : blocs de surface (terrain sans terrain au-dessus) parmi
         // les 8 coins de la cellule, mélangés. Pas simplement le bloc le plus
@@ -514,7 +604,9 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
         if let Some(top) = nb.surface_y(px, pz) {
             let depth = (top - py) as f32;
             if depth > 2.0 {
-                ao *= (1.0 - (depth - 2.0) / 10.0).clamp(0.12, 1.0);
+                // Jusqu'à 3 % (12 % auparavant : le fond des grottes
+                // restait éclairé par le ciel).
+                ao *= (1.0 - (depth - 2.0) / 10.0).clamp(0.03, 1.0);
             }
         }
         let (i0, j0, k0) = (coord(i), base_y + coord(j), coord(k));
@@ -524,6 +616,14 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
         // neige : les deux ne se rencontrent pas (eau gelée), terrain.wgsl
         // les sépare par le signe.
         let bank = if s == 1 { bank_wetness(nb, Vec3::from(positions[vi]) + Vec3::new(0.0, base_y as f32, 0.0)) } else { 0.0 };
+        // Micro-relief : maillage proche seulement (au loin, des cellules de
+        // 2 à 4 blocs ne le représentent pas ; la différence ne se voit pas).
+        relief.push(if s == 1 {
+            let q = positions[vi];
+            ground_relief(chunk_x as f32 * 16.0 + q[0], chunk_z as f32 * 16.0 + q[2], relief_amplitude(&w, normals[vi].y, bank))
+        } else {
+            0.0
+        });
         extra.push([if bank > w[4] { -bank } else { w[4] }, ao]);
         // Terre rouge (badlands), ou en négatif litière (jungle) : ne se
         // rencontrent pas, un seul canal.
@@ -531,6 +631,24 @@ pub fn terrain_mesh(nb: &Neighborhood, section_index: usize, step: usize) -> Mes
         stones.push([granite, limestone, 1.0, basalt]);
         more.push([w[7], w[8], w[9], w[10]]);
         salt.push(w[11]);
+    }
+
+    // Micro-relief appliqué, normales recalculées (les bosses doivent
+    // s'éclairer et porter leurs ombres).
+    let mut positions = positions;
+    if relief.iter().any(|&r| r != 0.0) {
+        for (p, r) in positions.iter_mut().zip(&relief) {
+            p[1] += r;
+        }
+        let mut sums = vec![Vec3::ZERO; positions.len()];
+        for tri in indices.chunks_exact(3) {
+            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| Vec3::from(positions[i as usize]));
+            let face = (b - a).cross(c - a);
+            for &i in tri {
+                sums[i as usize] += face;
+            }
+        }
+        normals = sums.into_iter().map(|v| v.normalize_or(Vec3::Y)).collect();
     }
 
     // 1er canal d'UV : inutile pour les coordonnées de texture (projection

@@ -54,36 +54,64 @@ struct CloudParams {
 @group(#{MATERIAL_BIND_GROUP}) @binding(8) var moon_sampler: sampler;
 
 // Taille (blocs) d'une répétition du bruit 3D de forme, et du bruit fin.
-const SHAPE_SCALE: f32 = 420.0;
-const DETAIL_SCALE: f32 = 110.0;
+const SHAPE_SCALE: f32 = 900.0;
+const DETAIL_SCALE: f32 = 240.0;
 
-// Pas de raymarching : ~10 blocs chacun (la couche fait 110 blocs d'épaisseur),
-// entre MIN_STEPS et MAX_STEPS. Un nombre fixe de 20 pas sur des rayons
-// rasants de 900 blocs donnait 45 blocs par pas : les nuages apparaissaient
-// en tranches (stries verticales sur les bords et les bases).
-const STEP_LENGTH: f32 = 10.0;
-const MIN_STEPS: i32 = 12;
-const MAX_STEPS: i32 = 30;
+// Raymarching en deux allures : à grands pas (densité grossière, peu
+// coûteuse) tant que le rayon traverse du vide, puis, au premier nuage, un
+// pas en arrière et des pas fins (détail et éclairage) jusqu'à en être
+// ressorti depuis quelques pas. Les deux s'allongent avec la distance (un
+// pixel y couvre plus de ciel). Un pas fixe ne laissait le choix qu'entre
+// des nuages en tranches (pas trop longs sur les rayons rasants) et un coût
+// prohibitif dans une couche de 450 blocs vue jusqu'à l'horizon.
+const COARSE_STEP: f32 = 80.0;
+const FINE_STEP: f32 = 22.0;
+const MAX_ITERATIONS: i32 = 72;
 const LIGHT_STEPS: i32 = 3;
+// Longueur maximale parcourue dans la couche (rayons rasants).
+const MAX_SPAN: f32 = 7000.0;
 // Altitude (blocs) du voile de cirrus.
 const CIRRUS_HEIGHT: f32 = 2200.0;
 // Coefficient d'extinction par bloc, pour une densité de 1.
 const SIGMA: f32 = 0.09;
 
-// Seuil de densité selon la hauteur relative `h` dans la couche : monte vers
-// le haut (sommets arrondis) et tout en bas (base plate), façon cumulus.
-fn height_threshold(h: f32) -> f32 {
-    let top = h - 0.25;
-    return (1.0 - params.layer.w) + 0.9 * top * top + (1.0 - smoothstep(0.0, 0.08, h)) * 0.3;
+// Seuil de densité selon la hauteur relative `h` dans la couche et la
+// densité `base` de la carte 2D : monte vers le haut (sommets arrondis) et
+// tout en bas (base plate), façon cumulus. Là où la carte est dense, il
+// monte moins vite : les cœurs bourgeonnent en tours, les bords restent
+// bas (au lieu de nuages tous de la même hauteur).
+fn height_threshold(h: f32, base: f32) -> f32 {
+    let tower = smoothstep(0.5, 0.9, base);
+    // Profil en dôme : le seuil monte dès le bas de la couche (flancs qui
+    // se resserrent, sommets arrondis), moins vite dans les tours.
+    let top = smoothstep(0.04, 1.0, h);
+    return (1.0 - params.layer.w) + pow(top, 1.4) * mix(1.5, 0.55, tower) + (1.0 - smoothstep(0.0, 0.05, h)) * 0.3;
 }
 
 // Hauteur relative (0..1) de `p` au-dessus de la base locale des nuages. La
 // base varie d'une région à l'autre (jusqu'à 30 % de l'épaisseur plus haut) :
 // toutes les bases sur un même plan faisaient un plafond plat et découpé.
+// Hors de [0, 1] : sous la base locale ou au-dessus du sommet (pas de nuage :
+// ramenée à 0, la base relevée laissait pendre des colonnes dessous).
+// Relèvement de la base (0..0.3), lu en chaque point (mipmap la plus
+// floue : il varie sur des kilomètres). Lu une seule fois par rayon, il
+// changeait d'une ligne de pixels à l'autre (le milieu du rayon se
+// déplace vite en vue rasante) : bases de nuages en étagères superposées.
 fn relative_height(p: vec3<f32>) -> f32 {
-    let raise = textureSampleLevel(density_texture, density_sampler, p.xz / 7000.0 + vec2(0.37, 0.61) + params.wind_fade.xy * 0.4, 3.0).a;
+    let raise = textureSampleLevel(density_texture, density_sampler, p.xz / 7000.0 + vec2(0.37, 0.61) + params.wind_fade.xy * 0.4, 4.0).a;
     let r = clamp((raise - 0.35) * 0.6, 0.0, 0.3);
-    return clamp(((p.y - params.layer.x) / params.layer.y - r) / (1.0 - r), 0.0, 1.0);
+    return ((p.y - params.layer.x) / params.layer.y - r) / (1.0 - r);
+}
+
+// Forme générale : la carte 2D lue floue (mipmap 2) : sur 450 blocs
+// d'épaisseur, ses petits détails extrudés faisaient des colonnes
+// verticales ; le détail vient du bruit 3D.
+const MAP_LOD: f32 = 2.0;
+
+// Bruit de forme, plus serré en hauteur : boursouflures empilées plutôt
+// qu'étirées sur toute l'épaisseur.
+fn shape_noise(p: vec3<f32>) -> f32 {
+    return textureSampleLevel(noise_texture, noise_sampler, noise_coord(p * vec3(1.0, 1.8, 1.0), SHAPE_SCALE), 0.0).r;
 }
 
 // Montée progressive de la densité au-delà du seuil : bords vaporeux plutôt
@@ -103,32 +131,44 @@ fn noise_coord(p: vec3<f32>, scale: f32) -> vec3<f32> {
 // Densité grossière (carte 2D et bruit de forme, sans le détail) pour
 // l'ombrage vers le soleil : les 3 échantillons de lumière par pas n'ont pas
 // besoin du détail.
-fn density_coarse(p: vec3<f32>) -> f32 {
+// `margin` : marge ajoutée pour la recherche à grands pas (prudente : mieux
+// vaut affiner pour rien que sauter un bord de nuage).
+fn density_coarse(p: vec3<f32>, margin: f32) -> f32 {
     let h = relative_height(p);
+    if h < 0.0 || h > 1.0 {
+        return 0.0;
+    }
     let uv = p.xz / params.layer.z + params.wind_fade.xy;
-    let base = textureSampleLevel(density_texture, density_sampler, uv, 0.0).a;
-    let shape = textureSampleLevel(noise_texture, noise_sampler, noise_coord(p, SHAPE_SCALE), 0.0).r;
-    return soft(base - height_threshold(h) - (1.0 - shape) * 0.3 + 0.12);
+    let base = textureSampleLevel(density_texture, density_sampler, uv, MAP_LOD).a;
+    let shape = shape_noise(p);
+    return soft(base - height_threshold(h, base) - (1.0 - shape) * (0.35 + 0.35 * h) + 0.22 + margin);
 }
 
 fn density(p: vec3<f32>) -> f32 {
     let h = relative_height(p);
+    if h < 0.0 || h > 1.0 {
+        return 0.0;
+    }
     let uv = p.xz / params.layer.z + params.wind_fade.xy;
     // Forme générale : carte 2D (où sont les nuages), creusée en 3D par le
     // bruit de forme (boursouflures qui varient avec l'altitude, au lieu de
     // colonnes extrudées), puis rongée sur les bords par le bruit fin, plus
     // fort en haut (sommets déchiquetés) qu'en bas (bases lisses).
-    let shape = textureSampleLevel(noise_texture, noise_sampler, noise_coord(p, SHAPE_SCALE), 0.0).r;
+    let shape = shape_noise(p);
     // Carte 2D déformée par le bruit 3D (qui varie avec l'altitude) : les
     // flancs ne sont plus des colonnes verticales striées.
     // Bruit de déformation écrasé verticalement (varie 4x plus vite en
     // hauteur) : sur les 110 blocs de la couche, sinon, il ne changeait presque pas.
-    let wp = noise_coord(p * vec3(1.0, 4.0, 1.0), SHAPE_SCALE);
+    let wp = noise_coord(p * vec3(1.0, 2.0, 1.0), SHAPE_SCALE);
     // Un seul échantillon (canaux r et g) pour les deux axes.
-    let warp = (textureSampleLevel(noise_texture, noise_sampler, wp, 0.0).rg - 0.5) * 0.025;
-    let base = textureSampleLevel(density_texture, density_sampler, uv + warp, 0.0).a;
+    // ~75 blocs (la carte couvre 7000 blocs) : déformée bien plus loin, elle
+    // ne correspondait plus à la densité grossière des grands pas, qui
+    // sautaient des morceaux de nuage (tranches plates empilées).
+    let warp = (textureSampleLevel(noise_texture, noise_sampler, wp, 0.0).rg - 0.5) * (0.008 + 0.01 * h);
+    let base = textureSampleLevel(density_texture, density_sampler, uv + warp, MAP_LOD).a;
     let fine = textureSampleLevel(noise_texture, noise_sampler, noise_coord(p, DETAIL_SCALE) + vec3(0.0, h * 0.3, 0.0), 0.0).g;
-    let x = base - height_threshold(h) - (1.0 - shape) * 0.3 + 0.12;
+    // Boursouflures plus marquées vers le haut (choux-fleurs), bases lisses.
+    let x = base - height_threshold(h, base) - (1.0 - shape) * (0.35 + 0.35 * h) + 0.22;
     // Érosion par le bruit fin surtout là où le nuage est ténu (bords
     // effilochés en filaments) ; le cœur reste plein.
     let edge = 1.0 - smoothstep(0.0, 0.18, x);
@@ -234,7 +274,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         t1 = max(ta, tb);
     }
     // Au-delà du fondu, rien à voir ; rayons rasants bornés en longueur.
-    t1 = min(t1, min(params.wind_fade.w, t0 + 900.0));
+    t1 = min(t1, min(params.wind_fade.w, t0 + MAX_SPAN));
 #ifdef DEPTH_PREPASS
     // Relief devant les nuages (montagne plus lointaine que la sphère qui
     // porte ce shader) : le rayon s'arrête dessus.
@@ -250,9 +290,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let is_sky = true;
 #endif
 
-    let span = max(t1 - t0, 0.0);
-    let steps = select(0, clamp(i32(ceil(span / STEP_LENGTH)), MIN_STEPS, MAX_STEPS), t1 > t0);
-    let step = span / f32(max(steps, 1));
     let jitter = interleaved_gradient_noise(in.position.xy, select(0u, globals.frame_count, params.misc.z > 0.5));
     let sun_dir = params.sun_dir.xyz;
     let cos_theta = dot(dir, sun_dir);
@@ -262,18 +299,40 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var transmittance = 1.0;
     var color = vec3(0.0);
-    for (var i = 0; i < steps; i++) {
-        let t = t0 + (f32(i) + jitter) * step;
+    // Allongement des pas avec la distance.
+    let stretch = 1.0 + t0 / 2500.0;
+    let coarse = COARSE_STEP * stretch;
+    let fine = FINE_STEP * stretch;
+    var t = t0 + jitter * coarse;
+    var refining = false;
+    var misses = 0;
+    for (var i = 0; i < MAX_ITERATIONS; i++) {
+        if t >= t1 { break; }
         let p = origin + dir * t;
+        if !refining {
+            // Vide : grands pas sur la densité grossière ; au premier nuage,
+            // un pas en arrière et passage aux pas fins.
+            if density_coarse(p, 0.05) > 0.001 {
+                refining = true;
+                misses = 0;
+                // Décalage aléatoire gardé (sinon les pas fins tombaient au
+                // même endroit d'un pixel à l'autre : colonnes en escalier).
+                t = max(t - coarse + jitter * fine, t0);
+            } else {
+                t += coarse;
+            }
+            continue;
+        }
         let d = density(p);
         if d > 0.001 {
+            misses = 0;
             // Densité vers le soleil (pas croissants) : ombrage propre.
             var optical = 0.0;
-            var light_step = 6.0;
+            var light_step = 14.0;
             var lp = p;
             for (var j = 0; j < LIGHT_STEPS; j++) {
                 lp += sun_dir * light_step;
-                optical += density_coarse(lp) * light_step;
+                optical += density_coarse(lp, 0.0) * light_step;
                 light_step *= 2.0;
             }
             // Diffusion multiple (approximation par octaves, Wrenninge) : la
@@ -283,16 +342,23 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             // « Powder » : l'intérieur des bords éclairés un peu plus sombre,
             // ce qui donne du volume aux boursouflures.
             let powder = 1.0 - exp(-d * SIGMA * 30.0);
-            let h = clamp((p.y - bottom) / params.layer.y, 0.0, 1.0);
+            let h = clamp(relative_height(p), 0.0, 1.0);
             // Base nettement plus sombre que le sommet (contraste des cumulus).
             let ambient = mix(params.ambient_bottom.rgb * 0.75, params.ambient_top.rgb * 1.1, smoothstep(0.0, 0.7, h));
             let luminance = params.sun_color.rgb * sun_transmittance * phase * mix(1.0, powder, 0.5) + ambient;
 
-            let step_transmittance = exp(-d * SIGMA * step);
+            let step_transmittance = exp(-d * SIGMA * fine);
             color += transmittance * luminance * (1.0 - step_transmittance);
             transmittance *= step_transmittance;
             if transmittance < 0.02 { break; }
+        } else {
+            // Ressorti du nuage depuis quelques pas : retour aux grands pas.
+            misses += 1;
+            if misses > 3 {
+                refining = false;
+            }
         }
+        t += fine;
     }
 
     // Cirrus : voile fibreux très haut (plan à CIRRUS_HEIGHT), étiré dans
@@ -307,14 +373,17 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         // Déformation à grande échelle : filaments qui ondulent au lieu de
         // bandes parallèles rectilignes (traînées « parasites » dans le ciel).
         let bend = textureSampleLevel(density_texture, density_sampler, q / 20000.0 + vec2(0.13, 0.71), 3.0).a - 0.5;
-        let cuv = vec2(along / 16000.0, across / 3500.0 + bend * 1.2) + params.wind_fade.xy * 0.5;
-        // Niveaux de mipmap élevés : filaments doux, pas de bords nets.
-        let streak = textureSampleLevel(density_texture, density_sampler, cuv, 2.0).a;
-        let fine = textureSampleLevel(density_texture, density_sampler, cuv * vec2(2.0, 4.0) + vec2(0.3, 0.7), 1.0).a;
+        // Fibres : deux tranches du bruit 3D à des échelles et des
+        // étirements différents, mélangées puis seuillées en douceur. La
+        // carte 2D des cumulus dessinait le contour de ses taches (réseau
+        // de veines), une seule tranche de bruit très étirée des cernes de
+        // bois.
+        let drift = params.wind_fade.xy * 0.5;
+        let a = textureSampleLevel(noise_texture, noise_sampler, vec3(along / 11000.0 + drift.x, 0.37, across / 3200.0 + bend * 0.8 + drift.y), 0.0).r;
+        let b = textureSampleLevel(noise_texture, noise_sampler, vec3(along / 5200.0 + 0.31, 0.83, across / 1900.0 + bend * 0.5), 0.0).g;
         let coverage = clamp(params.layer.w * 1.4, 0.0, 1.0);
-        // Moins marqués et plus progressifs (fondu large) : voile fibreux
-        // plutôt que traits nets.
-        var c = smoothstep(0.55 - 0.15 * coverage, 1.05, streak * 0.75 + fine * 0.25) * 0.16;
+        var c = smoothstep(0.3 - 0.1 * coverage, 1.0, a * 0.6 + b * 0.4);
+        c = c * c * c * 0.18;
         c *= smoothstep(0.02, 0.25, dir.y) * (1.0 - smoothstep(4000.0, 60000.0, tc));
         let cirrus_light = params.sun_color.rgb * (0.6 + 0.8 * phase) * 0.6 + params.ambient_top.rgb * 1.2;
         color += transmittance * cirrus_light * c;
@@ -328,6 +397,43 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     color = mix(color, params.horizon.rgb * alpha, fade * 0.7);
     color *= 1.0 - fade;
     alpha *= 1.0 - fade;
+
+    // Rayons à travers les nuages : le long du regard, sous la couche,
+    // part du soleil qui passe les nuages (densité grossière le long du
+    // rayon du soleil). Les trouées donnent des faisceaux, au-dessus du
+    // paysage comme dans le ciel, surtout face au soleil bas. Ajoutés devant
+    // le reste (l'air est entre la caméra et les nuages).
+    if params.sun_dir.y > 0.02 && params.misc.x < 0.5 && origin.y < bottom {
+        let toward = max(cos_theta, 0.0);
+        let forward = pow(toward, 8.0);
+        if forward > 0.03 {
+            var reach = select(t0, 6000.0, dir.y <= 0.0);
+#ifdef DEPTH_PREPASS
+            if !is_sky {
+                reach = min(reach, scene_distance);
+            }
+#endif
+            reach = min(reach, 6000.0);
+            var vis = 0.0;
+            let samples = 6;
+            for (var i = 0; i < samples; i++) {
+                let q = origin + dir * reach * (f32(i) + jitter) / f32(samples);
+                let enter = (bottom - q.y) / sun_dir.y;
+                var optical = 0.0;
+                for (var j = 0; j < 2; j++) {
+                    let sp = q + sun_dir * (enter + params.layer.y * (f32(j) + 0.5) / 2.0 / sun_dir.y);
+                    optical += density_coarse(sp, 0.0);
+                }
+                vis += exp(-optical * SIGMA * params.layer.y / 2.0 / sun_dir.y * 0.6);
+            }
+            vis /= f32(samples);
+            // Contraste : seulement là où une partie du soleil est masquée
+            // (le halo autour du soleil existe déjà).
+            let air = 1.0 - exp(-reach / 9000.0);
+            let shafts = vis * (1.0 - vis) * 4.0;
+            color += params.sun_color.rgb * shafts * air * forward * 0.3 * (1.0 - params.misc.y);
+        }
+    }
 
     // La nuit, nuages éclairés par la seule lune : plus sombres (l'exposition
     // automatique les rendait presque aussi blancs que de jour).

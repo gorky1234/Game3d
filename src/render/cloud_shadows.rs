@@ -28,6 +28,9 @@ const SHADOW_SPAN: f32 = 8000.0;
 const SHADOW_SIZE: usize = 512;
 /// Intervalle (s) entre deux recalculs.
 const REFRESH_SECS: f32 = 1.0;
+/// Écart entre le seuil de la carte des nuages et leur forme réelle (voir
+/// `height_threshold`, clouds.wgsl).
+const CLOUD_MAP_OFFSET: f32 = 0.14;
 /// Part de la lumière du soleil arrêtée sous un nuage épais.
 const MAX_SHADOW: f32 = 0.72;
 
@@ -36,7 +39,8 @@ pub struct CloudShadowsPlugin;
 impl Plugin for CloudShadowsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, load_cloud_density)
-            .add_systems(Update, update_cloud_shadows);
+            .init_resource::<SunThroughClouds>()
+            .add_systems(Update, (update_cloud_shadows, sun_through_clouds));
     }
 }
 
@@ -106,13 +110,52 @@ fn shadow_texture(frame: Frame, density: &CloudDensity, drift: Vec2, coverage: f
             let base = density.sample(Vec2::new(q.x, q.z) / CLOUD_TEXTURE_SPAN + drift);
             // Même seuil que la densité des nuages (clouds.wgsl, au cœur de
             // la couche) ; fondu doux : ombres aux bords flous.
-            let x = base - (1.0 - coverage) - 0.03;
+            // Les nuages (clouds.wgsl) s'amincissent vers le haut et sont
+            // rongés par le bruit : à densité égale de la carte, bien moins
+            // pleins que ce simple seuil (ombres trop étendues sinon).
+            let x = base - (1.0 - coverage) - CLOUD_MAP_OFFSET;
             let t = (x / 0.18).clamp(0.0, 1.0);
             let opacity = t * t * (3.0 - 2.0 * t);
             data[j * SHADOW_SIZE + i] = ((1.0 - MAX_SHADOW * opacity) * 255.0).round() as u8;
         }
     }
     data
+}
+
+/// Part (0..1, lissée) du soleil qui passe les nuages vue depuis le joueur :
+/// rayons de soleil (voir height_fog.wgsl) seulement quand le soleil n'est
+/// pas caché.
+#[derive(Resource)]
+pub struct SunThroughClouds(pub f32);
+
+impl Default for SunThroughClouds {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+fn sun_through_clouds(
+    density: Option<Res<CloudDensity>>,
+    drift: Res<CloudDrift>,
+    weather: Res<Weather>,
+    players: Query<&Transform, (With<Player>, Without<Sun>)>,
+    suns: Query<&Transform, With<Sun>>,
+    time: Res<Time>,
+    mut out: ResMut<SunThroughClouds>,
+) {
+    let (Some(density), Ok(player), Ok(sun)) = (density, players.single(), suns.single()) else { return };
+    let to_sun = sun.rotation * Vec3::Z;
+    let target = if to_sun.y < 0.02 {
+        1.0
+    } else {
+        let mid = CLOUD_HEIGHT + CLOUD_THICKNESS * 0.4;
+        let q = player.translation + to_sun * ((mid - player.translation.y) / to_sun.y);
+        let base = density.sample(Vec2::new(q.x, q.z) / CLOUD_TEXTURE_SPAN + drift.0);
+        let x = base - (1.0 - weather.current.cloud_coverage) - CLOUD_MAP_OFFSET;
+        let t = (x / 0.18).clamp(0.0, 1.0);
+        1.0 - 0.95 * t * t * (3.0 - 2.0 * t)
+    };
+    out.0 += (target - out.0) * (time.delta_secs() * 1.5).min(1.0);
 }
 
 #[derive(Default)]

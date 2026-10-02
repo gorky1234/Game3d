@@ -13,3 +13,8 @@
 /biome_map*.png
 /relief_map.png
 /top_view.png
+# Atlas sources (plus de 100 Mo, au-delà de la limite de GitHub) : refaits par
+# tools/gen_*.py, gardés seulement en local
+/assets/atlas_texture.png
+/assets/atlas_texture_normal.png
+/assets/atlas_texture_metallic_roughness.png

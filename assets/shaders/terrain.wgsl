@@ -11,10 +11,16 @@
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing},
     forward_io::{VertexOutput, FragmentOutput},
-    mesh_view_bindings::view,
+    mesh_view_bindings::{view, lights},
     mesh_functions,
     view_transformations::position_world_to_clip,
 }
+#import "shaders/terrain_uniform.wgsl"::terrain
+#ifdef SEAM_FADE
+#import "shaders/seam.wgsl"::seam_hidden
+#endif
+#import "shaders/far_shadow.wgsl"::{apply_far_shadow, far_shadow_blend, far_shadow_uv, far_shadow_weight, ground_bounce}
+#import "shaders/far_shadow_types.wgsl"::{CANOPY_SHADE, CANOPY_SPECULAR}
 
 // Sommet du terrain : attributs standard de Bevy, plus les poids des
 // couches 7 à 11 (voir `ATTRIBUTE_TERRAIN_LAYERS`, smooth_terrain.rs).
@@ -100,24 +106,15 @@ fn vertex(vertex: TerrainVertex) -> TerrainVertexOutput {
     return out;
 }
 
-struct Terrain {
-    // Tuile (xy : coin UV, zw : taille UV) du dessus puis du côté de chacune
-    // des 12 couches : tiles[2 * couche] = dessus, tiles[2 * couche + 1] = côté.
-    tiles: array<vec4<f32>, 24>,
-    // x : blocs couverts par une répétition de tuile, y : humidité (pluie).
-    params: vec4<f32>,
-    // Paroi photo projetée en grand sur la roche (coin UV, taille UV ;
-    // taille nulle : absente).
-    rock_macro: vec4<f32>,
-};
-
-@group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> terrain: Terrain;
-@group(#{MATERIAL_BIND_GROUP}) @binding(101) var color_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(101) var color_texture: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var color_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(103) var normal_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var normal_texture: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var normal_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(105) var roughness_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var roughness_texture: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var roughness_sampler: sampler;
+// Ombres du relief vues de dessus (R : avant le fondu, G : après).
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var far_shadow_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var far_shadow_sampler: sampler;
 
 struct Sampled {
     color: vec3<f32>,
@@ -126,21 +123,32 @@ struct Sampled {
     height: f32,         // relief de la texture (0..1, voir `height_blend`)
 };
 
-// Échantillonne une tuile de l'atlas aux coordonnées `uv` (en répétitions de
-// tuile, non bornées) ; `du`, `dv` : leurs dérivées écran (calculées hors des
-// branches, où les dérivées ne sont pas permises). Niveau de mipmap choisi à
-// la main et plafonné : au-delà, la tuile déborderait sur ses voisines dans
-// l'atlas (32 px de marge : 1 px au niveau 5).
+// Échantillonne une tuile (calque `tile.x` du tableau de textures) aux
+// coordonnées `uv` (en répétitions de tuile, non bornées) ; `du`, `dv` :
+// leurs dérivées écran (calculées hors des branches, où les dérivées ne sont
+// pas permises). En qualité haute, le matériel choisit le niveau de mipmap
+// et filtre en anisotrope à partir de ces dérivées : sol net en vue rasante, sans
+// plafond de mipmap (la tuile, seule dans son calque, se répète sans
+// déborder sur ses voisines). `fract` : les coordonnées restent petites
+// (précision), le raccord est assuré par la répétition de l'échantillonneur.
 fn sample_tile(tile: vec4<f32>, uv: vec2<f32>, du: vec2<f32>, dv: vec2<f32>) -> Sampled {
-    let atlas_uv = tile.xy + fract(uv) * tile.zw;
-    let size = vec2<f32>(textureDimensions(color_texture, 0));
-    let ddx = du * tile.zw * size;
-    let ddy = dv * tile.zw * size;
-    let lod = clamp(0.5 * log2(max(dot(ddx, ddx), dot(ddy, ddy))), 0.0, 5.0);
+    let layer = i32(tile.x);
+    let t = fract(uv);
     var out: Sampled;
-    out.color = textureSampleLevel(color_texture, color_sampler, atlas_uv, lod).rgb;
-    out.normal = textureSampleLevel(normal_texture, normal_sampler, atlas_uv, lod).xyz * 2.0 - 1.0;
-    let mr = textureSampleLevel(roughness_texture, roughness_sampler, atlas_uv, lod);
+#ifdef TERRAIN_ANISOTROPIC
+    out.color = textureSampleGrad(color_texture, color_sampler, t, layer, du, dv).rgb;
+    out.normal = textureSampleGrad(normal_texture, normal_sampler, t, layer, du, dv).xyz * 2.0 - 1.0;
+    let mr = textureSampleGrad(roughness_texture, roughness_sampler, t, layer, du, dv);
+#else
+    // Qualité basse : niveau de mipmap choisi ici, sans anisotrope (~2 ms
+    // de GPU en moins sur ce shader).
+    let ddx = du * 1024.0;
+    let ddy = dv * 1024.0;
+    let lod = 0.5 * log2(max(dot(ddx, ddx), dot(ddy, ddy)));
+    out.color = textureSampleLevel(color_texture, color_sampler, t, layer, lod).rgb;
+    out.normal = textureSampleLevel(normal_texture, normal_sampler, t, layer, lod).xyz * 2.0 - 1.0;
+    let mr = textureSampleLevel(roughness_texture, roughness_sampler, t, layer, lod);
+#endif
     out.roughness = mr.g;
     // Hauteur dans le canal R (voir tools/gen_terrain_layers.py).
     out.height = mr.r;
@@ -245,6 +253,21 @@ fn meadow_dryness(p: vec2<f32>) -> f32 {
     return clamp((large * 0.7 + small * 0.3 - 0.55) * 1.6 + 0.35, 0.0, 1.0);
 }
 
+// Couleur moyenne des touffes d'une prairie (voir `species_at` et la teinte
+// des touffes, plant_mesh.rs) : herbe teintée du vert au doré selon la
+// sécheresse `dry`, et part d'herbe sèche couchée (texture paille, bien plus
+// orange) qui monte jusqu'à 55 % des touffes là où la prairie est sèche
+// (`zone` : sécheresse sans l'altitude). Pondérée par la couverture de
+// chaque texture. Mesurée sur l'atlas : avant, seule l'herbe verte comptait,
+// et le sol au-delà des touffes tranchait sur les plaques orange.
+fn tuft_color(dry: f32, zone: f32) -> vec3<f32> {
+    let grass = vec3(0.203, 0.214, 0.083) * mix(vec3(0.6, 0.74, 0.62), vec3(0.98, 0.86, 0.66), dry) * 0.95;
+    let straw = vec3(0.332, 0.252, 0.08) * vec3(0.84, 0.82, 0.76) * 0.975;
+    let share = 0.55 * 0.75 * clamp((zone - 0.3) * 1.4, 0.0, 1.0);
+    let w = share * 0.26 / max(share * 0.26 + (1.0 - share) * 0.54, 1e-4);
+    return mix(grass, straw, w);
+}
+
 // Bruit centré (-0,5..0,5) de cellule `cell`, estompé quand la cellule
 // devient plus petite que le pixel (`footprint`, blocs couverts par un
 // pixel) : au loin, un détail sous-pixel ne ferait que scintiller.
@@ -334,6 +357,18 @@ fn rock_relief(p: vec3<f32>, footprint: f32) -> vec3<f32> {
     return gradient;
 }
 
+// Teinte d'une strate des badlands (multiplie la couleur de la paroi) :
+// tirée au hasard pour chaque couche `k`, le plus souvent la roche telle
+// quelle.
+fn strata_tint(k: i32) -> vec3<f32> {
+    let r = plant_hash(k, 17, 93u);
+    if r < 0.42 { return vec3(1.0); }
+    if r < 0.62 { return vec3(0.82, 0.64, 0.58); }
+    if r < 0.78 { return vec3(1.22, 1.16, 1.04); }
+    if r < 0.9 { return vec3(0.84, 0.8, 0.88); }
+    return vec3(1.38, 1.34, 1.28);
+}
+
 // Teinte (linéaire) de la couche de podzol, voir `sample_layer`.
 const PODZOL_TINT: vec3<f32> = vec3(0.35, 0.56, 0.62);
 
@@ -350,7 +385,19 @@ struct LayerEnv {
     stone_tint: vec3<f32>,
     has_macro: bool,
     macro_weight: f32,
+    // Force des cartes de normales (plus marquées de près).
+    normal_gain: f32,
 };
+
+// Profondeur (blocs) du relief des textures en parallaxe, par couche :
+// herbe, terre, roche, sable, neige, terre rouge, litière, podzol, vase,
+// gravier, grès, sel.
+const POM_DEPTH = array<f32, 12>(0.07, 0.12, 0.18, 0.06, 0.04, 0.12, 0.1, 0.08, 0.08, 0.15, 0.15, 0.02);
+const POM_STEPS: i32 = 10;
+
+fn pom_height(layer: i32, uv: vec2<f32>, lod: f32) -> f32 {
+    return textureSampleLevel(roughness_texture, roughness_sampler, fract(uv), layer, lod).r;
+}
 
 // Couche `layer` en projection triplanaire : couleur, normale (monde),
 // rugosité et relief, mélangés entre les trois projections.
@@ -377,6 +424,13 @@ fn sample_layer(layer: i32, e: LayerEnv) -> Sampled {
     // ciel (rochers et falaises bleutés à l'ombre).
     let min_rough = select(0.0, 0.85, layer == 2);
     let macro_rock = layer == 2 && e.has_macro;
+    // Badlands : la paroi (photo de grès en bancs) seulement sur les pentes
+    // raides ; les pentes douces restent du sol (en bandes sur des collines
+    // arrondies, elle faisait des rayures de gâteau). Limite irrégulière.
+    var wall = side;
+    if layer == 5 && n.y + (value_noise(p.xz * 4.0, 2.5, 95u) - 0.5) * 0.14 > 0.62 {
+        wall = top;
+    }
     var out: Sampled;
     out.color = vec3(0.0);
     out.normal = vec3(0.0);
@@ -394,29 +448,29 @@ fn sample_layer(layer: i32, e: LayerEnv) -> Sampled {
         // penche la normale vers -z. (Signe inversé avant : bosses du
         // sol éclairées du mauvais côté le long de z. Les projections
         // latérales ont v = -y, où le vert va bien vers +y.)
-        let tn = vec3(vec2(s.normal.x, -s.normal.y) + n.xz, abs(s.normal.z) * n.y);
+        let tn = vec3(vec2(s.normal.x, -s.normal.y) * e.normal_gain + n.xz, abs(s.normal.z) * n.y);
         out.color += s.color * tint * blend.y;
         out.normal += tn.xzy * blend.y;
         out.roughness += max(s.roughness, min_rough) * blend.y;
         out.height += s.height * blend.y;
     }
     if blend.x > 0.02 {
-        var s = sample_varied(side, vec2(p.z, -p.y), vec2(px.z, -px.y), vec2(py.z, -py.y), e.var_x);
+        var s = sample_varied(wall, vec2(p.z, -p.y), vec2(px.z, -px.y), vec2(py.z, -py.y), e.var_x);
         if macro_rock {
             s = mix_macro(s, sample_tile(terrain.rock_macro, vec2(p.z, -p.y) * MACRO_SCALE, vec2(px.z, -px.y) * MACRO_SCALE, vec2(py.z, -py.y) * MACRO_SCALE), e.macro_weight);
         }
-        let tn = vec3(s.normal.xy + n.zy, abs(s.normal.z) * n.x);
+        let tn = vec3(s.normal.xy * e.normal_gain + n.zy, abs(s.normal.z) * n.x);
         out.color += s.color * tint * blend.x;
         out.normal += tn.zyx * blend.x;
         out.roughness += max(s.roughness, min_rough) * blend.x;
         out.height += s.height * blend.x;
     }
     if blend.z > 0.02 {
-        var s = sample_varied(side, vec2(p.x, -p.y), vec2(px.x, -px.y), vec2(py.x, -py.y), e.var_z);
+        var s = sample_varied(wall, vec2(p.x, -p.y), vec2(px.x, -px.y), vec2(py.x, -py.y), e.var_z);
         if macro_rock {
             s = mix_macro(s, sample_tile(terrain.rock_macro, vec2(p.x, -p.y) * MACRO_SCALE, vec2(px.x, -px.y) * MACRO_SCALE, vec2(py.x, -py.y) * MACRO_SCALE), e.macro_weight);
         }
-        let tn = vec3(s.normal.xy + n.xy, abs(s.normal.z) * n.z);
+        let tn = vec3(s.normal.xy * e.normal_gain + n.xy, abs(s.normal.z) * n.z);
         out.color += s.color * tint * blend.z;
         out.normal += tn.xyz * blend.z;
         out.roughness += max(s.roughness, min_rough) * blend.z;
@@ -455,7 +509,7 @@ fn fragment(terrain_in: TerrainVertexOutput, @builtin(front_facing) is_front: bo
     var pbr_input = pbr_input_from_standard_material(in, is_front);
 
     let n = normalize(in.world_normal);
-    let p = in.world_position.xyz / terrain.params.x;
+    var p = in.world_position.xyz / terrain.params.x;
     // Dérivées en dehors de toute branche.
     let px = dpdx(p);
     let py = dpdy(p);
@@ -571,7 +625,68 @@ fn fragment(terrain_in: TerrainVertexOutput, @builtin(front_facing) is_front: bo
     }
     if i1 < 0 || w1 <= 0.01 { i1 = -1; w1 = 0.0; }
     if i2 < 0 || w2 <= 0.01 { i2 = -1; w2 = 0.0; }
-    let env = LayerEnv(n, blend, p, px, py, var_x, var_y, var_z, stone_tint, has_macro, macro_weight);
+    // Relief des textures (qualité haute, sol proche et à peu près plat) :
+    // parallaxe sur la couche dominante -- le point vu est cherché le long
+    // du regard sous la surface, dans la carte de hauteur (cailloux, mottes,
+    // fissures qui se creusent selon l'angle de vue) -- puis auto-ombrage :
+    // du point trouvé vers le soleil, le relief voisin plus haut le masque
+    // (petites ombres dans les creux au soleil rasant).
+    let view_dist = distance(view.world_position, in.world_position.xyz);
+    var pom_shadow = 1.0;
+#ifdef TERRAIN_ANISOTROPIC
+    let pom_fade = (1.0 - smoothstep(12.0, 20.0, view_dist)) * smoothstep(0.75, 0.92, n.y) * terrain.params.w;
+    if pom_fade > 0.01 {
+        var depths = POM_DEPTH;
+        let depth = depths[i0] / terrain.params.x * pom_fade;
+        let layer = i32(terrain.tiles[2 * i0].x);
+        let offset = select(var_y.offset_a, var_y.offset_b, var_y.f > 0.5);
+        let d = px.xz * 1024.0;
+        let e = py.xz * 1024.0;
+        let lod = max(0.5 * log2(max(dot(d, d), dot(e, e))), 0.0);
+        let V = normalize(view.world_position - in.world_position.xyz);
+        let shift = -V.xz / max(V.y, 0.3) * depth;
+        let start = p.xz;
+        var t = 0.0;
+        var uv = start;
+        var h = pom_height(layer, uv + offset, lod);
+        var prev_t = 0.0;
+        var prev_h = h;
+        var prev_uv = uv;
+        for (var i = 0; i < POM_STEPS; i++) {
+            if t >= 1.0 - h {
+                break;
+            }
+            prev_t = t;
+            prev_h = h;
+            prev_uv = uv;
+            t += 1.0 / f32(POM_STEPS);
+            uv = start + shift * t;
+            h = pom_height(layer, uv + offset, lod);
+        }
+        // Affinage entre les deux derniers pas.
+        let above = (1.0 - prev_h) - prev_t;
+        let below = t - (1.0 - h);
+        let k = clamp(above / max(above + below, 1e-4), 0.0, 1.0);
+        uv = mix(prev_uv, uv, k);
+        let hit = 1.0 - mix(prev_t, t, k);
+        p = vec3(uv.x, p.y, uv.y);
+        if lights.n_directional_lights > 0u {
+            let L = lights.directional_lights[0].direction_to_light;
+            if L.y > 0.03 {
+                let toward = L.xz / max(L.y, 0.15) * depth;
+                var occlusion = 0.0;
+                for (var j = 1; j <= 6; j++) {
+                    let rise = f32(j) / 6.0 * (1.0 - hit);
+                    let hq = pom_height(layer, uv + offset + toward * rise, lod);
+                    occlusion = max(occlusion, hq - (hit + rise));
+                }
+                pom_shadow = 1.0 - clamp(occlusion * 6.0, 0.0, 1.0) * pom_fade * 0.85;
+            }
+        }
+    }
+#endif
+    let normal_gain = mix(1.6, 1.0, smoothstep(8.0, 50.0, view_dist));
+    let env = LayerEnv(n, blend, p, px, py, var_x, var_y, var_z, stone_tint, has_macro, macro_weight, normal_gain);
     let s0 = sample_layer(i0, env);
     var s1 = s0;
     var s2 = s0;
@@ -630,17 +745,18 @@ fn fragment(terrain_in: TerrainVertexOutput, @builtin(front_facing) is_front: bo
         // 40). Renfort de saturation atténué au loin : sinon les pentes
         // enherbées vues de loin formaient un tapis vert vif uniforme.
         let altitude = smoothstep(166.0, 216.0, in.world_position.y);
-        let dry = min(meadow_dryness(in.world_position.xz) + altitude * 0.55, 1.0);
+        let zone = meadow_dryness(in.world_position.xz);
+        let dry = min(zone + altitude * 0.55, 1.0);
         let far = smoothstep(30.0, 180.0, distance(view.world_position, in.world_position.xyz));
         var green = mix(vec3(luma), color, mix(1.2, 0.9, far)) * mix(vec3(0.9, 1.1, 0.8), vec3(0.97, 1.02, 0.88), far);
         green *= mix(vec3(0.95, 1.04, 0.95), vec3(1.18, 1.02, 0.7), dry);
         // Au-delà de ~25 blocs, les touffes d'herbe haute s'éclaircissent une à
-        // une jusqu'à 88 (voir `ground_plant_hidden`, wind_common.wgsl) : le
+        // une jusqu'à 120 (voir `ground_plant_hidden`, wind_common.wgsl) : le
         // sol prend peu à peu leur couleur (texture des touffes, mesurée,
         // teintée comme dans `plant_mesh` : vert frais ou doré selon la
         // sécheresse), sinon on voyait la prairie « apparaître » à la limite.
-        let tuft = vec3(0.203, 0.214, 0.083) * mix(vec3(0.6, 0.74, 0.62), vec3(0.98, 0.86, 0.66), dry) * 0.95;
-        let meadow = smoothstep(20.0, 90.0, distance(view.world_position, in.world_position.xyz)) * 0.85;
+        let tuft = tuft_color(dry, zone);
+        let meadow = smoothstep(25.0, 120.0, distance(view.world_position, in.world_position.xyz)) * 0.85;
         green = mix(green, tuft, meadow);
         // Les touffes éclaircies au loin laissent un aplat : on leur rend
         // leur marbrure (plus sombre et plus verte dans les creux, plus
@@ -667,6 +783,72 @@ fn fragment(terrain_in: TerrainVertexOutput, @builtin(front_facing) is_front: bo
     // - coulures sombres (eau, lichens) qui descendent les faces raides ;
     // - arêtes plus claires, creux plus sombres (bruit de relief).
     // Détails estompés sous la taille du pixel (voir `filtered_noise`).
+    // Badlands : strates horizontales en altitude (communes à toutes les
+    // parois, comme de vraies couches), d'épaisseur irrégulière (bancs de 1
+    // à 6 blocs), de couleurs variées : grès rouge sombre, bancs crème,
+    // argiles gris-violet, minces lits blancs de bentonite. De grandes
+    // couches (~15 blocs) s'y ajoutent, visibles de loin. Sur les parois
+    // seulement ; les pentes douces sont délavées (poussière). Teinte par
+    // zones de quelques centaines de blocs (régions plus ocres, plus roses,
+    // plus grises) : un seul orange uniforme faisait dessin animé.
+    let red = w[5] / total;
+    // Rigoles des badlands (voir plus bas), ajoutées à la normale.
+    var rill_slope = vec3(0.0);
+    if red > 0.01 {
+        // Rigoles : le relief les creuse (ravines en arêtes de poisson,
+        // generation/terrain), mais le maillage simplifié des chunks
+        // lointains (une colonne sur 4, puis sur 16) les lisse. Rigoles plus
+        // fines dans la normale et l'ombrage, dans le sens de la pente, sur
+        // les pentes seulement.
+        let slope_face = smoothstep(0.985, 0.88, n.y) * smoothstep(0.25, 0.45, n.y);
+        if slope_face > 0.0 {
+            let down = normalize(n.xz + vec2(1e-4, 0.0));
+            let across = vec2(-down.y, down.x);
+            let q = vec2(dot(wp, across), dot(wp, down) * 0.2);
+            let cells = array<f32, 3>(5.0, 13.0, 30.0);
+            let heights = array<f32, 3>(0.8, 2.6, 6.5);
+            var crease = 0.0;
+            for (var i = 0; i < 3; i++) {
+                let cell = cells[i];
+                let fade = 1.0 - smoothstep(0.35 * cell, cell, footprint);
+                if fade <= 0.0 {
+                    continue;
+                }
+                let salt = 150u + u32(i);
+                let g0 = 1.0 - abs(value_noise(q, cell, salt) * 2.0 - 1.0);
+                let e = cell * 0.2;
+                let g1 = 1.0 - abs(value_noise(q + vec2(e, 0.0), cell, salt) * 2.0 - 1.0);
+                crease += (g0 - 0.5) * fade / f32(i + 1);
+                rill_slope += vec3(across.x, 0.0, across.y) * (g1 - g0) / e * heights[i] * fade;
+            }
+            rill_slope *= red * slope_face;
+            color *= 1.0 + crease * 0.55 * red * slope_face;
+        }
+        let wall_face = 1.0 - smoothstep(0.5, 0.72, n.y);
+        let tilt = value_noise(wp, 140.0, 90u) * 5.0 + value_noise(wp, 40.0, 91u) * 1.2;
+        let fine_fade = 1.0 - smoothstep(0.6, 2.5, footprint);
+        if fine_fade > 0.0 {
+            let y = world.y + tilt;
+            // Épaisseur variable : coordonnée déformée par un bruit lent de
+            // l'altitude elle-même.
+            let u = y / 2.6 + value_noise(vec2(y / 9.0, 3.7), 1.0, 92u) * 2.2;
+            let k = floor(u);
+            let f = u - k;
+            let a = strata_tint(i32(k));
+            let b = strata_tint(i32(k) + 1);
+            let band = mix(a, b, smoothstep(0.82, 1.0, f));
+            color *= mix(vec3(1.0), band, red * wall_face * fine_fade);
+        }
+        let big = strata_tint(i32(floor((world.y + tilt * 2.0) / 15.0)) + 40);
+        color *= mix(vec3(1.0), mix(vec3(1.0), big, 0.55), red * wall_face);
+        // Pentes douces : poussière (plus pâle, moins saturée).
+        let luma = dot(color, vec3(0.3, 0.59, 0.11));
+        color = mix(color, vec3(luma) * vec3(1.12, 1.02, 0.94), red * (1.0 - wall_face) * 0.22);
+        let zone = value_noise(wp + vec2(-77.0, 413.0), 420.0, 96u);
+        let zone_tint = mix(mix(vec3(1.06, 0.98, 0.84), vec3(1.04, 0.92, 0.86), smoothstep(0.3, 0.55, zone)), vec3(0.94, 0.93, 0.94), smoothstep(0.6, 0.85, zone));
+        color *= mix(vec3(1.0), zone_tint, red);
+    }
+
     let rock = w[2] / total;
     if rock > 0.01 {
         let zone = value_noise(wp, 80.0, 61u) * 0.6 + value_noise(wp + vec2(world.y * 0.5, 0.0), 23.0, 62u) * 0.4;
@@ -710,23 +892,31 @@ fn fragment(terrain_in: TerrainVertexOutput, @builtin(front_facing) is_front: bo
     // Pluie : sol mouillé (plus sombre, luisant) et flaques dans les zones
     // plates à découvert, qui s'étendent avec l'humidité. Pas sur le sable
     // (il boit l'eau) ni sous les arbres.
-    let wet = terrain.params.y;
     var puddle = 0.0;
     // Berges : bande sombre et luisante juste au-dessus de l'eau (voir
     // `bank_wetness`), plus marquée sur la terre que sur le sable et la roche
     // (qui sèchent vite), à peine sur l'herbe.
+    // Vase (marais, lits de rivière) : toujours détrempée -- plus sombre,
+    // luisante, flaques permanentes dans les creux plats.
+    let mud = w[8] / total;
     if bank_wet > 0.01 {
         // Bord irrégulier (pas la ligne en escalier des blocs d'eau).
         let ragged = value_noise(wp, 1.7, 43u) * 0.6 + value_noise(wp, 0.6, 44u) * 0.4;
-        let bank = smoothstep(0.15, 0.55, bank_wet + (ragged - 0.5) * 0.35) * (1.0 - 0.4 * w[0] / total);
+        // Sur la vase, transition plus large et progressive vers l'eau.
+        let reach = mix(0.15, 0.03, mud);
+        let bank = smoothstep(reach, 0.55, bank_wet + (ragged - 0.5) * 0.35) * (1.0 - 0.4 * w[0] / total);
         color *= 1.0 - 0.5 * bank;
-        roughness = mix(roughness, 0.2, bank * 0.85);
+        roughness = mix(roughness, mix(0.2, 0.08, mud), bank * 0.85);
+        // Herbe noyée : couchée, brun-olive, au ras de l'eau.
+        let drowned = smoothstep(0.3, 0.8, bank_wet + (ragged - 0.5) * 0.3) * w[0] / total;
+        color = mix(color, color * vec3(0.75, 0.68, 0.42), drowned);
     }
+    let wet = max(terrain.params.y, mud * 0.6);
     if wet > 0.01 {
         let sand = w[3] / total;
         let flat = smoothstep(0.965, 0.995, n.y);
         let spots = value_noise(wp + vec2(71.0, 13.0), 9.0, 41u) * 0.7 + value_noise(wp, 3.0, 42u) * 0.3;
-        puddle = smoothstep(0.84 - 0.08 * wet, 0.87 - 0.08 * wet, spots) * flat * (1.0 - sand) * smoothstep(0.85, 0.95, ao) * wet;
+        puddle = smoothstep(0.84 - 0.08 * wet, 0.87 - 0.08 * wet, spots) * flat * (1.0 - sand) * mix(smoothstep(0.85, 0.95, ao), 1.0, mud) * wet;
         let soak = wet * (1.0 - 0.7 * sand);
         color *= 1.0 - 0.35 * soak;
         roughness = mix(roughness, 0.35, soak * 0.6);
@@ -751,7 +941,7 @@ fn fragment(terrain_in: TerrainVertexOutput, @builtin(front_facing) is_front: bo
     // vu d'en haut seulement (pas les falaises).
     let far_relief = smoothstep(15.0, 60.0, distance(view.world_position, in.world_position.xyz)) * smoothstep(0.7, 0.95, n.y);
     let slope = hummock_slope(in.world_position.xz, footprint) * far_relief;
-    var relief_n = normalize(normal_sum + n * 1e-3) - vec3(slope.x, 0.0, slope.y);
+    var relief_n = normalize(normal_sum + n * 1e-3) - vec3(slope.x, 0.0, slope.y) - rill_slope;
     // Parois rocheuses et versants enneigés : relief 3D (voir `rock_relief`).
     let rocky = (w[2] + w[4] * 0.8) / total * smoothstep(10.0, 40.0, distance(view.world_position, world));
     if rocky > 0.01 {
@@ -762,8 +952,48 @@ fn fragment(terrain_in: TerrainVertexOutput, @builtin(front_facing) is_front: bo
     // Eau des flaques : reflet du ciel (réflectance de l'eau).
     pbr_input.material.reflectance = mix(pbr_input.material.reflectance, vec3(0.5), puddle);
 
+    // Bord de la zone chargée : fondu tramé vers le relief lointain (après
+    // tous les calculs de dérivées). Seulement dans la variante du matériau
+    // des chunks du bord : un `discard` dans le shader empêche le GPU
+    // d'éliminer tôt les pixels cachés (qualité basse : 74 -> 47 FPS).
+#ifdef SEAM_FADE
+    if seam_hidden(world.xz, in.position.xy) {
+        discard;
+    }
+#endif
+
+    // Sous-bois (voir `CANOPY_SHADE`) et reflets abrités : la carte
+    // d'environnement ne voit que le ciel, qui se reflétait encore au fond
+    // des creux, des gorges et des grottes (`ao`).
+    let canopy_area = terrain.far_shadow;
+    let canopy_uv = far_shadow_uv(canopy_area, world.xz);
+    if canopy_area.area.w > 0.0 && all(canopy_uv > vec2(0.0)) && all(canopy_uv < vec2(1.0)) {
+        let canopy = textureSampleLevel(far_shadow_texture, far_shadow_sampler, canopy_uv, 0.0).b;
+        pbr_input.diffuse_occlusion *= mix(vec3(1.0), CANOPY_SHADE, canopy);
+        pbr_input.specular_occlusion *= 1.0 - CANOPY_SPECULAR * canopy;
+    }
+    pbr_input.specular_occlusion *= ao * ao;
+
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
+    // Rebond du sol (voir `ground_bounce`) : le sol alentour est en
+    // moyenne de la couleur du lieu.
+    out.color = vec4(out.color.rgb + ground_bounce(pbr_input, color, ao), out.color.a);
+    // Au-delà des cartes d'ombre : ombres du relief (voir far_shadow.wgsl).
+    // Auto-ombrage du relief des textures (voir plus haut) : même
+    // retrait de la lumière directe.
+    let far = terrain.far_shadow;
+    let far_weight = select(0.0, far_shadow_weight(far, world), far.area.w > 0.0);
+    let far_uv = far_shadow_uv(far, world.xz);
+    var sun_visibility = pom_shadow;
+    if far_weight > 0.0 && all(far_uv > vec2(0.0)) && all(far_uv < vec2(1.0)) {
+        let s = textureSampleLevel(far_shadow_texture, far_shadow_sampler, far_uv, 0.0).rg;
+        let visibility = mix(s.r, s.g, far_shadow_blend(far));
+        sun_visibility *= mix(1.0, visibility, far_weight);
+    }
+    if sun_visibility < 0.995 {
+        out.color = apply_far_shadow(out.color, pbr_input, sun_visibility, far.timing.z);
+    }
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
     return out;
 }

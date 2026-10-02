@@ -1,4 +1,5 @@
-use crate::texture::TextureAtlasMaterial;
+use crate::texture::{BarkMaterial, TextureAtlasMaterial};
+use bevy::mesh::MeshTag;
 use bevy_rapier3d::prelude::TriMeshFlags;
 use bevy_rapier3d::prelude::ComputedColliderShape;
 use bevy_rapier3d::prelude::Collider;
@@ -47,11 +48,11 @@ const FOLIAGE_SHADOW_DISTANCE: i32 = 2;
 
 /// Distance (blocs) au-delà de laquelle les maillages d'herbe ne sont plus
 /// dessinés du tout. Garde-fou seulement : les touffes s'éclaircissent déjà
-/// une à une entre 25 et 88 blocs (voir `ground_plant_hidden`,
+/// une à une entre 25 et 120 blocs (voir `ground_plant_hidden`,
 /// wind_common.wgsl). L'ancien fondu tramé de toute la section, entre 48 et
 /// 72 blocs, faisait apparaître la prairie d'un bloc.
-const GRASS_FADE_START: f32 = 88.0;
-const GRASS_FADE_END: f32 = 96.0;
+const GRASS_FADE_START: f32 = 120.0;
+const GRASS_FADE_END: f32 = 128.0;
 
 /// File de maillage. Même principe que les files de chargement et de
 /// génération (`QueuedChunk`, tas trié par distance/direction au joueur) :
@@ -99,7 +100,9 @@ impl Plugin for GenerateMeshChunksPlugin {
         // (composants insérés) avant que le déchargement ne puisse les
         // détruire dans la même image, sinon la commande d'insertion panique
         // en trouvant l'entité déjà détruite.
+        app.init_resource::<LodFading>();
         app.add_systems(Update, (poll_chunk_tasks.before(ChunkUnloadSet), sync_chunk_colliders).chain());
+        app.add_systems(Update, despawn_faded);
         app.add_systems(Update, update_foliage_shadows.after(poll_chunk_tasks));
         app.add_systems(Update, strip_far_chunks.after(queue_chunk_mesh_tasks).after(poll_chunk_tasks));
 
@@ -214,13 +217,49 @@ fn queue_chunk_mesh_tasks(
 }
 
 
+/// Fondu entre l'ancien et le nouveau maillage des arbres d'un chunk
+/// (changement de niveau de détail, remaillage) : les deux sont dessinés
+/// pendant `LOD_FADE_SECS`, l'ancien s'effaçant pixel par pixel pendant que le
+/// nouveau apparaît (voir lod_fade.wgsl), au lieu d'un remplacement d'un coup
+/// (houppiers qui changeaient de forme sous les yeux).
+const LOD_FADE_SECS: f32 = 0.6;
+
+/// Anciens maillages d'arbres en train de s'effacer, et instant (temps réel)
+/// où les supprimer.
+#[derive(Resource, Default)]
+struct LodFading(Vec<(Entity, f32)>);
+
+/// Tag de fondu (voir lod_fade.wgsl) : début en millisecondes (temps des
+/// shaders, qui reboucle toutes les heures), mode 1 apparition, 2 disparition.
+fn lod_fade_tag(time: &Time, mode: u32) -> MeshTag {
+    let ms = (time.elapsed_secs_wrapped() * 1000.0) as u32 & 0x3F_FFFF;
+    MeshTag((ms << 2) | mode)
+}
+
+fn despawn_faded(mut commands: Commands, mut fading: ResMut<LodFading>, time: Res<Time>) {
+    let now = time.elapsed_secs();
+    fading.0.retain(|&(entity, end)| {
+        if now >= end {
+            commands.entity(entity).try_despawn();
+            false
+        } else {
+            true
+        }
+    });
+}
+
 fn poll_chunk_tasks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     materials: Res<TextureAtlasMaterial>,
     mut chunk_tasks: ResMut<ChunkMeshTasks>,
-    mut world_data: ResMut<WorldData>
+    mut world_data: ResMut<WorldData>,
+    tree_parts: Query<(), Or<(With<TreeFoliage>, With<MeshMaterial3d<BarkMaterial>>)>>,
+    mut fading: ResMut<LodFading>,
+    time: Res<Time>,
 ) {
+    let fade_in = lod_fade_tag(&time, 1);
+    let fade_out = lod_fade_tag(&time, 2);
     let mut completed = Vec::new();
 
     for (&coords, (task, full_neighborhood)) in chunk_tasks.tasks.iter_mut() {
@@ -249,6 +288,13 @@ fn poll_chunk_tasks(
             for section_index in 0..(WORLD_HEIGHT / SECTION_HEIGHT) as i32 {
                 if let Some(old_entities) = world_data.chunks_sections_meshes.remove(&(coords.0, coords.1, section_index)) {
                     for (entity, _) in old_entities {
+                        // Troncs et feuillage : effacés en fondu (voir
+                        // `LOD_FADE_SECS`), supprimés ensuite.
+                        if tree_parts.contains(entity) {
+                            commands.entity(entity).try_insert(MeshTag(fade_out.0));
+                            fading.0.push((entity, time.elapsed_secs() + LOD_FADE_SECS + 0.1));
+                            continue;
+                        }
                         // try_despawn (pas despawn) : voir la note sur l'ordre
                         // poll_chunk_tasks -> loading_and_unloading_chunks plus bas.
                         commands.entity(entity).try_despawn();
@@ -264,7 +310,8 @@ fn poll_chunk_tasks(
                 let aabb = bark_mesh.compute_aabb().unwrap_or_default();
                 let entity = commands.spawn((
                     Mesh3d(meshes.add(bark_mesh)),
-                    MeshMaterial3d(materials.opaque_handle.clone()),
+                    MeshMaterial3d(materials.bark_handle.clone()),
+                    MeshTag(fade_in.0),
                     Transform::from_xyz((coords.0 * CHUNK_SIZE as i32) as f32, 0.0, (coords.1 * CHUNK_SIZE as i32) as f32),
                     aabb,
                     ChunkSectionMesh,
@@ -294,6 +341,7 @@ fn poll_chunk_tasks(
                 let entity = commands.spawn((
                     Mesh3d(meshes.add(foliage_mesh)),
                     MeshMaterial3d(materials.foliage_handle.clone()),
+                    MeshTag(fade_in.0),
                     Transform::from_xyz((coords.0 * CHUNK_SIZE as i32) as f32, 0.0, (coords.1 * CHUNK_SIZE as i32) as f32),
                     aabb,
                     ChunkSectionMesh,
